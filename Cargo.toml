@@ -1,0 +1,41 @@
+[package]
+name = "larkspur"
+version = "0.0.1"
+edition = "2021"
+
+[[bin]]
+name = "larkspur_ui"
+path = "src/ui/main.rs"
+
+[lib]
+name = "larkspur"
+path = "src/lib.rs"
+
+[dependencies]
+gpui = "0.2"
+
+# Audio decode (FLAC + Opus enabled by default; mp3 needs explicit feature)
+symphonia = { version = "0.5", features = ["mp3", "opt-simd"] }
+
+# Audio output
+rodio = { version = "0.22", default-features = false, features = ["playback", "symphonia-all"] }
+
+# Opus decode — symphonia 0.5 demuxes Ogg/Opus but ships no Opus decoder,
+# so packets go to libopus instead (bundled static build via cmake).
+opus = "0.4"
+
+# Tag/metadata reading (covers, lyrics, bitrate, etc.)
+lofty = "0.21"
+
+# Bounded in-memory cover cache
+lru = "0.12"
+
+# Stable, fast hashing for song identity (NOT SipHash — see note in datatypes.rs)
+twox-hash = "1.6"
+
+# Error handling
+anyhow = "1"
+thiserror = "1"
+
+[profile.dev]
+opt-level = 1 # symphonia/rodio are painfully slow un-optimized in debug
