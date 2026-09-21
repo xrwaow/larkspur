@@ -26,22 +26,39 @@ pub struct PlaybackController {
 
 impl PlaybackController {
     pub fn new(queue: Vec<PathBuf>) -> anyhow::Result<Self> {
-        anyhow::ensure!(!queue.is_empty(), "no songs given");
-
         let device_sink = DeviceSinkBuilder::open_default_sink()?;
         let player = Player::connect_new(device_sink.mixer());
 
-        let (source, metadata, duration) = Self::track_parts(&queue[0])?;
-        player.append(source);
-
-        Ok(Self {
+        let mut this = Self {
             _device_sink: device_sink,
             player,
             queue,
-            current: Some(0),
-            metadata,
-            duration,
-        })
+            current: None,
+            metadata: SongMetadata::placeholder(),
+            duration: Duration::ZERO,
+        };
+
+        // An empty queue is valid: the app may launch with only a directory to
+        // scan, and a track gets queued once the library is up.
+        if !this.queue.is_empty() {
+            let parts = Self::track_parts(&this.queue[0])?;
+            this.start_track(0, parts);
+        }
+        Ok(this)
+    }
+
+    /// Replace the whole queue and start playing at `start`.
+    ///
+    /// This is how a playlist becomes the play queue: the UI resolves the
+    /// playlist's [`SongId`](crate::model::SongId)s to paths and hands them
+    /// over — the controller never needs to know what a playlist is.
+    pub fn set_queue(&mut self, queue: Vec<PathBuf>, start: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(!queue.is_empty(), "empty queue");
+        let start = start.min(queue.len() - 1);
+        let parts = Self::track_parts(&queue[start])?;
+        self.queue = queue;
+        self.start_track(start, parts);
+        Ok(())
     }
 
     /// Decode + tag-read one track. rodio's Decoder covers FLAC/MP3/WAV/

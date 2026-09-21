@@ -30,7 +30,7 @@ fn main() -> anyhow::Result<()> {
         &metadata.artists,
         metadata.duration,
     );
-    let waveform = larkspur::waveform::compute_waveform(Path::new(&path), 120)?;
+    let waveform = larkspur::analysis::compute_waveform(Path::new(&path), 120)?;
     println!(
         "waveform: {} bars, peak {:.2}",
         waveform.len(),

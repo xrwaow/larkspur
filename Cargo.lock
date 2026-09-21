@@ -3033,10 +3033,13 @@ version = "0.0.1"
 dependencies = [
  "anyhow",
  "gpui",
+ "image",
  "lofty",
  "lru",
  "opus",
  "rodio",
+ "serde",
+ "serde_json",
  "symphonia",
  "thiserror 1.0.69",
  "twox-hash",

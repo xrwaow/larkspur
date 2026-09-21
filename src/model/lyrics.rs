@@ -1,7 +1,11 @@
+use std::borrow::Cow;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use serde::{Deserialize, Serialize};
+
 /// One timestamped line of synced lyrics.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LyricLine {
     pub timestamp: Duration,
     pub text: String,
@@ -13,13 +17,57 @@ pub struct LyricLine {
 /// timestamps, so `Synced` usually comes from a `.lrc` sidecar — but some
 /// taggers *do* embed LRC-formatted text, which is why [`looks_like_lrc`]
 /// sniffs the tag contents rather than trusting the source.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Lyrics {
     None,
     /// Unsynced text, shown as a block.
     Plain(String),
     /// Timestamped lines, shown highlighted against playback position.
     Synced(Vec<LyricLine>),
+}
+
+impl Lyrics {
+    pub fn is_none(&self) -> bool {
+        matches!(self, Lyrics::None)
+    }
+
+    /// The full text, however it's stored — used by the search engine and by
+    /// the plain rendering path. Borrowed for `Plain`, joined for `Synced`.
+    pub fn text(&self) -> Option<Cow<'_, str>> {
+        match self {
+            Lyrics::None => None,
+            Lyrics::Plain(s) => Some(Cow::Borrowed(s)),
+            Lyrics::Synced(lines) => {
+                if lines.is_empty() {
+                    return None;
+                }
+                let mut joined = String::new();
+                for (i, line) in lines.iter().enumerate() {
+                    if i > 0 {
+                        joined.push('\n');
+                    }
+                    joined.push_str(&line.text);
+                }
+                Some(Cow::Owned(joined))
+            }
+        }
+    }
+}
+
+/// The `.lrc` sidecar path for an audio file: same directory, same stem.
+pub fn sidecar_path(audio: &Path) -> PathBuf {
+    audio.with_extension("lrc")
+}
+
+/// Load synced lyrics from a `.lrc` sidecar next to `audio`, if one is there.
+///
+/// A sidecar wins over embedded lyrics: it's the only source that reliably
+/// carries timestamps, so when both exist the synced one is the better answer.
+/// Sidecars are read at scan time and cached with the rest of the metadata.
+pub fn load_sidecar(audio: &Path) -> Option<Lyrics> {
+    let text = std::fs::read_to_string(sidecar_path(audio)).ok()?;
+    let lines = parse_lrc(&text);
+    (!lines.is_empty()).then_some(Lyrics::Synced(lines))
 }
 
 /// Detects whether a string contains LRC-style timestamp tags

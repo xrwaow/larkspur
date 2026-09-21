@@ -10,25 +10,26 @@ use super::introspect::{self, ModuleSizes};
 
 /// The window's dock/center arrangement.
 ///
-/// Playback bar across the bottom, cover square docked right, with matching
-/// placeholder rails on the left and above the cover. The rails carry z(2),
-/// so they hug their window edges at full height and the bottom bar (z=1)
-/// fits *between* them — keeping it centered in the window instead of
-/// shifted left by the cover.
+/// Playback bar across the bottom, the playlist list docked left, and the
+/// right rail carrying the lyrics panel above the cover square. The center is
+/// the tab container, which holds one active container per tab — browse,
+/// search, or an opened playlist. The rails carry z(2), so they hug their
+/// window edges at full height and the bottom bar (z=1) fits *between* them —
+/// keeping it centered in the window instead of shifted left by the cover.
 pub fn app_layout() -> LayoutPlan {
-    let mut plan = LayoutPlan::new(module("empty"));
+    let mut plan = LayoutPlan::new(module("tabs"));
     plan.dock(Dock::bottom(module("playback")));
     plan.dock(
         Dock::right(
             col(vec![
-                module("empty-above-cover").fill(),
+                module("lyrics").fill(),
                 module("cover"),
             ])
             .px(240.0),
         )
         .z(2),
     );
-    plan.dock(Dock::left(module("empty-left").px(240.0)).z(2));
+    plan.dock(Dock::left(module("playlists").px(240.0)).z(2));
     plan
 }
 

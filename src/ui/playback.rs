@@ -1,17 +1,18 @@
 use std::cell::Cell;
 use std::rc::Rc;
 use std::sync::Arc;
-use std::time::Duration;
 
 use gpui::{
-    canvas, div, fill, point, prelude::*, px, rgb, size, AnyElement, Bounds, Context, Entity,
-    FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, PathBuilder, Pixels, Render,
-    Rgba, Subscription, Window,
+    canvas, div, fill, point, prelude::*, px, size, AnyElement, Bounds, Context, Entity,
+    Keystroke, MouseButton, MouseDownEvent, PathBuilder, Pixels, Render, Rgba, Subscription, Window,
 };
 
 use crate::model::InputAction;
+use crate::ui::config_state::ConfigState;
 use crate::ui::container::Container;
+use crate::ui::format::format_duration;
 use crate::ui::state::PlaybackState;
+use crate::ui::theme::Theme;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum WaveformStyle {
@@ -23,34 +24,38 @@ pub struct PlaybackView {
     /// Shared playback state. This view reads it and dispatches actions
     /// into it; it never owns the controller.
     state: Entity<PlaybackState>,
+    theme: Theme,
     style: WaveformStyle,
-    focus_handle: FocusHandle,
     // Filled in by the seek-bar's canvas each time it paints, so
     // on_mouse_down can turn a window-relative click into a
     // bar-relative fraction without guessing at layout position.
     seek_bar_bounds: Rc<Cell<Bounds<Pixels>>>,
     _observe: Subscription,
+    _observe_config: Subscription,
 }
 
 impl PlaybackView {
-    pub fn new(state: Entity<PlaybackState>, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        state: Entity<PlaybackState>,
+        config: Entity<ConfigState>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         // Re-render whenever the shared state changes. The state owns the
         // ticker, so this view no longer polls for position updates.
         let observe = cx.observe(&state, |_this, _state, cx| cx.notify());
+        let observe_config = cx.observe(&config, |this, config, cx| {
+            this.theme = config.read(cx).theme_for(Self::container_id(), Self::default_font_size());
+            cx.notify();
+        });
+        let theme = config.read(cx).theme_for(Self::container_id(), Self::default_font_size());
         Self {
             state,
+            theme,
             style: WaveformStyle::Bars,
-            focus_handle: cx.focus_handle(),
             seek_bar_bounds: Rc::new(Cell::new(Bounds::default())),
             _observe: observe,
+            _observe_config: observe_config,
         }
-    }
-
-    /// Exposed so main.rs can grab OS/window keyboard focus onto this
-    /// view right after creating it — without this, on_key_down never
-    /// fires because nothing is focused by default.
-    pub fn focus_handle_for_window(&self) -> FocusHandle {
-        self.focus_handle.clone()
     }
 
     /// Route a decoupled [`InputAction`] into the shared state, re-rendering
@@ -83,12 +88,27 @@ impl PlaybackView {
 ///
 /// This is the *only* place GPUI key names appear. Everything downstream
 /// matches on `InputAction`, so swapping or extending the input backend
-/// (say, a TUI) is a change to this one function.
-fn action_for_key(key: &str) -> Option<InputAction> {
+/// (say, a TUI) is a change to this one function. Views call this for every
+/// key they receive and act on the subset they own; the rest bubble up.
+pub(crate) fn action_for_key(keystroke: &Keystroke) -> Option<InputAction> {
+    let key = keystroke.key.as_str();
+    let modifiers = keystroke.modifiers;
     match key {
+        // Tab switching, closing, and search are the tab container's.
+        "tab" if modifiers.control => Some(if modifiers.shift {
+            InputAction::PrevTab
+        } else {
+            InputAction::NextTab
+        }),
+        "w" if modifiers.control => Some(InputAction::CloseTab),
+        "f" if modifiers.control && modifiers.shift => Some(InputAction::ToggleSearch),
+        "escape" => Some(InputAction::CloseOverlay),
         "left" => Some(InputAction::SeekBackward),
         "right" => Some(InputAction::SeekForward),
         "space" => Some(InputAction::TogglePause),
+        "up" => Some(InputAction::SelectPrev),
+        "down" => Some(InputAction::SelectNext),
+        "enter" => Some(InputAction::Activate),
         _ => None,
     }
 }
@@ -99,18 +119,14 @@ impl Container for PlaybackView {
     }
 }
 
-impl Focusable for PlaybackView {
-    fn focus_handle(&self, _cx: &gpui::App) -> FocusHandle {
-        self.focus_handle.clone()
-    }
-}
-
 const BAR_WIDTH: f32 = 480.0;
 const BAR_HEIGHT: f32 = 40.0;
 const BAR_GAP: f32 = 1.0;
 
 impl Render for PlaybackView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
+
         // Snapshot the shared state once, then drop the borrow before
         // building elements.
         let (position, duration, can_prev, can_next, ended, playing, peaks) = {
@@ -122,7 +138,7 @@ impl Render for PlaybackView {
                 state.can_next(),
                 state.ended(),
                 state.is_playing(),
-                state.waveform().peaks(),
+                state.peaks(),
             )
         };
 
@@ -141,7 +157,6 @@ impl Render for PlaybackView {
             .h(px(BAR_HEIGHT))
             .relative()
             .overflow_hidden()
-            .bg(rgb(0x181818))
             .child(
                 // canvas gives us the element's real on-screen bounds
                 // every time it paints — that's what on_mouse_down below
@@ -162,7 +177,7 @@ impl Render for PlaybackView {
                 div()
                     .absolute()
                     .inset_0()
-                    .child(render_waveform(peaks, self.style, fraction)),
+                    .child(render_waveform(peaks, self.style, fraction, theme)),
             )
             .on_mouse_down(
                 MouseButton::Left,
@@ -181,19 +196,14 @@ impl Render for PlaybackView {
             );
 
         div()
-            .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                if let Some(action) = action_for_key(&event.keystroke.key) {
-                    this.dispatch(action, cx);
-                }
-            }))
             .flex()
             .flex_col()
             .items_center()
             .gap_3()
             .p_4()
             .w_full()
-            .bg(rgb(0x141414))
+            .bg(theme.panel_bg)
+            .font_family(theme.font)
             .child(
                 div()
                     .flex()
@@ -204,6 +214,7 @@ impl Render for PlaybackView {
                         "prev",
                         can_prev,
                         PREV_POLYGONS,
+                        theme,
                         cx.listener(|this, _event, _window, cx| {
                             this.dispatch(InputAction::PrevTrack, cx);
                         }),
@@ -218,19 +229,19 @@ impl Render for PlaybackView {
                             .flex()
                             .items_center()
                             .justify_center()
-                            .bg(rgb(0xffffff))
-                            .when(!ended, |d| d.hover(|d| d.bg(rgb(0xdddddd))))
+                            .bg(theme.text)
+                            .when(!ended, |d| d.hover(|d| d.bg(theme.text_muted)))
                             .on_click(cx.listener(|this, _event, _window, cx| {
                                 this.dispatch(InputAction::TogglePause, cx);
                             }))
                             .child(div().flex().items_center().child(if playing {
-                                icon(13.0, 16.0, PAUSE_POLYGONS, rgb(0x101010)).into_any_element()
+                                icon(13.0, 16.0, PAUSE_POLYGONS, theme.panel_bg).into_any_element()
                             } else {
                                 // Nudge the triangle right so it reads as
                                 // optically centered in the circle.
                                 div()
                                     .pl(px(2.0))
-                                    .child(icon(14.0, 16.0, PLAY_POLYGONS, rgb(0x101010)))
+                                    .child(icon(14.0, 16.0, PLAY_POLYGONS, theme.panel_bg))
                                     .into_any_element()
                             })),
                     )
@@ -238,35 +249,45 @@ impl Render for PlaybackView {
                         "next",
                         can_next,
                         NEXT_POLYGONS,
+                        theme,
                         cx.listener(|this, _event, _window, cx| {
                             this.dispatch(InputAction::NextTrack, cx);
                         }),
-                    ))
+                    )),
+            )
+            .child(seek_bar)
+            .child(
+                // Current time — style toggle — total time. The toggle sits
+                // between them, under the waveform it switches.
+                div()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .w(px(BAR_WIDTH))
+                    .text_size(px(theme.small_px()))
+                    .text_color(theme.text_muted)
+                    .child(format_duration(position))
                     .child(
                         div()
                             .id("style-toggle")
                             .cursor_pointer()
-                            .ml_4()
-                            .text_xs()
-                            .text_color(rgb(0x707070))
-                            .hover(|d| d.text_color(rgb(0xaaaaaa)))
+                            .text_size(px(theme.small_px()))
+                            .text_color(theme.text_faint)
+                            .hover(|d| d.text_color(theme.text))
                             .on_click(cx.listener(|this, _event, _window, cx| this.toggle_style(cx)))
                             .child(match self.style {
                                 WaveformStyle::Bars => "bars",
                                 WaveformStyle::FlatLine => "line",
                             }),
+                    )
+                    // The live bitrate now rides on the playing track's row in
+                    // the list views, next to its duration.
+                    .child(
+                        div()
+                            .text_size(px(theme.small_px()))
+                            .text_color(theme.text_muted)
+                            .child(format_duration(duration)),
                     ),
-            )
-            .child(seek_bar)
-            .child(
-                div()
-                    .flex()
-                    .justify_between()
-                    .w(px(BAR_WIDTH))
-                    .text_xs()
-                    .text_color(rgb(0x707070))
-                    .child(format_duration(position))
-                    .child(format_duration(duration)),
             )
     }
 }
@@ -330,6 +351,7 @@ fn transport_button(
     id: &'static str,
     enabled: bool,
     polygons: &'static [&'static [(f32, f32)]],
+    theme: Theme,
     on_click: impl Fn(&gpui::ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> impl IntoElement {
     div()
@@ -340,25 +362,18 @@ fn transport_button(
         .flex()
         .items_center()
         .justify_center()
-        .when(enabled, |d| d.hover(|d| d.bg(rgb(0x222222))))
+        .when(enabled, |d| d.hover(|d| d.bg(theme.row_active)))
         .on_click(on_click)
-        .child(icon(15.0, 14.0, polygons, rgb(0xcccccc)))
+        .child(icon(15.0, 14.0, polygons, theme.text_muted))
 }
 
-fn format_duration(d: Duration) -> String {
-    let secs = d.as_secs();
-    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    if h > 0 {
-        format!("{h}:{m:02}:{s:02}")
-    } else {
-        format!("{m}:{s:02}")
-    }
-}
-
+/// A fixed-size canvas painting filled polygons given in unit-square
+/// coordinates, scaled into the element's bounds.
 fn render_waveform(
     peaks: Option<Arc<Vec<f32>>>,
     style: WaveformStyle,
     progress: f32,
+    theme: Theme,
 ) -> AnyElement {
     match style {
         WaveformStyle::FlatLine => div()
@@ -372,7 +387,7 @@ fn render_waveform(
                     .top(px((BAR_HEIGHT - 2.0) / 2.0))
                     .w_full()
                     .h(px(2.0))
-                    .bg(rgb(0x404040)),
+                    .bg(theme.waveform),
             )
             .child(
                 // Progress dot centered on the line, fully inside the bar
@@ -384,12 +399,12 @@ fn render_waveform(
                     .top(px((BAR_HEIGHT - 10.0) / 2.0))
                     .size(px(10.0))
                     .rounded_full()
-                    .bg(rgb(0xffffff)),
+                    .bg(theme.waveform_played),
             )
             .into_any_element(),
         WaveformStyle::Bars => match peaks {
-            Some(peaks) => waveform_bars(peaks, progress),
-            // Still decoding (or unavailable): leave the bar empty rather
+            Some(peaks) => waveform_bars(peaks, progress, theme),
+            // Still analyzing (or unavailable): leave the bar empty rather
             // than flashing a placeholder shape that then swaps.
             None => div().size_full().into_any_element(),
         },
@@ -401,7 +416,7 @@ fn render_waveform(
 /// One element with one paint callback, instead of one `div` per bar — the
 /// element-tree cost is constant no matter how many buckets we use, so the
 /// bucket count can grow toward per-pixel resolution without a frame cost.
-fn waveform_bars(peaks: Arc<Vec<f32>>, progress: f32) -> AnyElement {
+fn waveform_bars(peaks: Arc<Vec<f32>>, progress: f32, theme: Theme) -> AnyElement {
     canvas(
         |_bounds, _window, _cx| (),
         move |bounds, _prepaint, window, _cx| {
@@ -422,7 +437,7 @@ fn waveform_bars(peaks: Arc<Vec<f32>>, progress: f32) -> AnyElement {
                 let y = origin_y + (height - bar_height);
                 let bar = Bounds::new(point(px(x), px(y)), size(px(bar_width), px(bar_height)));
                 let played = (i as f32 / count as f32) < progress;
-                let color = if played { rgb(0xffffff) } else { rgb(0x404040) };
+                let color = if played { theme.waveform_played } else { theme.waveform };
                 window.paint_quad(fill(bar, color));
             }
         },

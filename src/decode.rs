@@ -2,7 +2,7 @@
 //!
 //! Several call sites need the same dance: open a file, build a `Hint`
 //! from its extension, probe the container, and pick a playable track —
-//! the Opus source, the waveform scanner, and the headless bitrate probe.
+//! the Opus source, the one-pass track analysis, and the bitrate probe.
 //! This is that one implementation, so they can't drift apart.
 
 use std::fs::File;

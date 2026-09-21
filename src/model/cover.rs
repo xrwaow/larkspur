@@ -11,6 +11,13 @@ pub struct DecodedImage {
     pub rgba: Vec<u8>,
 }
 
+impl DecodedImage {
+    /// Size in bytes of the pixel buffer — what the cache budgets against.
+    pub fn byte_len(&self) -> usize {
+        self.rgba.len()
+    }
+}
+
 /// Cover art for one song/album, as a state rather than an `Option`.
 ///
 /// Distinguishes "haven't tried yet", "in flight", and "genuinely has no
@@ -24,19 +31,26 @@ pub enum CoverState {
     Missing,
 }
 
-/// Two-tier cover cache: bounded in-memory LRU (decoded pixels) plus a
-/// persistent on-disk thumbnail cache keyed by [`SongId`](super::SongId).
+/// Two-tier cover cache: bounded in-memory LRU plus a persistent on-disk
+/// thumbnail cache keyed by [`SongId`](super::SongId).
 ///
 /// Eviction is by a real **byte budget**, not entry count — image sizes
 /// vary too much for a count-based cap to mean anything.
-pub struct CoverCache {
-    memory: lru::LruCache<u64, Arc<DecodedImage>>,
+///
+/// Generic over the payload so the framework-agnostic model can own the
+/// budgeting while the UI stores whatever it renders from: the model stores
+/// [`DecodedImage`], the GPUI layer stores its own `RenderImage`. The caller
+/// passes each entry's byte size, since only it knows the payload's shape.
+pub struct CoverCache<T> {
+    /// Each entry keeps its own byte size, so a replaced or evicted entry can
+    /// be subtracted from the running total.
+    memory: lru::LruCache<u64, (Arc<T>, usize)>,
     memory_bytes: usize,
     memory_budget_bytes: usize,
     disk_dir: PathBuf,
 }
 
-impl CoverCache {
+impl<T> CoverCache<T> {
     pub fn new(disk_dir: PathBuf, memory_budget_bytes: usize) -> Self {
         std::fs::create_dir_all(&disk_dir).ok();
         Self {
@@ -48,29 +62,39 @@ impl CoverCache {
         }
     }
 
-    pub fn get(&mut self, id: u64) -> Option<Arc<DecodedImage>> {
-        self.memory.get(&id).cloned()
+    pub fn get(&mut self, id: u64) -> Option<Arc<T>> {
+        self.memory.get(&id).map(|(value, _)| value.clone())
     }
 
-    /// Insert (or replace) the decoded image for `id`, evicting
-    /// least-recently-used entries until the byte budget is met.
-    pub fn insert(&mut self, id: u64, image: Arc<DecodedImage>) {
-        let size = image.rgba.len();
+    /// Insert (or replace) the entry for `id`, evicting least-recently-used
+    /// entries until the byte budget is met. `bytes` is the payload's size,
+    /// as reported by the caller.
+    ///
+    /// Returns the ids it evicted, so a caller keeping a parallel map (the UI's
+    /// GPU-ready images) can drop the same entries and stay in lockstep with
+    /// this cache instead of growing a second, unbounded one.
+    pub fn insert(&mut self, id: u64, value: Arc<T>, bytes: usize) -> Vec<u64> {
+        let mut evicted = Vec::new();
 
         // `put` hands back the entry it displaced. Account for it, or a
         // re-insert of the same id leaves the counter permanently high and
         // the cache evicts entries it should have kept.
-        if let Some(previous) = self.memory.put(id, image) {
-            self.memory_bytes -= previous.rgba.len();
+        if let Some((_, previous_bytes)) = self.memory.put(id, (value, bytes)) {
+            self.memory_bytes -= previous_bytes;
+            evicted.push(id);
         }
-        self.memory_bytes += size;
+        self.memory_bytes += bytes;
 
         while self.memory_bytes > self.memory_budget_bytes {
             match self.memory.pop_lru() {
-                Some((_, evicted)) => self.memory_bytes -= evicted.rgba.len(),
+                Some((key, (_, evicted_bytes))) => {
+                    self.memory_bytes -= evicted_bytes;
+                    evicted.push(key);
+                }
                 None => break,
             }
         }
+        evicted
     }
 
     /// Current accounted memory usage in bytes. Exposed for tests and
@@ -103,15 +127,23 @@ mod tests {
         Arc::new(DecodedImage { width: 1, height: 1, rgba: vec![0; bytes] })
     }
 
-    fn cache(budget: usize) -> CoverCache {
+    fn cache(budget: usize) -> CoverCache<DecodedImage> {
         CoverCache::new(std::env::temp_dir().join("larkspur-test-covers"), budget)
+    }
+
+    /// Insert accounting for the payload's real size, the way the UI does.
+    fn insert(c: &mut CoverCache<DecodedImage>, id: u64, bytes: usize) -> Vec<u64> {
+        let image = image(bytes);
+        let size = image.byte_len();
+        c.insert(id, image, size)
     }
 
     #[test]
     fn evicts_least_recently_used_to_meet_budget() {
         let mut c = cache(100);
-        c.insert(1, image(60));
-        c.insert(2, image(60)); // 120 > 100, so id 1 goes first
+        insert(&mut c, 1, 60);
+        let evicted = insert(&mut c, 2, 60); // 120 > 100, so id 1 goes first
+        assert_eq!(evicted, vec![1], "the caller is told what was dropped");
         assert!(c.get(1).is_none());
         assert!(c.get(2).is_some());
         assert_eq!(c.memory_usage(), 60);
@@ -120,8 +152,8 @@ mod tests {
     #[test]
     fn reinsert_does_not_leak_budget() {
         let mut c = cache(100);
-        c.insert(1, image(60));
-        c.insert(1, image(60)); // replace, not accumulate
+        insert(&mut c, 1, 60);
+        insert(&mut c, 1, 60); // replace, not accumulate
         assert_eq!(c.memory_usage(), 60);
         assert!(c.get(1).is_some());
     }
@@ -129,7 +161,8 @@ mod tests {
     #[test]
     fn oversized_image_does_not_stay_cached() {
         let mut c = cache(10);
-        c.insert(1, image(50));
+        let evicted = insert(&mut c, 1, 50);
+        assert_eq!(evicted, vec![1], "it evicted itself");
         assert_eq!(c.memory_usage(), 0);
         assert!(c.get(1).is_none());
     }

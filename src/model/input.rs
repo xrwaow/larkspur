@@ -16,4 +16,20 @@ pub enum InputAction {
     VolumeDown,
     FocusLeftPane,
     FocusRightPane,
+    /// Move the playlist selection down a row.
+    SelectNext,
+    /// Move the playlist selection up a row.
+    SelectPrev,
+    /// Play the selected row.
+    Activate,
+    /// Switch to the next center tab.
+    NextTab,
+    /// Switch to the previous center tab.
+    PrevTab,
+    /// Toggle the search box, bringing the search panel into view.
+    ToggleSearch,
+    /// Close the active tab (or the search panel, if it's up).
+    CloseTab,
+    /// Dismiss whatever overlay is on top.
+    CloseOverlay,
 }

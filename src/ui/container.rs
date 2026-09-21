@@ -8,6 +8,15 @@ use gpui::{div, prelude::*, px, relative, rgb, AnyElement, AnyView, Context, Ent
 /// without knowing their concrete types.
 pub trait Container: Render + Sized {
     fn container_id() -> &'static str;
+
+    /// The built-in font size for this container, in px.
+    ///
+    /// Every container inherits [`DEFAULT_FONT_SIZE`] from here and may adjust
+    /// it; `Config::font_sizes` can override it at runtime, so a view reads its
+    /// size through the shared config rather than trusting this directly.
+    fn default_font_size() -> f32 {
+        crate::model::config::DEFAULT_FONT_SIZE
+    }
 }
 
 /// Main-axis size of a layout child: width in a [`Layout::Row`],

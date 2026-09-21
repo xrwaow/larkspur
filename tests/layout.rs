@@ -31,7 +31,7 @@ fn touches(report: &LayoutReport, a: &str, b: &str) -> bool {
 fn every_module_in_the_layout_gets_a_region() {
     let report = report();
     let names = names(&report);
-    for id in ["empty", "empty-left", "empty-above-cover", "cover", "playback"] {
+    for id in ["tabs", "playlists", "lyrics", "cover", "playback"] {
         assert!(names.iter().any(|n| n == id), "no region for {id}: {names:?}");
     }
 }
@@ -39,24 +39,24 @@ fn every_module_in_the_layout_gets_a_region() {
 #[test]
 fn left_rail_spans_the_full_window_height() {
     let report = report();
-    assert!(touches(&report, "empty-left", "window.top"), "left rail reaches the top");
-    assert!(touches(&report, "empty-left", "window.bottom"), "left rail reaches the bottom");
+    assert!(touches(&report, "playlists", "window.top"), "left rail reaches the top");
+    assert!(touches(&report, "playlists", "window.bottom"), "left rail reaches the bottom");
 }
 
 #[test]
-fn right_rail_is_split_into_placeholder_and_cover() {
+fn right_rail_is_split_into_lyrics_and_cover() {
     let report = report();
-    // The filler occupies the top of the rail, the cover the bottom.
-    assert!(touches(&report, "empty-above-cover", "window.top"));
+    // The lyrics panel occupies the top of the rail, the cover the bottom.
+    assert!(touches(&report, "lyrics", "window.top"));
     assert!(touches(&report, "cover", "window.bottom"));
-    assert!(touches(&report, "empty-above-cover", "cover"));
+    assert!(touches(&report, "lyrics", "cover"));
 }
 
 #[test]
 fn playback_bar_sits_between_the_rails() {
     let report = report();
     // The bar's ends meet the rails...
-    assert!(touches(&report, "playback", "empty-left"), "bar meets the left rail");
+    assert!(touches(&report, "playback", "playlists"), "bar meets the left rail");
     assert!(touches(&report, "playback", "cover"), "bar meets the right rail");
     // ...and it hugs the bottom without reaching the window's own sides.
     assert!(touches(&report, "playback", "window.bottom"));
@@ -67,17 +67,17 @@ fn playback_bar_sits_between_the_rails() {
 #[test]
 fn center_is_flanked_by_both_rails_and_the_bar() {
     let report = report();
-    assert!(touches(&report, "empty", "empty-left"), "center meets the left rail");
-    assert!(touches(&report, "empty", "empty-above-cover"), "center meets the right rail");
-    assert!(touches(&report, "empty", "playback"), "center sits above the bar");
+    assert!(touches(&report, "tabs", "playlists"), "center meets the left rail");
+    assert!(touches(&report, "tabs", "lyrics"), "center meets the right rail");
+    assert!(touches(&report, "tabs", "playback"), "center sits above the bar");
 }
 
 #[test]
-fn cover_is_bottom_right_with_the_placeholder_above_it() {
+fn cover_is_bottom_right_with_the_lyrics_above_it() {
     let report = report();
     assert!(touches(&report, "cover", "window.bottom"), "cover is at the bottom");
     assert!(touches(&report, "cover", "window.right"), "cover is at the right");
-    assert!(touches(&report, "empty-above-cover", "cover"), "placeholder sits above cover");
+    assert!(touches(&report, "lyrics", "cover"), "lyrics sit above cover");
 }
 
 #[test]
@@ -96,7 +96,7 @@ fn docks_resolve_outermost_first() {
 #[test]
 fn describe_app_produces_a_readable_diagram() {
     let text = layout::describe_app();
-    for id in ["empty-left", "empty-above-cover", "cover", "playback"] {
+    for id in ["playlists", "lyrics", "cover", "playback", "tabs"] {
         assert!(text.contains(id), "diagram should mention {id}:\n{text}");
     }
     assert!(text.contains('┌') && text.contains('─') && text.contains('│'), "diagram should be box-drawn:\n{text}");
