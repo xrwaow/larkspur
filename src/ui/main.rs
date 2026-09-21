@@ -3,9 +3,11 @@ use gpui::{
 };
 
 use larkspur::audio::PlaybackController;
-use larkspur::ui::container::{col, module, Dock, Workspace, EmptyView};
+use larkspur::ui::container::{EmptyView, Workspace};
 use larkspur::ui::cover::CoverView;
+use larkspur::ui::layout;
 use larkspur::ui::playback::PlaybackView;
+use larkspur::ui::state::PlaybackState;
 
 fn main() {
     let queue: Vec<std::path::PathBuf> = std::env::args().skip(1).map(Into::into).collect();
@@ -16,12 +18,7 @@ fn main() {
 
     Application::new().run(move |cx: &mut App| {
         let bounds = Bounds::centered(None, size(px(1920.0), px(1080.0)), cx);
-        let controller =
-            PlaybackController::new(queue).expect("failed to load songs");
-        let has_art = matches!(
-            controller.metadata.cover,
-            larkspur::datatypes::CoverState::NotRequested | larkspur::datatypes::CoverState::Ready(_)
-        );
+        let controller = PlaybackController::new(queue).expect("failed to load songs");
 
         cx.open_window(
             WindowOptions {
@@ -33,8 +30,13 @@ fn main() {
                 ..Default::default()
             },
             move |window, cx| {
-                let cover = cx.new(|_| CoverView { has_art });
-                let playback = cx.new(|cx| PlaybackView::new(controller, cx));
+                // One shared, observable playback state. The views below take
+                // a clone of it and observe it — none of them own the
+                // controller, and none of them poll.
+                let state = cx.new(|cx| PlaybackState::new(controller, cx));
+
+                let playback = cx.new(|cx| PlaybackView::new(state.clone(), cx));
+                let cover = cx.new(|cx| CoverView::new(state.clone(), cx));
                 let empty_center = cx.new(|_| EmptyView);
                 let empty_left = cx.new(|_| EmptyView);
                 let empty_above_cover = cx.new(|_| EmptyView);
@@ -42,34 +44,17 @@ fn main() {
                 let focus_handle = playback.read(cx).focus_handle_for_window();
                 window.focus(&focus_handle);
 
-                // Edge-docked layout: playback bar across the bottom, cover
-                // square docked right, with matching placeholder rails on
-                // the left and above the cover. The rails carry z(2), so
-                // they hug their window edges at full height and the bottom
-                // bar (z=1) fits between them — keeping it centered in the
-                // window instead of shifted left by the cover. The cover
-                // sits in the bottom-right corner with a placeholder filling
-                // the space above it.
-                let mut workspace = Workspace::new(module("empty"));
-                workspace.dock(Dock::bottom(module("playback")));
-                workspace.dock(
-                    Dock::right(
-                        col(vec![
-                            module("empty-above-cover").fill(),
-                            module("cover"),
-                        ])
-                        .px(240.0),
-                    )
-                    .z(2),
-                );
-                workspace.dock(Dock::left(module("empty-left").px(240.0)).z(2));
+                // The dock arrangement lives in `ui::layout::app_layout`, so
+                // it's shared with the text-introspection tooling. Here we
+                // only bind live views to its module ids.
+                let mut workspace = Workspace::from_plan(layout::app_layout());
                 workspace.push_as("empty", empty_center);
                 workspace.push_as("empty-left", empty_left);
                 workspace.push_as("empty-above-cover", empty_above_cover);
                 workspace.push(cover);
                 workspace.push(playback);
                 cx.new(|_| workspace)
-            }
+            },
         )
         .unwrap();
 

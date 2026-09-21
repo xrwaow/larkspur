@@ -23,12 +23,12 @@ fn main() -> anyhow::Result<()> {
         .expect("usage: seek_probe <audio-file>");
 
     // Exercise the full track_parts path, including tag reading.
-    let metadata = larkspur::datatypes::SongMetadata::load(Path::new(&path))?;
+    let metadata = larkspur::model::SongMetadata::load(Path::new(&path))?;
     println!(
         "metadata: {:?} / {:?}, duration {:?}",
-        metadata.as_ref().map(|m| &m.song_name),
-        metadata.as_ref().map(|m| &m.artists),
-        metadata.as_ref().map(|m| m.duration),
+        &metadata.song_name,
+        &metadata.artists,
+        metadata.duration,
     );
     let waveform = larkspur::waveform::compute_waveform(Path::new(&path), 120)?;
     println!(

@@ -1,0 +1,97 @@
+//! Shared Symphonia container-opening logic.
+//!
+//! Several call sites need the same dance: open a file, build a `Hint`
+//! from its extension, probe the container, and pick a playable track —
+//! the Opus source, the waveform scanner, and the headless bitrate probe.
+//! This is that one implementation, so they can't drift apart.
+
+use std::fs::File;
+use std::io::{Read, Seek, SeekFrom};
+use std::path::Path;
+
+use symphonia::core::codecs::{CodecParameters, CODEC_TYPE_NULL};
+use symphonia::core::formats::{FormatOptions, FormatReader};
+use symphonia::core::io::{MediaSource, MediaSourceStream};
+use symphonia::core::meta::MetadataOptions;
+use symphonia::core::probe::Hint;
+
+/// A `MediaSource` over a plain file that reports its real length —
+/// Symphonia's Ogg seek needs it for the page binary search.
+pub struct SeekableFile {
+    inner: File,
+    len: Option<u64>,
+}
+
+impl MediaSource for SeekableFile {
+    fn is_seekable(&self) -> bool {
+        true
+    }
+
+    fn byte_len(&self) -> Option<u64> {
+        self.len
+    }
+}
+
+impl Read for SeekableFile {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(buf)
+    }
+}
+
+impl Seek for SeekableFile {
+    fn seek(&mut self, pos: SeekFrom) -> std::io::Result<u64> {
+        self.inner.seek(pos)
+    }
+}
+
+/// An opened container plus the first playable track's parameters.
+pub struct OpenedTrack {
+    pub format: Box<dyn FormatReader>,
+    pub track_id: u32,
+    pub codec_params: CodecParameters,
+}
+
+/// Open `path` and select the first track with a real (non-null) codec.
+///
+/// `gapless` enables packet-level pre-skip/end trimming, which is what
+/// makes Opus decode sample-accurately at the start and end of the stream.
+pub fn open_track(path: &Path, gapless: bool) -> anyhow::Result<OpenedTrack> {
+    let file = File::open(path)?;
+    let len = file.metadata().ok().map(|m| m.len());
+    let mss = MediaSourceStream::new(
+        Box::new(SeekableFile { inner: file, len }) as Box<dyn MediaSource + Send + Sync>,
+        Default::default(),
+    );
+
+    let mut hint = Hint::new();
+    if let Some(ext) = path.extension().and_then(|e| e.to_str()) {
+        hint.with_extension(ext);
+    }
+
+    let format_options = FormatOptions {
+        enable_gapless: gapless,
+        ..Default::default()
+    };
+    let probed = symphonia::default::get_probe().format(
+        &hint,
+        mss,
+        &format_options,
+        &MetadataOptions::default(),
+    )?;
+
+    let (track_id, codec_params) = {
+        let track = probed
+            .format
+            .tracks()
+            .iter()
+            .find(|t| t.codec_params.codec != CODEC_TYPE_NULL)
+            .ok_or_else(|| anyhow::anyhow!("no playable track in {path:?}"))?;
+        (track.id, track.codec_params.clone())
+    };
+
+    Ok(OpenedTrack {
+        format: probed.format,
+        track_id,
+        codec_params,
+    })
+}

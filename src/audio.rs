@@ -4,19 +4,23 @@ use std::time::Duration;
 
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source};
 
-use crate::datatypes::SongMetadata;
+use crate::model::{SongMetadata, SongStatus};
 use crate::opus::OpusSource;
-use crate::waveform::compute_waveform;
 
 type TrackSource = Box<dyn Source<Item = f32> + Send>;
 
+/// Owns the rodio player and device sink, the play queue, and the current
+/// track's static metadata.
+///
+/// Deliberately does *not* own the waveform: that's loaded off-thread by
+/// the UI layer (see the UI's `PlaybackState`), so a track change never
+/// blocks on a full-file decode here.
 pub struct PlaybackController {
     _device_sink: MixerDeviceSink, // must outlive the player or audio stops
     player: Player,
     queue: Vec<PathBuf>,
     current: Option<usize>,
     pub metadata: SongMetadata,
-    pub waveform: Vec<f32>,
     pub duration: Duration,
 }
 
@@ -27,7 +31,7 @@ impl PlaybackController {
         let device_sink = DeviceSinkBuilder::open_default_sink()?;
         let player = Player::connect_new(device_sink.mixer());
 
-        let (source, metadata, waveform, duration) = Self::track_parts(&queue[0])?;
+        let (source, metadata, duration) = Self::track_parts(&queue[0])?;
         player.append(source);
 
         Ok(Self {
@@ -36,7 +40,6 @@ impl PlaybackController {
             queue,
             current: Some(0),
             metadata,
-            waveform,
             duration,
         })
     }
@@ -44,10 +47,8 @@ impl PlaybackController {
     /// Decode + tag-read one track. rodio's Decoder covers FLAC/MP3/WAV/
     /// Vorbis; Opus falls through to our symphonia+libopus source because
     /// symphonia 0.5 has no Opus decoder.
-    fn track_parts(path: &Path) -> anyhow::Result<(TrackSource, SongMetadata, Vec<f32>, Duration)> {
-        let metadata = SongMetadata::load(path)?
-            .ok_or_else(|| anyhow::anyhow!("no tag data found in {path:?}"))?;
-        let waveform = compute_waveform(path, 120)?;
+    fn track_parts(path: &Path) -> anyhow::Result<(TrackSource, SongMetadata, Duration)> {
+        let metadata = SongMetadata::load(path)?;
         let source: TrackSource = match Decoder::try_from(File::open(path)?) {
             Ok(decoder) => Box::new(decoder),
             Err(_) => Box::new(OpusSource::new(path)?),
@@ -56,7 +57,7 @@ impl PlaybackController {
         // tags can drift from the actual audio, and seek clamping should
         // match what's actually seekable.
         let duration = source.total_duration().unwrap_or(metadata.duration);
-        Ok((source, metadata, waveform, duration))
+        Ok((source, metadata, duration))
     }
 
     fn load_track(&mut self, index: usize) -> anyhow::Result<()> {
@@ -68,7 +69,7 @@ impl PlaybackController {
     fn start_track(
         &mut self,
         index: usize,
-        (source, metadata, waveform, duration): (TrackSource, SongMetadata, Vec<f32>, Duration),
+        (source, metadata, duration): (TrackSource, SongMetadata, Duration),
     ) {
         // skip_one (not clear — that blocks until the current track
         // finishes!) tells the audio thread to drop the current source;
@@ -80,7 +81,6 @@ impl PlaybackController {
         self.player.play();
         self.current = Some(index);
         self.metadata = metadata;
-        self.waveform = waveform;
         self.duration = duration;
     }
 
@@ -90,14 +90,19 @@ impl PlaybackController {
         self.player.empty() && self.advance()
     }
 
-    /// Start the next track if there is one.
+    /// Start the next track if there is one. Returns whether a new track
+    /// actually started (a failed load returns `false`, not a phantom
+    /// success).
     fn advance(&mut self) -> bool {
         let next = self.current.map_or(0, |i| i + 1);
         if next >= self.queue.len() {
             return false;
         }
         match Self::track_parts(&self.queue[next]) {
-            Ok(parts) => self.start_track(next, parts),
+            Ok(parts) => {
+                self.start_track(next, parts);
+                true
+            }
             Err(e) => {
                 eprintln!("failed to load {:?}: {e}", self.queue[next]);
                 // Drop whatever is playing so we land in the ended state
@@ -106,9 +111,9 @@ impl PlaybackController {
                     self.player.skip_one();
                 }
                 self.current = Some(next);
+                false
             }
         }
-        true
     }
 
     pub fn next_track(&mut self) {
@@ -116,13 +121,14 @@ impl PlaybackController {
     }
 
     pub fn prev_track(&mut self) {
-        if self.current.is_some_and(|i| i > 0) {
-            if let Err(e) = self.load_track(self.current.unwrap() - 1) {
-                eprintln!("failed to load previous track: {e}");
+        match self.current {
+            Some(i) if i > 0 => {
+                if let Err(e) = self.load_track(i - 1) {
+                    eprintln!("failed to load previous track: {e}");
+                }
             }
-        } else {
-            // First track: restart it.
-            self.seek(Duration::ZERO);
+            // First track (or nothing loaded): restart it.
+            _ => self.seek(Duration::ZERO),
         }
     }
 
@@ -141,12 +147,33 @@ impl PlaybackController {
         self.player.empty()
     }
 
+    /// Path of the currently-loaded track, for the UI to load the waveform
+    /// (and later, cover art) from without touching the decoder.
+    pub fn current_path(&self) -> Option<&Path> {
+        self.current
+            .and_then(|i| self.queue.get(i))
+            .map(PathBuf::as_path)
+    }
+
     pub fn position(&self) -> Duration {
         self.player.get_pos()
     }
 
     pub fn is_playing(&self) -> bool {
         !self.player.is_paused() && !self.player.empty()
+    }
+
+    /// Coarse playback status for display / state projection.
+    pub fn status(&self) -> SongStatus {
+        if self.current.is_none() {
+            SongStatus::NoSelection
+        } else if self.ended() {
+            SongStatus::Ended
+        } else if self.player.is_paused() {
+            SongStatus::Paused
+        } else {
+            SongStatus::Playing
+        }
     }
 
     pub fn toggle_play_pause(&self) {

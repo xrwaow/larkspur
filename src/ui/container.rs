@@ -13,7 +13,7 @@ pub trait Container: Render + Sized {
 /// Main-axis size of a layout child: width in a [`Layout::Row`],
 /// height in a [`Layout::Col`] (or the band thickness of a [`Dock`]).
 /// The cross axis always fills unless the content is fixed-size.
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug)]
 pub enum Size {
     /// Grow to take the remaining space (`flex: 1`).
     Fill,
@@ -27,6 +27,7 @@ pub enum Size {
 
 /// A declarative layout subtree. Modules plug in by container id; rows
 /// and columns nest arbitrarily.
+#[derive(Debug)]
 pub enum Layout {
     /// Slot filled by the module registered under this container id.
     Module(&'static str),
@@ -39,6 +40,7 @@ pub enum Layout {
 }
 
 /// A [`Layout`] plus its main-axis size within the parent Row/Col.
+#[derive(Debug)]
 pub struct Child {
     layout: Layout,
     size: Size,
@@ -68,6 +70,16 @@ impl Child {
         self.size = Size::Fraction(v);
         self
     }
+
+    /// The main-axis size policy of this child.
+    pub fn size(&self) -> Size {
+        self.size
+    }
+
+    /// The layout subtree this child places.
+    pub fn layout(&self) -> &Layout {
+        &self.layout
+    }
 }
 
 /// `Layout::Row` shorthand.
@@ -91,7 +103,7 @@ pub fn gap() -> Child {
 }
 
 /// The window edge a [`Dock`] attaches to.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Edge {
     Top,
     Bottom,
@@ -100,7 +112,7 @@ pub enum Edge {
 }
 
 /// Cross-axis placement of a dock's content within its band.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Align {
     Start,
     Center,
@@ -116,6 +128,7 @@ pub enum Align {
 /// — so by default bars span the full width and side panels span
 /// between them. Give a side dock `z(2)` to let it keep its full height
 /// and push the bars beside it instead.
+#[derive(Debug)]
 pub struct Dock {
     pub child: Child,
     pub edge: Edge,
@@ -153,7 +166,10 @@ impl Dock {
     /// Docks higher z first (outermost = hugs the window edge). Side
     /// docks are handicapped by 1 so top/bottom bars win contested
     /// corners by default.
-    fn sort_key(&self) -> (i32, i32) {
+    ///
+    /// `pub(crate)` so the text introspection in `ui::introspect` resolves
+    /// the layout in exactly the order the renderer does.
+    pub(crate) fn sort_key(&self) -> (i32, i32) {
         let side = matches!(self.edge, Edge::Left | Edge::Right);
         (self.z - if side { 1 } else { 0 }, self.z)
     }
@@ -170,17 +186,57 @@ impl From<Child> for Layout {
 /// Gap between sections, so flush panels don't visually merge.
 const SECTION_GAP: f32 = 8.0;
 
-/// Holds the module set and renders them: edge-docked bands first
-/// (highest z outermost), with the center layout in whatever remains.
+/// The pure layout description: docks plus a center, and nothing else.
+///
+/// Holding the layout as plain data (no `Entity`s, no `App`) is what lets
+/// `ui::introspect` — and the tests in `tests/layout.rs` — resolve and
+/// assert on the layout without opening a window.
+#[derive(Debug)]
+pub struct LayoutPlan {
+    pub docks: Vec<Dock>,
+    pub center: Layout,
+}
+
+impl LayoutPlan {
+    pub fn new(center: impl Into<Layout>) -> Self {
+        Self { docks: Vec::new(), center: center.into() }
+    }
+
+    /// Add an edge-docked band.
+    pub fn dock(&mut self, dock: Dock) {
+        self.docks.push(dock);
+    }
+}
+
+/// Holds the layout plan and the module set, and renders them: edge-docked
+/// bands first (highest z outermost), with the center layout in whatever
+/// remains.
 pub struct Workspace {
+    plan: LayoutPlan,
     modules: HashMap<&'static str, AnyView>,
-    docks: Vec<Dock>,
-    center: Layout,
 }
 
 impl Workspace {
     pub fn new(center: impl Into<Layout>) -> Self {
-        Self { modules: HashMap::new(), docks: Vec::new(), center: center.into() }
+        Self { plan: LayoutPlan::new(center), modules: HashMap::new() }
+    }
+
+    /// Build a workspace from a pre-built [`LayoutPlan`] (see
+    /// `ui::layout::app_layout`), so the app and the layout-introspection
+    /// tools share one definition of the layout.
+    pub fn from_plan(plan: LayoutPlan) -> Self {
+        Self { plan, modules: HashMap::new() }
+    }
+
+    /// Add an edge-docked band.
+    pub fn dock(&mut self, dock: Dock) {
+        self.plan.dock(dock);
+    }
+
+    /// The layout plan this workspace renders — the input to
+    /// `ui::introspect`.
+    pub fn plan(&self) -> &LayoutPlan {
+        &self.plan
     }
 
     /// Register a module under its container id, ready to be placed by
@@ -195,11 +251,6 @@ impl Workspace {
     pub fn push_as<C: Container>(&mut self, id: &'static str, entity: Entity<C>) {
         self.modules.insert(id, entity.into());
     }
-
-    /// Add an edge-docked band.
-    pub fn dock(&mut self, dock: Dock) {
-        self.docks.push(dock);
-    }
 }
 
 impl Render for Workspace {
@@ -207,7 +258,7 @@ impl Render for Workspace {
         div()
             .size_full()
             .bg(rgb(0x000000))
-            .child(render_dock_stack(&self.docks, &self.center, &self.modules))
+            .child(render_dock_stack(&self.plan.docks, &self.plan.center, &self.modules))
     }
 }
 

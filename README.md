@@ -38,24 +38,32 @@ Paths are relative to this crate's root. This is the fastest way in:
 
 | Path | What lives there |
 |------|------------------|
-| `src/lib.rs` | Crate roots — `datatypes`, `audio`, `opus`, `waveform`, `ui`. |
-| `src/datatypes.rs` | The whole data schema: `SongId` + hashing, `SongMetadata` (static, per-file), `Lyrics`/`LyricLine` + `parse_lrc`, `CoverState`/`DecodedImage`/`CoverCache`, `Album`/`Library`, `StreamingInfo` + `SongStatus` (live), `InputAction`, `Config`. |
-| `src/audio.rs` | `PlaybackController` — owns the rodio `Player` and device sink, the `Vec<PathBuf>` queue, seek/next/prev, drain-detection auto-advance (`tick_advance`), and the current track's metadata/waveform/duration. `track_parts` is the single place decode source, tags, and waveform are chosen. |
+| `src/lib.rs` | Crate roots — `audio`, `bitrate`, `decode`, `model`, `opus`, `waveform`, `ui`. |
+| `src/model/` | The whole data schema, split by concern: `identity` (`SongId` + hashing), `song` (`SongMetadata` + lofty loading), `lyrics` (`Lyrics`/`LyricLine` + `parse_lrc`), `cover` (`CoverState`/`DecodedImage`/`CoverCache`), `library` (`Album`/`Library`), `streaming` (`StreamingInfo` + `SongStatus`), `input` (`InputAction`), `config` (`Config`). Framework-agnostic — no GPUI, no rodio — so it unit-tests without a device or a window. |
+| `src/audio.rs` | `PlaybackController` — owns the rodio `Player` and device sink, the `Vec<PathBuf>` queue, seek/next/prev, drain-detection auto-advance (`tick_advance`), and the current track's metadata/duration. `track_parts` is the single place decode source, tags, and duration are chosen. Deliberately does **not** own the waveform. |
+| `src/decode.rs` | `open_track(path, gapless)` — the one place a Symphonia container is opened and a playable track selected. Shared by `opus.rs` and `waveform.rs`. |
 | `src/opus.rs` | `OpusSource` — symphonia's Ogg demuxer feeding libopus, because symphonia 0.5 demuxes Opus but has no decoder. Handles gapless pre-skip/end trims and accurate seek (decode-and-drop to the exact timestamp). |
 | `src/waveform.rs` | `compute_waveform(path, buckets)` — decodes to per-512-sample peaks, then buckets and normalizes them. Opus routes through `OpusSource`. |
-| `src/ui/mod.rs` | UI module roots — `container`, `cover`, `playback`. |
-| `src/ui/main.rs` | The `larkspur_ui` binary: window setup + dock/layout wiring. **Start here to change the layout.** |
-| `src/ui/container.rs` | The layout system: `Container` trait, `Layout`/`Child`/`Size`, `Dock`/`Edge`/`Align`, `Workspace` (module registry + docks + center), `EmptyView` placeholder. |
+| `src/bitrate.rs` | `BitrateTracker` — rolling live-bitrate estimation from decoded packet sizes (the thing the old `test.rs` proved out). Unit-tested and driven by caller-supplied media time. Not yet wired into playback. |
+| `src/ui/mod.rs` | UI module roots — `container`, `cover`, `introspect`, `layout`, `playback`, `state`. |
+| `src/ui/main.rs` | The `larkspur_ui` binary: window setup + binding live views to the shared state. The layout itself lives in `src/ui/layout.rs`. |
+| `src/ui/state.rs` | `PlaybackState` — the shared, observable playback `Entity`. Owns the controller, the async waveform load, and the single ticker; views observe it instead of polling. |
+| `src/ui/container.rs` | The layout system: `Container` trait, `LayoutPlan`/`Layout`/`Child`/`Size`, `Dock`/`Edge`/`Align`, `Workspace` (module registry + plan), `EmptyView` placeholder. |
+| `src/ui/layout.rs` | `app_layout()` — the one definition of the dock/center arrangement, shared by the real UI and the introspection tools. |
+| `src/ui/introspect.rs` | Resolves a `LayoutPlan` into rectangles and renders it as an ASCII diagram + dock legend + border/adjacency list. Pure geometry, no GPUI. |
 | `src/ui/cover.rs` | `CoverView` — the 240 px now-playing cover square (placeholder rendering for now). |
-| `src/ui/playback.rs` | `PlaybackView` — transport buttons, seek bar + waveform (`bars`/`line`), time labels, and its key handling (`←`/`→` seek, `space` play/pause). |
+| `src/ui/playback.rs` | `PlaybackView` — transport buttons, seek bar + waveform (`bars`/`line`), time labels, and key handling (`←`/`→` seek, `space` play/pause) routed through `InputAction`. |
 | `src/bin/seek_probe.rs` | Diagnostic binary: runs the real decode + seek chain headlessly and reports seek-vs-linear RMS error. |
-| `src/test.rs` | **Stale — not compiled.** The original headless playback + live-bitrate spike. Not declared in `lib.rs`, and still on rodio's pre-0.22 `OutputStream`/`Sink` API. Kept as reference for the bitrate-tracking approach. |
+| `src/bin/layout_dump.rs` | Prints the resolved UI layout as text — no window needed. |
+| `tests/layout.rs` | Layout tests over the introspection tooling (see `tests/README.md`). |
 
 ## Running
 
 ```sh
 cargo run --bin larkspur_ui -- song1.flac song2.opus   # the GUI
 cargo run --bin seek_probe  -- song.opus               # decode/seek check, no UI
+cargo run --bin layout_dump                            # the UI layout as text
+cargo test                                             # model + layout tests
 ```
 
 ## Architecture
@@ -86,17 +94,18 @@ Modules are just `Render` impls that read a slice of that state; a
 adding/removing a module is a list mutation, not a rewrite of the
 others.
 
-> **Diagram = target, not current wiring.** Today `ui/main.rs` hands a
-> `PlaybackController` straight to `PlaybackView`, which reads it
-> directly each frame. `Library` and `StreamingInfo` exist in
-> `datatypes.rs` but aren't wired into any `Entity` yet, and the
-> lyrics/bitrate/queue modules don't exist — the placeholder panels in
-> the layout below are where they'll go.
+> **Mostly wired now.** `PlaybackState` (an `Entity`) owns the controller
+> and is shared with the views, which observe it rather than polling — so
+> adding a playback-reading module is a subscription, not another timer.
+> `Library` and `StreamingInfo` still exist only as model types (no
+> `Entity` yet), and the lyrics/bitrate/queue modules don't exist — the
+> placeholder panels in the layout below are where they'll go.
 
 ### UI layout (current)
 
-`ui/main.rs` builds the workspace from edge docks plus a center, all
-resolved by `ui/container.rs`:
+`ui/layout.rs` defines the workspace from edge docks plus a center,
+resolved by `ui/container.rs`; `ui/main.rs` only binds live views to its
+module ids. Run `cargo run --bin layout_dump` to see it as a diagram:
 
 | Dock | Module(s) | Band size | `z` |
 |------|-----------|-----------|-----|
@@ -210,17 +219,36 @@ resolution originals:
 
 ## Status
 
-- [x] Core data schema (`datatypes.rs`)
-- [x] Headless playback + live bitrate test (`test.rs`) — **stale**,
-      see the source map above
+- [x] Core data schema (`model/`)
+- [x] Headless playback (`PlaybackController`) + live-bitrate *tracker*
+      (`bitrate.rs`, unit-tested) — meter not yet wired into playback
 - [x] GPUI shell + module/workspace container (`ui/`)
+- [x] Shared observable playback state (`Entity<PlaybackState>`) — views
+      observe it instead of polling
+- [x] Layout introspection + tests (`ui/introspect.rs`, `tests/`)
 - [ ] Cover cache disk tier + external cover fallback
 - [ ] `.lrc` sidecar loading wired into playback
+- [ ] Live bitrate meter module (needs packet-level decode instrumentation)
 - [ ] Input/keybinding system — **WIP**, not yet decided whether this
       needs to be backend-agnostic (TUI + GPUI) or GPUI-only; current
       `InputAction` enum is deliberately not tied to any specific
       input crate's key type until that's settled.
 - [ ] Playlist support (same `SongId`-reference pattern as `Album`)
+
+## Testing & layout introspection
+
+The UI can be read as text, so layout can be reviewed and tested without
+opening a window:
+
+```sh
+cargo run --bin layout_dump   # the resolved layout as an ASCII diagram
+cargo test                    # model + layout tests
+```
+
+`ui/introspect.rs` resolves `ui/layout.rs`'s `LayoutPlan` into rectangles
+and emits a diagram, a dock legend, and an explicit border list ("which
+panel touches which"). Tests assert on the structured `LayoutReport`
+rather than parsing the text. See `tests/README.md`.
 
 ## Supported formats
 

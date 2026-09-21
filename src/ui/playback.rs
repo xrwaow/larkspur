@@ -1,14 +1,17 @@
 use std::cell::Cell;
 use std::rc::Rc;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    canvas, div, point, prelude::*, px, relative, rgb, Bounds, Context, FocusHandle, Focusable,
-    KeyDownEvent, MouseButton, MouseDownEvent, PathBuilder, Pixels, Render, Rgba, Window,
+    canvas, div, fill, point, prelude::*, px, rgb, size, AnyElement, Bounds, Context, Entity,
+    FocusHandle, Focusable, KeyDownEvent, MouseButton, MouseDownEvent, PathBuilder, Pixels, Render,
+    Rgba, Subscription, Window,
 };
 
-use crate::audio::PlaybackController;
+use crate::model::InputAction;
 use crate::ui::container::Container;
+use crate::ui::state::PlaybackState;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum WaveformStyle {
@@ -17,40 +20,29 @@ pub enum WaveformStyle {
 }
 
 pub struct PlaybackView {
-    controller: PlaybackController,
+    /// Shared playback state. This view reads it and dispatches actions
+    /// into it; it never owns the controller.
+    state: Entity<PlaybackState>,
     style: WaveformStyle,
     focus_handle: FocusHandle,
     // Filled in by the seek-bar's canvas each time it paints, so
     // on_mouse_down can turn a window-relative click into a
     // bar-relative fraction without guessing at layout position.
     seek_bar_bounds: Rc<Cell<Bounds<Pixels>>>,
+    _observe: Subscription,
 }
 
 impl PlaybackView {
-    pub fn new(controller: PlaybackController, cx: &mut Context<Self>) -> Self {
-        // Drives the position display and auto-advances the queue when a
-        // track finishes. Stops when the view is dropped.
-        cx.spawn(async move |this, cx| {
-            loop {
-                cx.background_executor().timer(Duration::from_millis(200)).await;
-                if this
-                    .update(cx, |this, cx| {
-                        this.controller.tick_advance();
-                        cx.notify();
-                    })
-                    .is_err()
-                {
-                    break;
-                }
-            }
-        })
-        .detach();
-
+    pub fn new(state: Entity<PlaybackState>, cx: &mut Context<Self>) -> Self {
+        // Re-render whenever the shared state changes. The state owns the
+        // ticker, so this view no longer polls for position updates.
+        let observe = cx.observe(&state, |_this, _state, cx| cx.notify());
         Self {
-            controller,
+            state,
             style: WaveformStyle::Bars,
             focus_handle: cx.focus_handle(),
             seek_bar_bounds: Rc::new(Cell::new(Bounds::default())),
+            _observe: observe,
         }
     }
 
@@ -61,6 +53,16 @@ impl PlaybackView {
         self.focus_handle.clone()
     }
 
+    /// Route a decoupled [`InputAction`] into the shared state, re-rendering
+    /// only if it changed something.
+    fn dispatch(&mut self, action: InputAction, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            if state.apply(action) {
+                cx.notify();
+            }
+        });
+    }
+
     fn toggle_style(&mut self, cx: &mut Context<Self>) {
         self.style = match self.style {
             WaveformStyle::FlatLine => WaveformStyle::Bars,
@@ -69,15 +71,25 @@ impl PlaybackView {
         cx.notify();
     }
 
-    fn seek_to_fraction(&mut self, fraction: f32, cx: &mut Context<Self>) {
-        let target = self.controller.duration.mul_f32(fraction.clamp(0.0, 1.0));
-        self.controller.seek(target);
-        cx.notify();
+    fn seek_fraction(&mut self, fraction: f32, cx: &mut Context<Self>) {
+        self.state.update(cx, |state, cx| {
+            state.seek_fraction(fraction);
+            cx.notify();
+        });
     }
+}
 
-    fn seek_relative(&mut self, delta_secs: i64, cx: &mut Context<Self>) {
-        self.controller.seek_relative(delta_secs);
-        cx.notify();
+/// Map a key press to a backend-agnostic [`InputAction`].
+///
+/// This is the *only* place GPUI key names appear. Everything downstream
+/// matches on `InputAction`, so swapping or extending the input backend
+/// (say, a TUI) is a change to this one function.
+fn action_for_key(key: &str) -> Option<InputAction> {
+    match key {
+        "left" => Some(InputAction::SeekBackward),
+        "right" => Some(InputAction::SeekForward),
+        "space" => Some(InputAction::TogglePause),
+        _ => None,
     }
 }
 
@@ -95,21 +107,30 @@ impl Focusable for PlaybackView {
 
 const BAR_WIDTH: f32 = 480.0;
 const BAR_HEIGHT: f32 = 40.0;
+const BAR_GAP: f32 = 1.0;
 
 impl Render for PlaybackView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let position = self.controller.position();
-        let duration = self.controller.duration;
+        // Snapshot the shared state once, then drop the borrow before
+        // building elements.
+        let (position, duration, can_prev, can_next, ended, playing, peaks) = {
+            let state = self.state.read(cx);
+            (
+                state.position(),
+                state.duration(),
+                state.can_prev(),
+                state.can_next(),
+                state.ended(),
+                state.is_playing(),
+                state.waveform().peaks(),
+            )
+        };
+
         let fraction = if duration.as_secs_f32() > 0.0 {
             position.as_secs_f32() / duration.as_secs_f32()
         } else {
             0.0
         };
-
-        let can_prev = self.controller.can_prev();
-        let can_next = self.controller.can_next();
-        let ended = self.controller.ended();
-        let playing = self.controller.is_playing();
 
         let bounds_cell = self.seek_bar_bounds.clone();
         let bounds_for_paint = bounds_cell.clone();
@@ -123,9 +144,9 @@ impl Render for PlaybackView {
             .bg(rgb(0x181818))
             .child(
                 // canvas gives us the element's real on-screen bounds
-                // every time it paints — that's what on_mouse_down
-                // below reads to compute a click-relative fraction,
-                // instead of assuming window coords == local coords.
+                // every time it paints — that's what on_mouse_down below
+                // reads to compute a click-relative fraction, instead of
+                // assuming window coords == local coords.
                 canvas(
                     move |bounds, _window, _cx| {
                         bounds_for_paint.set(bounds);
@@ -141,29 +162,29 @@ impl Render for PlaybackView {
                 div()
                     .absolute()
                     .inset_0()
-                    .child(render_waveform(&self.controller.waveform, self.style, fraction)),
+                    .child(render_waveform(peaks, self.style, fraction)),
             )
             .on_mouse_down(
                 MouseButton::Left,
                 cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                    // Use the *actual* painted width, not BAR_WIDTH: if the
+                    // bar ever becomes responsive the two diverge and clicks
+                    // would land in the wrong place.
                     let bounds = bounds_cell.get();
+                    let width = f32::from(bounds.size.width);
+                    if width <= 0.0 {
+                        return;
+                    }
                     let local_x: f32 = f32::from(event.position.x - bounds.origin.x);
-                    this.seek_to_fraction(local_x / BAR_WIDTH, cx);
+                    this.seek_fraction(local_x / width, cx);
                 }),
             );
 
         div()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                match event.keystroke.key.as_str() {
-                    "left" => this.seek_relative(-5, cx),
-                    "right" => this.seek_relative(5, cx),
-                    // No toggling once the queue has played out.
-                    "space" if !this.controller.ended() => {
-                        this.controller.toggle_play_pause();
-                        cx.notify();
-                    }
-                    _ => {}
+                if let Some(action) = action_for_key(&event.keystroke.key) {
+                    this.dispatch(action, cx);
                 }
             }))
             .flex()
@@ -184,8 +205,7 @@ impl Render for PlaybackView {
                         can_prev,
                         PREV_POLYGONS,
                         cx.listener(|this, _event, _window, cx| {
-                            this.controller.prev_track();
-                            cx.notify();
+                            this.dispatch(InputAction::PrevTrack, cx);
                         }),
                     ))
                     .child(
@@ -201,10 +221,7 @@ impl Render for PlaybackView {
                             .bg(rgb(0xffffff))
                             .when(!ended, |d| d.hover(|d| d.bg(rgb(0xdddddd))))
                             .on_click(cx.listener(|this, _event, _window, cx| {
-                                if !this.controller.ended() {
-                                    this.controller.toggle_play_pause();
-                                    cx.notify();
-                                }
+                                this.dispatch(InputAction::TogglePause, cx);
                             }))
                             .child(div().flex().items_center().child(if playing {
                                 icon(13.0, 16.0, PAUSE_POLYGONS, rgb(0x101010)).into_any_element()
@@ -222,8 +239,7 @@ impl Render for PlaybackView {
                         can_next,
                         NEXT_POLYGONS,
                         cx.listener(|this, _event, _window, cx| {
-                            this.controller.next_track();
-                            cx.notify();
+                            this.dispatch(InputAction::NextTrack, cx);
                         }),
                     ))
                     .child(
@@ -330,10 +346,20 @@ fn transport_button(
 }
 
 fn format_duration(d: Duration) -> String {
-    format!("{}:{:02}", d.as_secs() / 60, d.as_secs() % 60)
+    let secs = d.as_secs();
+    let (h, m, s) = (secs / 3600, (secs % 3600) / 60, secs % 60);
+    if h > 0 {
+        format!("{h}:{m:02}:{s:02}")
+    } else {
+        format!("{m}:{s:02}")
+    }
 }
 
-fn render_waveform(peaks: &[f32], style: WaveformStyle, progress: f32) -> impl IntoElement {
+fn render_waveform(
+    peaks: Option<Arc<Vec<f32>>>,
+    style: WaveformStyle,
+    progress: f32,
+) -> AnyElement {
     match style {
         WaveformStyle::FlatLine => div()
             .w_full()
@@ -361,18 +387,46 @@ fn render_waveform(peaks: &[f32], style: WaveformStyle, progress: f32) -> impl I
                     .bg(rgb(0xffffff)),
             )
             .into_any_element(),
-        WaveformStyle::Bars => div()
-            .flex()
-            .items_end()
-            .gap(px(1.0))
-            .h_full()
-            .children(peaks.iter().enumerate().map(|(i, &peak)| {
-                let played = (i as f32 / peaks.len() as f32) < progress;
-                div()
-                    .w(px(3.0))
-                    .h(relative(peak.max(0.04)))
-                    .bg(if played { rgb(0xffffff) } else { rgb(0x404040) })
-            }))
-            .into_any_element(),
+        WaveformStyle::Bars => match peaks {
+            Some(peaks) => waveform_bars(peaks, progress),
+            // Still decoding (or unavailable): leave the bar empty rather
+            // than flashing a placeholder shape that then swaps.
+            None => div().size_full().into_any_element(),
+        },
     }
+}
+
+/// Paint the bars in a single canvas pass.
+///
+/// One element with one paint callback, instead of one `div` per bar — the
+/// element-tree cost is constant no matter how many buckets we use, so the
+/// bucket count can grow toward per-pixel resolution without a frame cost.
+fn waveform_bars(peaks: Arc<Vec<f32>>, progress: f32) -> AnyElement {
+    canvas(
+        |_bounds, _window, _cx| (),
+        move |bounds, _prepaint, window, _cx| {
+            let count = peaks.len();
+            if count == 0 {
+                return;
+            }
+            let width = f32::from(bounds.size.width);
+            let height = f32::from(bounds.size.height);
+            let slot = width / count as f32;
+            let bar_width = (slot - BAR_GAP).max(1.0);
+            let origin_x = f32::from(bounds.origin.x);
+            let origin_y = f32::from(bounds.origin.y);
+
+            for (i, &peak) in peaks.iter().enumerate() {
+                let bar_height = (peak.max(0.04) * height).max(1.0);
+                let x = origin_x + i as f32 * slot + (slot - bar_width) / 2.0;
+                let y = origin_y + (height - bar_height);
+                let bar = Bounds::new(point(px(x), px(y)), size(px(bar_width), px(bar_height)));
+                let played = (i as f32 / count as f32) < progress;
+                let color = if played { rgb(0xffffff) } else { rgb(0x404040) };
+                window.paint_quad(fill(bar, color));
+            }
+        },
+    )
+    .size_full()
+    .into_any_element()
 }
