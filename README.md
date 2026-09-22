@@ -39,35 +39,38 @@ Paths are relative to this crate's root. This is the fastest way in:
 | Path | What lives there |
 |------|------------------|
 | `src/lib.rs` | Crate roots — `analysis`, `audio`, `bitrate`, `decode`, `model`, `opus`, `ui`. |
-| `src/model/` | The whole data schema, split by concern: `identity` (`SongId` + hashing), `song` (`SongMetadata` + lofty loading), `lyrics` (`Lyrics`/`LyricLine` + `parse_lrc` + `.lrc` sidecars), `cover` (`CoverState`/`DecodedImage`/`CoverCache`), `library` (`Library`/`LibraryMeta` + playlist autogen + derived artist groupings), `playlist` (`Playlist`/`PlaylistId`/`PlaylistKind`/`PlaylistMeta`/`PlaylistOrigin`), `search` (the query language: `Query`/`parse`/`matches`, plus the album grouping both result views render), `scan` (`LibraryCache` + mtime-based incremental sync), `streaming` (`StreamingInfo` + `SongStatus`), `view` (`TabId`), `input` (`InputAction`), `config` (`Config`: theme, per-container typefaces and font sizes, synced paths). Framework-agnostic — no GPUI, no rodio — so it unit-tests without a device or a window. |
+| `src/model/` | The whole data schema, split by concern: `identity` (`SongId` + hashing), `song` (`SongMetadata` + lofty loading; serde-derived so the scan cache round-trips it whole), `lyrics` (`Lyrics`/`LyricLine` + `parse_lrc` + `.lrc` sidecars), `cover` (`CoverState`/`DecodedImage`/`CoverCache`), `library` (`Library` + playlist autogen + derived artist groupings, with a maintained index), `playlist` (`Playlist`/`PlaylistId`/`PlaylistKind`/`PlaylistMeta`/`PlaylistOrigin`), `search` (the query language: `Query`/`parse`/`matches`, plus the album grouping both result views render), `scan` (`LibraryCache` + mtime-based incremental sync), `streaming` (`SongStatus`), `view` (`TabId`), `input` (`InputAction`), `config` (`Config`: theme, waveform style, per-container typefaces and font sizes, synced paths). Framework-agnostic — no GPUI, no rodio — so it unit-tests without a device or a window. |
 | `src/audio.rs` | `PlaybackController` — owns the rodio `Player` and device sink, the `Vec<PathBuf>` queue, seek/next/prev, drain-detection auto-advance (`tick_advance`), and the current track's metadata/duration. `track_parts` is the single place decode source, tags, and duration are chosen. Deliberately does **not** own the waveform. |
-| `src/decode.rs` | `open_track(path, gapless)` — the one place a Symphonia container is opened and a playable track selected. Shared by `opus.rs` and `waveform.rs`. |
+| `src/decode.rs` | `open_track(path, gapless)` — the one place a Symphonia container is opened and a playable track selected. Also `PacketDecoder`, the one place a packet is turned into interleaved f32 samples: Opus goes to libopus, everything else to symphonia, and both the playback source and the analysis share it. |
 | `src/opus.rs` | `OpusSource` — symphonia's Ogg demuxer feeding libopus, because symphonia 0.5 demuxes Opus but has no decoder. Handles gapless pre-skip/end trims and accurate seek (decode-and-drop to the exact timestamp). |
-| `src/analysis.rs` | `analyze_track(path, buckets, bucket)` — one demux+decode pass producing both the waveform peaks and the live-bitrate profile. Opus routes through `OpusSource`'s libopus decoder. `compute_waveform` is the peaks-only convenience. |
+| `src/analysis.rs` | `analyze_track(path, buckets, bucket)` — one demux+decode pass producing both the waveform peaks and the live-bitrate profile, decoding through the shared `PacketDecoder`. `compute_waveform` is the peaks-only convenience. |
 | `src/bitrate.rs` | `BitrateProfile` — a track's compressed bitrate bucketed over media time, built from packet byte counts (no decode). `at(position)` gives the live number the UI shows. |
-| `src/ui/mod.rs` | UI module roots — `albums`, `browse`, `config_state`, `container`, `cover`, `cover_store`, `format`, `introspect`, `layout`, `library_state`, `lyrics`, `menu`, `playback`, `playlist`, `playlists`, `search`, `settings`, `state`, `tabs`, `text_field`, `theme`. |
+| `src/ui/mod.rs` | UI module roots — `albums`, `animation`, `browse`, `config_state`, `container`, `cover`, `cover_store`, `format`, `input`, `introspect`, `layout`, `library_state`, `lyrics`, `menu`, `playback`, `playlist`, `playlists`, `row_list`, `search`, `settings`, `state`, `tabs`, `text_field`, `theme`, `widgets`. |
 | `src/ui/main.rs` | The `larkspur_ui` binary: loads the config, seeds its synced paths from any command-line directories, and binds live views to the shared state. The layout itself lives in `src/ui/layout.rs`. |
-| `src/ui/state.rs` | `PlaybackState` — the shared, observable playback `Entity`. Owns the controller, the async track analysis (waveform peaks + live-bitrate profile), and the single ticker; views observe it instead of polling. |
+| `src/ui/state.rs` | `PlaybackState` — the shared, observable playback `Entity`. Owns the controller, the async track analysis (waveform peaks + live-bitrate profile), and the single ticker; views observe it instead of polling. The ticker samples the player often enough to catch a track draining, but only *notifies* when a coarse value changes — the transport re-renders on the slow clock, not every sample. |
 | `src/ui/library_state.rs` | `LibraryState` — the shared, observable library `Entity`. Owns the `Library`, the scan/persistence cache, and the selected playlist; roots come from `ConfigState` (the synced-path list), which it observes, so editing the list rescans. The background scan runs on the executor and the playlist views observe it. User-owned custom playlists survive a scan that was already in flight when they were edited. |
-| `src/ui/playlists.rs` | `PlaylistsView` — the left rail: a settings button, custom playlists, autogen album playlists, and artists (each expanding into its discography). Clicking a playlist opens it as a tab in the center, so this view holds the tab container. Right-clicking a custom playlist opens a menu to rename it inline or delete it. |
-| `src/ui/playlist.rs` | `PlaylistView` — one open playlist, drawn the way the library draws an album: a cover header over its track rows, with a one-song playlist collapsed into a single row carrying its cover on the left. One instance per tab, each with its own row cursor. Custom playlists get a full-width “Add songs” search box that adds a clicked result, and right-clicking a track opens a menu to remove it. A custom playlist reads as “Various Artists” once its tracks disagree on the artist, and never shows a release year. `↑`/`↓` move the row selection, `enter` plays it, single click selects, double click plays. |
-| `src/ui/theme.rs` | `Theme` — the color + font palette (zebra row colors, text tiers, accent, typeface). Views read it instead of hardcoding hex values. `Theme::dark()` and `Theme::light()` are the two palettes; each view builds its own copy carrying its per-container typeface and font size, so a theme/font change re-renders live and one container can render larger, or in a different family, than another. |
-| `src/ui/container.rs` | The layout system: `Container` trait, `LayoutPlan`/`Layout`/`Child`/`Size`, `Dock`/`Edge`/`Align`, `Workspace` (module registry + plan), `EmptyView` placeholder. |
-| `src/ui/layout.rs` | `app_layout()` — the one definition of the dock/center arrangement, shared by the real UI and the introspection tools. The center is the `tabs` container; the right rail is `lyrics` above `cover`. |
+| `src/ui/playlist.rs` | `PlaylistView` — one open playlist, drawn the way the library draws an album: a cover header over its track rows, with a one-song playlist collapsed into a single row carrying its cover on the left. One instance per tab, each with its own selection. Custom playlists get a full-width “Add songs” search box that adds a clicked result, and right-clicking a track opens a menu to remove it. A custom playlist reads as “Various Artists” once its tracks disagree on the artist, and never shows a release year. `↑`/`↓` move the row selection, `enter` plays it, single click selects, double click plays. |
+| `src/ui/theme.rs` | `Theme` — the color + font palette (zebra row colors, text tiers, accent, typeface). Views read it instead of hardcoding hex values. `Theme::dark()`, `Theme::light()`, and `Theme::dynamic(accent)` are the palettes; each view builds its own copy carrying its per-container typeface and font size, so a theme/font change re-renders live and one container can render larger, or in a different family, than another. |
+| `src/ui/text_field.rs` | `TextField` — a minimal, view-owned text input (value + caret + selection + key handling: `ctrl+a`, `ctrl+v` paste, `shift`/`ctrl` arrows, word movement), reused by the search box, the settings path box, inline playlist rename, and the playlist's add-songs search. The caret is drawn over the text rather than between it, so moving it never nudges the characters around it. |
+| `src/ui/animation.rs` | `Animator` + `Tween` + `Spring` — the shared frame clock and the easing primitives views animate with. `SLOW_FPS` (1) drives the coarse readouts (transport time, waveform progress, live bitrate); `SMOOTH_FPS` (60) drives selection/hover highlights and lyric scrolling. `Tween` is a duration-based ease (the lyric scroll); `Spring` is a damped spring that **keeps its velocity when retargeted**, so fast repeated hover chases the new target instead of restarting (gpui 0.2 has no spring element — the git version's `SpringAnimation` isn't in the published crate — so it's hand-rolled and driven by the shared clock). Views observe the clock and re-render only while something is moving. |
+| `src/ui/input.rs` | `action_for_key` — the one place GPUI key names are mapped to a backend-agnostic `InputAction`. Called by the tab container and every list container, not just the transport. |
+| `src/ui/row_list.rs` | `RowList` — the selection and navigation state the three list containers share: sections, flattened rows, per-section title widths, the virtualized list, the selection set, the keyboard cursor, and the selection/hover **crossfades** (per-row springs, so several rows can fade independently). `handle` maps an `InputAction` to a `RowAction`, so a view only has to say what *activating* a row means. `SPRING_STIFFNESS`/`SPRING_DAMPING` tune the highlight feel. **All** vertical movement goes through one eased `SmoothScroll` — moving the selection, paging, and the wheel (`wheel`, which the view intercepts) — so the content slides rather than stepping. |
+| `src/ui/widgets.rs` | `section_header`/`empty_hint`/`panel_header` — the small view helpers the rail and the list containers had each grown their own copy of. `scroll_area`/`wheel_pixels` wrap a virtualized list so its wheel scrolling can be eased instead of applied immediately. |
+| `src/ui/container.rs` | The layout system: `Container` trait, `LayoutPlan`/`Layout`/`Child`/`Size`, `Dock`/`Edge`/`Align`, `Workspace` (module registry + plan). |
 | `src/ui/introspect.rs` | Resolves a `LayoutPlan` into rectangles and renders it as an ASCII diagram + dock legend + border/adjacency list. Pure geometry, no GPUI. |
-| `src/ui/tabs.rs` | `TabsView` — the center container: a strip of tabs (library, one per opened playlist, one per artist opened from “go to {artist}”) over the active container. Search is swapped in over the active tab rather than being a tab of its own. Re-points focus on every switch, so the active container is the input hub; tab switching, tab closing, the `×` buttons, and the transport keys all live here. Only the active container is in the element tree. |
-| `src/ui/albums.rs` | Album sections — the shared rendering behind the browse, search, and playlist containers: snapshot an album into a cover header plus track rows (or one compressed row when it holds a single song), flatten them into the rows `gpui::list` virtualizes, measure the title column so the artists line up, and request each visible cover as it renders. |
-| `src/ui/browse.rs` | `BrowseView` — the library browse container. Every album as a headed group (cover, artist, album, `format \| bitrate \| tracks \| time`, year) with its tracks beneath, drawn through GPUI's virtualized `list`; clicking a track plays the album from there. One instance backs the library tab; “go to {artist}” from a song menu opens another, scoped to that artist's discography, so it titles the header with the artist instead of “Library”. |
-| `src/ui/search.rs` | `SearchView` — the advanced search container, swapped in over the active tab rather than living as one. Owns the query text, the caret, and the last parsed `Query`; renders results as the same album sections. Swallows plain typing and editing keys, but lets command chords and `esc` bubble. |
-| `src/ui/lyrics.rs` | `LyricsView` — the right rail's lyrics panel, above the cover. Pins the active line of synced lyrics to the middle of the panel (50% of its height) whatever the height of the lines around it, and seeks to a line when it's clicked. Lines wrap on word boundaries (and break an over-long word per character) instead of being clipped. |
-| `src/ui/cover_store.rs` | `CoverStore` — the shared, observable cover store. Decodes embedded art off-thread, downscales once, writes the disk tier, and hands the UI a GPU-ready image. One owner for both the now-playing square and the album thumbnails. |
-| `src/ui/cover.rs` | `CoverView` — the 240 px now-playing cover square: the current track's art, dimmed while paused. |
+| `src/ui/playlists.rs` | `PlaylistsView` — the left rail: a settings button, custom playlists, autogen album playlists, and artists (each expanding into its discography, newest release first). Clicking a playlist opens it as a tab in the center, so this view holds the tab container. Right-clicking a custom playlist opens a menu to rename it inline or delete it. A library yields thousands of rows, so like the track lists they're flattened and drawn through GPUI's virtualized `list` (rebuilt only on change, scroll kept across expand/collapse) — rendering them all every frame made the whole app run at single-digit fps. |
+| `src/ui/layout.rs` | `app_layout()` — the one definition of the dock/center arrangement, shared by the real UI and the introspection tools. The center is the `tabs` container; the right rail is `lyrics` above `cover`. |
+| `src/ui/albums.rs` | Album sections — the shared rendering behind the browse, search, and playlist containers: snapshot an album into a cover header plus track rows (or one compressed row when it holds a single song, carrying the release year), flatten them into the rows `gpui::list` virtualizes, measure the title column so the artists line up, and request each visible cover as it renders. Also owns `Selection`, the item-index set behind shift/ctrl click and keyboard navigation. The album meta line is tracks + time only — the bitrate that matters is per song. |
+| `src/ui/tabs.rs` | `TabsView` — the center container: a strip of tabs (library, one per opened playlist, one per artist opened from “go to {artist}”) over the active container. Search is swapped in over the active tab rather than being a tab of its own. Re-points focus on every switch, so the active container is the input hub; tab switching, tab closing, the `×` buttons, and the transport keys all live here. Only the active container is in the element tree. It also sets the window title (`Playing {song}` / `Larkspur`). |
+| `src/ui/browse.rs` | `BrowseView` — the library browse container. Every album as a headed group (cover, artist, album, `tracks \| time`, year) with its tracks beneath, drawn through GPUI's virtualized `list`; clicking a track plays the album from there. One instance backs the library tab; “go to {artist}” from a song menu opens another, scoped to that artist's discography (newest first), so it titles the header with the artist instead of “Library”. Selection and navigation come from `RowList`. |
+| `src/ui/lyrics.rs` | `LyricsView` — the right rail's lyrics panel, above the cover. Pins the anchor line to the middle of the panel (50% of its height) whatever the height of the lines around it, and seeks to a line when it's clicked. The slide **leads the song**: the stack starts moving `TRANSITION_SECS` before a line's timestamp so it lands *on* the line, and the colour **crossfades over the second half of that slide** — the next line starts colouring up once the stack is already moving toward it, while the line it replaces fades out over the same window. Both are driven from the playback position, which is why the panel reads it at full resolution (`live_position`) on every frame of the shared clock. Lines wrap on word boundaries (and break an over-long word per character) instead of being clipped. |
+| `src/ui/cover_store.rs` | `CoverStore` — the shared, observable cover store. Decodes embedded art off-thread, downscales once, writes the disk tier, and hands the UI a GPU-ready image. It also derives each cover's dominant colour at decode time (`accent`), which is what the dynamic theme tints from. One owner for both the now-playing square and the album thumbnails. |
 | `src/ui/format.rs` | `format_bitrate`/`format_secs` — the shared bitrate and duration formatting the list views agree on. |
-| `src/ui/playback.rs` | `PlaybackView` — transport buttons, seek bar + waveform (`bars`/`line`), and the time labels with the style toggle between them. Also holds `action_for_key`, the one place GPUI key names are mapped to `InputAction`. |
-| `src/ui/config_state.rs` | `ConfigState` — the shared, observable config `Entity`. Owns the persisted `Config` and is observed by every view that draws with the theme, its typeface, or its per-container font size, so changes apply live. Also the source of truth for the synced-path list. |
-| `src/ui/settings.rs` | `SettingsView` — the settings overlay (opened from the rail's settings button): theme, per-container typefaces and font sizes, and the synced-path list. Every change is applied and persisted immediately — there's no save. |
-| `src/ui/menu.rs` | `context_menu`/`song_menu_items` — a small right-click menu helper built on GPUI's `anchored`/`deferred` (GPUI 0.2 ships no context-menu widget), and the song menu's items: one "go to {artist}" per credited artist, "go to playlist", and "remove from playlist". |
-| `src/ui/text_field.rs` | `TextField` — a minimal, view-owned text input (value + caret + selection + key handling: `ctrl+a`, `shift`/`ctrl` arrows, word movement), reused by the search box, the settings path box, inline playlist rename, and the playlist's add-songs search. The caret is drawn over the text rather than between it, so moving it never nudges the characters around it. |
+| `src/ui/cover.rs` | `CoverView` — the 240 px now-playing cover square: the current track's art, dimmed while paused. It also feeds the dynamic theme, pushing the cover store's dominant colour into `ConfigState` while that theme is selected. |
+| `src/ui/playback.rs` | `PlaybackView` — the seek bar + waveform (`bars`/`line`, chosen in settings), the time labels, and the transport buttons beneath them. |
+| `src/ui/settings.rs` | `SettingsView` — the settings overlay (opened from the rail's settings button): theme (dark/light/**dynamic**, derived from the current cover), waveform style, per-container typefaces and font sizes, and the synced-path list. Every change is applied and persisted immediately — there's no save. |
+| `src/ui/menu.rs` | `context_menu`/`song_menu_items` — a small right-click menu helper built on GPUI's `anchored`/`deferred` (GPUI 0.2 ships no context-menu widget), and the song menu's items. A single row offers one "go to {artist}" per credited artist, "go to playlist", and "remove from playlist"; a multi-row selection offers "play", "add to {playlist}", "new playlist from selection", and "remove from playlist". The menu occludes the mouse, so clicking an item can't also play the row behind it. |
+| `src/ui/config_state.rs` | `ConfigState` — the shared, observable config `Entity`. Owns the persisted `Config` and is observed by every view that draws with the theme, its typeface, or its per-container font size, so changes apply live. Also the source of truth for the synced-path list. `Themed` wraps the theme + its config subscription so a view can't forget to observe. |
 | `src/bin/seek_probe.rs` | Diagnostic binary: runs the real decode + seek chain headlessly and reports seek-vs-linear RMS error. |
 | `src/bin/layout_dump.rs` | Prints the resolved UI layout as text — no window needed. |
 | `src/bin/library_dump.rs` | Scans directories and prints the resulting library — playlists and their songs — as text, no window. |
@@ -98,9 +101,14 @@ Config lives at `$XDG_CONFIG_HOME/larkspur/config.json` (usually
 `~/.config/larkspur/config.json`) and is edited through the settings overlay
 (`⚙` in the rail header). Every change is applied and written immediately.
 
-- **Theme** — `Dark` or `Light`. The palette is picked by
+- **Theme** — `Dark`, `Light`, or `Dynamic`. The first two are fixed palettes picked by
   [`ThemeKind`](src/model/config.rs) and rebuilt per view, so switching
-  re-renders live rather than needing a restart.
+  re-renders live rather than needing a restart. `Dynamic` derives a palette from
+  the current track's cover: the cover is analysed for its dominant colour and
+  the hue drives the whole palette. It's only computed while `Dynamic` is
+  selected, falls back to `Dark` until a cover has been analysed, and keeps the
+  last colour when a new track's art hasn't decoded yet.
+- **Waveform** — `Bars` or `Line`, how the transport bar draws the waveform.
 - **Typeface, per container** — every container draws with
   [`FontKind::default`](src/model/config.rs) (`TX-02`) unless config overrides
   it, keyed by `container_id` like the font size. The settings row's family
@@ -122,7 +130,7 @@ Config lives at `$XDG_CONFIG_HOME/larkspur/config.json` (usually
 ## Keys
 
 Every binding is mapped to a backend-agnostic [`InputAction`](src/model/input.rs)
-in one function, `ui::playback::action_for_key` — the only place GPUI key names
+in one function, `ui::input::action_for_key` — the only place GPUI key names
 appear. The active container gets first crack at a key; anything it doesn't act
 on bubbles up to the tab container.
 
@@ -131,22 +139,27 @@ on bubbles up to the tab container.
 | `space` | play / pause |
 | `←` / `→` | seek back / forward 5 s |
 | `↑` / `↓` | move the row selection |
-| `enter` | play the selected row |
+| `pgup` / `pgdn` | scroll the active list a page |
+| `enter` | play the selected row (or, in search, run a changed query) |
 | `ctrl+tab` / `ctrl+shift+tab` | next / previous tab |
 | `ctrl+w` | close the active tab (or dismiss an overlay) |
 | `ctrl+shift+f` | open / close the search panel |
 | `esc` | dismiss the search or settings panel, or a right-click menu |
 
 Mouse actions the panels own: click a playlist in the rail to open it, click a
-track to play the album/playlist from it, right-click a **custom** playlist to
-rename or delete it, and right-click a track for **go to {artist}** (one entry
-per credited artist, opening the library scoped to that artist's discography) /
-**go to playlist** (its album), plus **remove from playlist** when it's in a
-custom one. The rail's `⚙` button opens settings.
+track to play the album/playlist from it (a playlist tab selects on a single
+click and plays on a double), `shift`+click to extend a range and `ctrl`+click
+to toggle one, right-click a **custom** playlist to rename or delete it, and
+right-click a track for **go to {artist}** (one entry per credited artist,
+opening the library scoped to that artist's discography) / **go to playlist**
+(its album), plus **remove from playlist** when it's in a custom one. A
+right-click on a multi-row selection offers the bulk operations instead: play,
+add to a playlist, create a playlist from it, and remove from a custom one. The
+rail's `⚙` button opens settings.
 
 The text boxes (search, settings path, playlist rename, add-songs) support the
 usual editing chords: `ctrl+a` selects all, `shift`+arrows extend the selection,
-and `ctrl`+arrows move by word.
+`ctrl`+arrows move by word, and `ctrl+v` pastes.
 
 While the search panel is up it owns plain typing and editing keys, so a space
 is a space rather than a play/pause. Command chords and `esc` still bubble, so
@@ -166,7 +179,7 @@ focused.
                              │ events / channel
                  ┌──────────▼───────────┐
                  │  Entity<Library>      │   ← single source of truth
-                 │  Entity<StreamingInfo>│      for static + live state
+                 │  Entity<PlaybackState>│      for static + live state
                  └──────────┬───────────┘
                              │ subscriptions
         ┌──────────┬─────────┼─────────┬───────────┐
@@ -189,8 +202,26 @@ others.
 > active playlist, and backs every library-reading view; `CoverStore`
 > (a third `Entity`) owns decoded cover art for all of them, so the
 > now-playing square and the album thumbnails share one decode cache.
-> `StreamingInfo` still exists only as a model type (no `Entity` yet), and
-> the bitrate-meter and queue modules don't exist.
+> `Animator` (a fourth) is the shared frame clock. The bitrate-meter and
+> queue modules don't exist.
+
+### Frame rates
+
+Two clocks, and views opt into the one they need:
+
+- **`SLOW_FPS` (1)** — the transport's coarse readouts: time labels, waveform
+  progress, live bitrate. `PlaybackState` samples the player often enough to
+  catch a track draining, but only *notifies* when a coarse value changes, so a
+  playing track re-renders the UI about once a second rather than 60 times.
+- **`SMOOTH_FPS` (60)** — animation. `Animator` is the shared clock; views that
+  animate (selection and hover highlight springs, lyric scrolling) observe it
+  and re-render only while something is actually moving, so an idle UI costs
+  nothing beyond the clock's wake-ups.
+
+Both are plain constants in `ui/animation.rs`. Dev builds also turn
+`debug-assertions` off (see `Cargo.toml`) — GPUI compiles its element inspector
+and a pile of per-frame checks behind that flag, which is a large chunk of frame
+time.
 
 ### UI layout (current)
 
@@ -214,12 +245,6 @@ transport bar centered in the window instead of shifted left by the
 cover. Without the `z`, the bottom bar wins the full width and the
 rails sit above it instead of beside it.
 
-Because `Container::container_id` is a per-type constant, a placeholder
-that has to fill several sections is registered per-slot with
-`Workspace::push_as(id, entity)`; each slot still gets its own
-`EmptyView` entity, since `AnyView`'s element id derives from the
-entity id.
-
 The center is a single `tabs` module rather than one module per view. Tabs
 are a *runtime* concern: `LayoutPlan` stays plain data (no `Entity`s, no
 `App`) so `ui::introspect` and the layout tests can resolve it without a
@@ -235,7 +260,7 @@ active one and the rail's settings button swaps settings in.
 
 Every song is keyed by a `SongId` (`u64`), derived from the
 canonicalized file path via `XxHash64`. This is the reference used
-everywhere — `Library`, `Album`, `StreamingInfo.current_song`, cover
+everywhere — `Library`, `Album`, `PlaybackState.current_song`, cover
 cache keys — rather than passing owned `SongMetadata` copies around,
 so a tag edit or cover reload only needs to happen in one place.
 
@@ -280,20 +305,16 @@ which is what makes lyrics searchable across the whole library. A song's
 cache stamp is the newer of the audio file's mtime and its sidecar's, so
 editing a `.lrc` re-parses that one song instead of leaving stale text.
 
-### `StreamingInfo` — live, per-second playback state
-
-Playback status, `current_song: Option<SongId>` (a reference, not an
-owned copy), elapsed time, and `live_bitrate_bps`, updated by a
-rolling window over decoded packet sizes as Symphonia produces them.
-
 ### `Config` — persisted preferences
 
 The runtime configuration, kept framework-agnostic in `model/config.rs` and
 wrapped as an observable `Entity` by `ui::config_state::ConfigState`: the theme
-kind, per-container typeface and font-size overrides, and the synced-path list.
-It's the source of truth for what gets scanned (see
+kind, the waveform style, per-container typeface and font-size overrides, and
+the synced-path list. It's the source of truth for what gets scanned (see
 [Configuration](#configuration)), and views observe it so theme/font changes
-apply live.
+apply live. The dynamic theme's accent is runtime state on `ConfigState` (not
+persisted): `CoverView` pushes it in, and `theme_for` reads it to build the
+palette.
 
 ### `Library` — single source of truth
 
@@ -301,13 +322,22 @@ apply live.
 struct Library {
     songs: HashMap<SongId, SongMetadata>,
     playlists: HashMap<PlaylistId, Playlist>, // Playlist.song_ids: Vec<SongId>
-    meta: LibraryMeta,                        // the "list of playlists" as a whole
+    next_playlist_id: u64,
+    index: Index,   // derived, rebuilt on mutation
 }
 ```
 
 Songs, playlists, and the play queue all reference songs by `SongId`
 rather than owning duplicate `SongMetadata` structs — avoids the classic
 "edited the tag in one place, three other copies are now stale" bug.
+
+The fields are **private** and the derived `Index` (which album owns each song,
+which playlists each artist appears on, each playlist's release year) is
+rebuilt by every mutating method — so the hot queries (`album_playlist_of`,
+`discography`, `playlist_year`, the search grouping) are lookups rather than
+scans, and can't be bypassed into going stale. Bulk paths go through
+`replace_songs`/`replace_playlists`/`install`, so the cache never reaches into
+the library's guts.
 
 ### Playlists — one container, one collection
 
@@ -484,8 +514,8 @@ exchanged.
 - [ ] Views — saved collections of tabs: which tabs are visible/active and
       where they sit (split / focus mode), persisted via `model::Config`
 - [x] List virtualization — the browse, search, and playlist containers draw
-      through `gpui::list`, so only the rows near the viewport (plus a ±50-row
-      overdraw) are rendered and their covers requested. A 4k-song library no
+      through `gpui::list`, so only the rows near the viewport (plus a modest
+      overdraw band) are rendered and their covers requested. A 4k-song library no
       longer renders every row each frame or thrashes the cover store
 - [ ] Search ranking — fuzzy matches aren't scored, so results come out in
       album/track order rather than by match quality
@@ -504,6 +534,24 @@ exchanged.
       with a JSON metadata cache. User-owned custom playlists now survive a
       scan that was in flight while they were edited (the startup scan used to
       silently undo a playlist created right after launch)
+- [x] Multi-select — `shift`+click extends a range, `ctrl`+click toggles a row,
+      `↑`/`↓` move a keyboard cursor and `enter` plays it, and `pgup`/`pgdn`
+      scroll a page. A right-click on a multi-row selection offers play / add to
+      a playlist / new playlist / remove from playlist
+- [x] Dynamic theme — a palette derived from the current cover's dominant
+      colour, selectable in settings and only computed while selected
+- [x] Waveform style in settings, transport controls below the waveform, the
+      titlebar naming the current track, clipboard paste in every text box, and
+      discographies ordered newest-first (undated albums last)
+- [x] Shared structure — `Library` keeps a derived index (song→album,
+      artist→playlists, playlist→year) behind private fields, so the hot queries
+      are lookups and can't go stale; the scan cache stores a whole
+      `SongMetadata` instead of mirroring its fields; one `PacketDecoder` serves
+      playback and analysis; and the three list containers share `RowList`,
+      `Themed`, `widgets`, and one key mapping
+- [x] Frame rates — a shared `Animator` clock with swappable `SLOW_FPS` (1, for
+      the transport readouts) and `SMOOTH_FPS` (60, for selection fades and lyric
+      scrolling), and a dev profile with GPUI's debug-only inspector off
 
 ## Testing & layout introspection
 

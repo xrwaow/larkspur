@@ -9,8 +9,12 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::Path;
 
-use symphonia::core::codecs::{CodecParameters, CODEC_TYPE_NULL};
-use symphonia::core::formats::{FormatOptions, FormatReader};
+use opus::{Channels, Decoder as OpusCodec};
+use symphonia::core::audio::SampleBuffer;
+use symphonia::core::codecs::{
+    CodecParameters, Decoder, DecoderOptions, CODEC_TYPE_NULL, CODEC_TYPE_OPUS,
+};
+use symphonia::core::formats::{FormatOptions, FormatReader, Packet};
 use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
@@ -94,4 +98,86 @@ pub fn open_track(path: &Path, gapless: bool) -> anyhow::Result<OpenedTrack> {
         track_id,
         codec_params,
     })
+}
+
+/// Opus always decodes internally at 48 kHz; libopus resamples its output to
+/// whatever rate the decoder is built with. We build it at 48 kHz and report
+/// 48 kHz, so the source's sample rate is always truthful.
+///
+/// (Previously a caller built the decoder at the container's declared rate
+/// while reporting 48 kHz — for any file whose header signalled a non-48 kHz
+/// rate those disagreed and playback ran at the wrong speed.)
+pub const OPUS_SAMPLE_RATE: u32 = 48_000;
+
+/// Maximum samples per channel in one Opus packet (120 ms @ 48 kHz).
+pub const MAX_OPUS_FRAMES: usize = 5760;
+
+/// One packet decoder, whichever codec the track uses.
+///
+/// Both the playback source ([`crate::opus::OpusSource`]) and the one-pass
+/// track analysis need the same thing — turn a packet into interleaved f32
+/// samples — and both need the same fallback: symphonia 0.5 demuxes Opus but
+/// ships no decoder, so Opus packets go to libopus while everything else goes
+/// through symphonia's own decoder. This is that one implementation, so the
+/// two call sites can't drift apart.
+pub struct PacketDecoder {
+    inner: Inner,
+    /// Reused across packets so the symphonia path doesn't reallocate.
+    sample_buf: Option<SampleBuffer<f32>>,
+}
+
+enum Inner {
+    Symphonia(Box<dyn Decoder>),
+    Opus { codec: OpusCodec, scratch: Vec<f32>, channels: usize },
+}
+
+impl PacketDecoder {
+    /// Build the decoder for `codec_params`, at `channels` channels.
+    pub fn new(codec_params: &CodecParameters, channels: usize) -> anyhow::Result<Self> {
+        let channels = channels.max(1);
+        let inner = if codec_params.codec == CODEC_TYPE_OPUS {
+            Inner::Opus {
+                codec: OpusCodec::new(
+                    OPUS_SAMPLE_RATE,
+                    if channels == 1 { Channels::Mono } else { Channels::Stereo },
+                )?,
+                scratch: vec![0.0; MAX_OPUS_FRAMES * channels],
+                channels,
+            }
+        } else {
+            Inner::Symphonia(
+                symphonia::default::get_codecs()
+                    .make(codec_params, &DecoderOptions::default())?,
+            )
+        };
+        Ok(Self { inner, sample_buf: None })
+    }
+
+    /// Whether this decoder is the libopus one.
+    pub fn is_opus(&self) -> bool {
+        matches!(self.inner, Inner::Opus { .. })
+    }
+
+    /// Decode one packet into interleaved f32 samples, or `None` if it isn't
+    /// decodable (a corrupt packet, or a non-audio one) — callers skip it and
+    /// try the next.
+    pub fn decode(&mut self, packet: &Packet) -> Option<&[f32]> {
+        // Field-split so the symphonia arm can borrow the sample buffer while
+        // `decoded` still borrows the decoder.
+        let Self { inner, sample_buf } = self;
+        match inner {
+            Inner::Opus { codec, scratch, channels } => {
+                let frames = codec.decode_float(&packet.data, scratch, false).ok()?;
+                Some(&scratch[..frames * *channels])
+            }
+            Inner::Symphonia(decoder) => {
+                let decoded = decoder.decode(packet).ok()?;
+                let buf = sample_buf.get_or_insert_with(|| {
+                    SampleBuffer::new(decoded.capacity() as u64, *decoded.spec())
+                });
+                buf.copy_interleaved_ref(decoded);
+                Some(buf.samples())
+            }
+        }
+    }
 }

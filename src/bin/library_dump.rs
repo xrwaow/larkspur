@@ -32,11 +32,11 @@ fn main() {
         println!("  ! {}: {err}", path.display());
     }
 
-    println!("songs: {}", library.songs.len());
+    println!("songs: {}", library.song_count());
 
     // Nominal bitrates are normalized to bits per second on load; this is the
     // quickest sanity check that the unit conversion is right.
-    let nominal: Vec<u32> = library.songs.values().filter_map(|s| s.nominal_bitrate).collect();
+    let nominal: Vec<u32> = library.songs().filter_map(|s| s.nominal_bitrate).collect();
     if !nominal.is_empty() {
         let min = nominal.iter().min().unwrap();
         let max = nominal.iter().max().unwrap();
@@ -44,7 +44,7 @@ fn main() {
         println!("nominal bitrate: min {min}  avg {avg}  max {max} bps");
     }
 
-    println!("playlists: {}", library.playlists.len());
+    println!("playlists: {}", library.playlists().len());
     for playlist in library.playlists() {
         let kind = if playlist.is_custom() { "custom" } else { "auto" };
         println!(

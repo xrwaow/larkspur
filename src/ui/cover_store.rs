@@ -9,12 +9,17 @@
 //! downscaled once and held in a byte-budgeted LRU, and each downscaled image
 //! is written to `~/.cache/larkspur/covers/<id>.jpg` so a later launch skips
 //! re-decoding embedded art entirely.
+//!
+//! The store also derives each cover's **dominant colour** at decode time (it
+//! already has the pixels in hand, off-thread) and exposes it via
+//! [`accent`](CoverStore::accent). That's what the dynamic theme tints from, so
+//! no view has to analyse an image itself.
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use gpui::{Context, RenderImage};
+use gpui::{Context, Hsla, RenderImage, Rgba};
 use lofty::file::TaggedFileExt;
 use lofty::probe::Probe;
 
@@ -43,6 +48,9 @@ pub struct CoverStore {
     /// What the UI can draw, keyed by song. `Ready` entries mirror the cache's
     /// contents; the `Loading`/`Missing` markers carry no pixels and are tiny.
     images: HashMap<SongId, CoverImage>,
+    /// Each decoded cover's dominant colour, for the dynamic theme. Tiny, and
+    /// kept even after the pixels are evicted.
+    accents: HashMap<SongId, Rgba>,
     /// Ids with a decode in flight, so a second ask doesn't spawn a second one.
     in_flight: HashSet<SongId>,
 }
@@ -53,6 +61,7 @@ impl CoverStore {
         Self {
             cache: CoverCache::new(disk_dir, COVER_MEMORY_BUDGET),
             images: HashMap::new(),
+            accents: HashMap::new(),
             in_flight: HashSet::new(),
         }
     }
@@ -65,6 +74,12 @@ impl CoverStore {
     /// The cover for an optional song id — `None` in, `None` out.
     pub fn cover_of(&self, id: Option<SongId>) -> Option<CoverImage> {
         id.and_then(|id| self.cover(id))
+    }
+
+    /// A cover's dominant colour, once it's been decoded — the dynamic theme's
+    /// seed.
+    pub fn accent(&self, id: SongId) -> Option<Rgba> {
+        self.accents.get(&id).copied()
     }
 
     /// Ask for `id`'s cover, decoding it off-thread the first time.
@@ -83,7 +98,7 @@ impl CoverStore {
 
         // Memory hit: nothing to decode.
         if let Some(image) = self.cache.get(id) {
-            self.keep(id, image);
+            self.keep(id, image, None);
             return;
         }
 
@@ -100,7 +115,7 @@ impl CoverStore {
             this.update(cx, |store, cx| {
                 store.in_flight.remove(&id);
                 match decoded {
-                    Some(image) => store.keep(id, image),
+                    Some((image, accent)) => store.keep(id, image, accent),
                     None => {
                         store.images.insert(id, CoverImage::Missing);
                     }
@@ -114,7 +129,10 @@ impl CoverStore {
 
     /// Put a decoded image in the byte-budgeted cache and mirror the result —
     /// including any evictions — into the UI map, so the two never diverge.
-    fn keep(&mut self, id: SongId, image: Arc<RenderImage>) {
+    fn keep(&mut self, id: SongId, image: Arc<RenderImage>, accent: Option<Rgba>) {
+        if let Some(accent) = accent {
+            self.accents.insert(id, accent);
+        }
         let bytes = image.as_bytes(0).map(<[u8]>::len).unwrap_or(0);
         for evicted in self.cache.insert(id, image.clone(), bytes) {
             self.images.remove(&evicted);
@@ -130,11 +148,56 @@ impl CoverStore {
     }
 }
 
+/// The dominant, reasonably-saturated colour of a decoded cover — the seed for
+/// the dynamic theme.
+///
+/// Pixels are bucketed by hue and weighted by saturation, and the heaviest
+/// bucket's average wins; a cover with no saturated pixels falls back to its
+/// overall average, and an empty image yields `None`.
+pub fn dominant_color(image: &DecodedImage) -> Option<Rgba> {
+    const BUCKETS: usize = 12;
+    let mut weight = [0.0f32; BUCKETS];
+    let mut sum = [[0.0f32; 3]; BUCKETS];
+    let mut average = [0.0f32; 3];
+    let mut counted = 0.0f32;
+
+    for pixel in image.rgba.chunks_exact(4) {
+        let (r, g, b, a) = (pixel[0], pixel[1], pixel[2], pixel[3]);
+        if a < 128 {
+            continue;
+        }
+        let (r, g, b) = (r as f32 / 255.0, g as f32 / 255.0, b as f32 / 255.0);
+        let hsla: Hsla = Rgba { r, g, b, a: 1.0 }.into();
+        if hsla.s > 0.15 && (0.15..=0.85).contains(&hsla.l) {
+            let bucket = ((hsla.h * BUCKETS as f32) as usize).min(BUCKETS - 1);
+            weight[bucket] += hsla.s;
+            sum[bucket][0] += r * hsla.s;
+            sum[bucket][1] += g * hsla.s;
+            sum[bucket][2] += b * hsla.s;
+        }
+        average[0] += r;
+        average[1] += g;
+        average[2] += b;
+        counted += 1.0;
+    }
+
+    let (best, &heaviest) = weight.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1))?;
+    if heaviest > 0.0 {
+        let bucket = sum[best];
+        Some(Rgba { r: bucket[0] / heaviest, g: bucket[1] / heaviest, b: bucket[2] / heaviest, a: 1.0 })
+    } else if counted > 0.0 {
+        Some(Rgba { r: average[0] / counted, g: average[1] / counted, b: average[2] / counted, a: 1.0 })
+    } else {
+        None
+    }
+}
+
 /// Decode a song's cover, preferring the disk tier over the file's tags.
 ///
-/// Runs off the UI thread. Returns `None` when there's genuinely no usable art,
-/// which the caller records as `Missing`.
-fn load_cover(path: &Path, disk_path: &Path) -> Option<Arc<RenderImage>> {
+/// Runs off the UI thread. Returns the GPU-ready image and its dominant colour,
+/// or `None` when there's genuinely no usable art (which the caller records as
+/// `Missing`).
+fn load_cover(path: &Path, disk_path: &Path) -> Option<(Arc<RenderImage>, Option<Rgba>)> {
     let decoded = match read_disk(disk_path) {
         Some(cached) => cached,
         None => {
@@ -143,7 +206,9 @@ fn load_cover(path: &Path, disk_path: &Path) -> Option<Arc<RenderImage>> {
             decoded
         }
     };
-    to_render_image(&decoded)
+    let accent = dominant_color(&decoded);
+    let image = to_render_image(&decoded)?;
+    Some((image, accent))
 }
 
 /// Read a previously downscaled thumbnail from the disk tier.
@@ -188,4 +253,36 @@ fn to_render_image(decoded: &DecodedImage) -> Option<Arc<RenderImage>> {
         pixel.swap(0, 2);
     }
     Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A one-row RGBA image from RGB pixels.
+    fn image_from(pixels: &[(u8, u8, u8)]) -> DecodedImage {
+        let mut rgba = Vec::with_capacity(pixels.len() * 4);
+        for (r, g, b) in pixels {
+            rgba.extend_from_slice(&[*r, *g, *b, 255]);
+        }
+        DecodedImage { width: pixels.len() as u32, height: 1, rgba }
+    }
+
+    #[test]
+    fn dominant_color_picks_the_saturated_hue() {
+        // Mostly grey with a few strongly blue pixels: blue wins.
+        let image = image_from(&[(128, 128, 128), (128, 128, 128), (10, 20, 220), (20, 30, 200)]);
+        let accent = dominant_color(&image).expect("an accent");
+        let hsla: Hsla = accent.into();
+        // Blue sits around 240°, i.e. 0.66 in the 0..1 hue range.
+        assert!(hsla.h > 0.55 && hsla.h < 0.75, "hue {hsla:?}");
+    }
+
+    #[test]
+    fn dominant_color_falls_back_to_the_average_for_greys() {
+        let image = image_from(&[(100, 100, 100), (100, 100, 100)]);
+        let accent = dominant_color(&image).expect("an accent");
+        let (r, g, b) = (accent.r, accent.g, accent.b);
+        assert!((r - g).abs() < 0.02 && (g - b).abs() < 0.02, "grey in, grey out");
+    }
 }

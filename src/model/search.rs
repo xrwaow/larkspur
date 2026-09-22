@@ -276,19 +276,12 @@ pub struct AlbumGroup {
 /// skipped — `Library::rebuild_auto` puts every song in one, so this only
 /// guards against a library that hasn't been rebuilt yet.
 pub fn album_groups(library: &Library, matched: &HashSet<SongId>) -> Vec<AlbumGroup> {
-    let mut owner: HashMap<SongId, PlaylistId> = HashMap::new();
-    for playlist in library.playlists() {
-        if playlist.kind == PlaylistKind::Auto {
-            for song in &playlist.song_ids {
-                owner.insert(*song, playlist.id);
-            }
-        }
-    }
-
+    // `Library`'s index answers "which album owns this song" directly, so this
+    // no longer walks every playlist building an owner map.
     let mut by_playlist: HashMap<PlaylistId, HashSet<SongId>> = HashMap::new();
     for song in matched {
-        if let Some(playlist) = owner.get(song) {
-            by_playlist.entry(*playlist).or_default().insert(*song);
+        if let Some(playlist) = library.album_playlist_of(*song) {
+            by_playlist.entry(playlist).or_default().insert(*song);
         }
     }
 
@@ -327,8 +320,7 @@ pub fn search(library: &Library, query: &Query) -> Vec<AlbumGroup> {
         return all_albums(library);
     }
     let matched: HashSet<SongId> = library
-        .songs
-        .values()
+        .songs()
         .filter(|song| query.matches(song))
         .map(|song| song.id)
         .collect();

@@ -8,7 +8,7 @@
 //! the palette is shared (chosen by [`ThemeKind`]), but the font size is
 //! per-container, so two views can render the same colors at different sizes.
 
-use gpui::{rgb, Rgba};
+use gpui::{hsla, rgb, Hsla, Rgba};
 
 use crate::model::config::ThemeKind;
 use crate::model::config::{FontKind, DEFAULT_FONT_SIZE};
@@ -60,8 +60,10 @@ impl Theme {
     /// The theme for `kind`, drawing with `font` at `font_size`.
     pub fn for_kind(kind: ThemeKind, font: &'static str, font_size: f32) -> Self {
         let mut theme = match kind {
-            ThemeKind::Dark => Self::dark_palette(),
             ThemeKind::Light => Self::light_palette(),
+            // The dynamic palette is built by [`Theme::dynamic`]; without an
+            // accent to derive from it reads as the default dark palette.
+            ThemeKind::Dark | ThemeKind::Dynamic => Self::dark_palette(),
         };
         theme.font = font;
         theme.font_size = font_size;
@@ -74,6 +76,39 @@ impl Theme {
 
     pub fn light() -> Self {
         Self::for_kind(ThemeKind::Light, FontKind::default().family(), DEFAULT_FONT_SIZE)
+    }
+
+    /// A palette derived from `accent` — the dominant colour of the current
+    /// cover. Backgrounds are a dark wash of the accent's hue, text a light tint
+    /// of the same hue, and the accent itself is brightened so it stays readable
+    /// on the dark surfaces. The hue is what carries the cover's character; the
+    /// saturation is clamped so a near-grey cover still yields a usable palette.
+    pub fn dynamic(accent: Rgba, font: &'static str, font_size: f32) -> Self {
+        let base: Hsla = accent.into();
+        let hue = base.h;
+        let sat = base.s.clamp(0.25, 0.65);
+        let surface = |lightness: f32| Rgba::from(hsla(hue, sat * 0.5, lightness, 1.0));
+        Self {
+            font,
+            font_size,
+            window_bg: surface(0.04),
+            panel_bg: surface(0.08),
+            rail_bg: surface(0.06),
+            header_bg: surface(0.12),
+            row_even: surface(0.08),
+            row_odd: surface(0.11),
+            row_hover: surface(0.16),
+            row_active: surface(0.21),
+            row_playing: Rgba::from(hsla(hue, sat * 0.7, 0.17, 1.0)),
+            text: Rgba::from(hsla(hue, 0.15, 0.93, 1.0)),
+            text_muted: Rgba::from(hsla(hue, 0.12, 0.62, 1.0)),
+            text_faint: Rgba::from(hsla(hue, 0.10, 0.46, 1.0)),
+            accent: Rgba::from(hsla(hue, sat.clamp(0.45, 0.85), 0.66, 1.0)),
+            selection: Rgba::from(hsla(hue, 0.45, 0.34, 1.0)),
+            border: surface(0.17),
+            waveform: Rgba::from(hsla(hue, 0.15, 0.30, 1.0)),
+            waveform_played: Rgba::from(hsla(hue, 0.20, 0.95, 1.0)),
+        }
     }
 
     fn dark_palette() -> Self {
@@ -179,5 +214,35 @@ impl Theme {
 impl Default for Theme {
     fn default() -> Self {
         Self::dark()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dynamic_palette_takes_the_accent_hue_and_stays_readable() {
+        let source = rgb(0x3a7bd5);
+        let theme = Theme::dynamic(source, "TX-02", 14.0);
+        let accent: Hsla = theme.accent.into();
+        let from: Hsla = source.into();
+        assert!((accent.h - from.h).abs() < 0.02, "accent hue follows the cover");
+        // Dark surfaces, light text, so the palette stays readable whatever the
+        // cover's colour is.
+        let text: Hsla = theme.text.into();
+        let panel: Hsla = theme.panel_bg.into();
+        assert!(text.l > 0.8, "text stays light");
+        assert!(panel.l < 0.2, "backgrounds stay dark");
+    }
+
+    #[test]
+    fn a_grey_cover_still_yields_a_usable_palette() {
+        // A near-grey accent has almost no saturation; the palette clamps it up
+        // rather than collapsing to flat greys.
+        let theme = Theme::dynamic(rgb(0x808080), "TX-02", 14.0);
+        let panel: Hsla = theme.panel_bg.into();
+        let text: Hsla = theme.text.into();
+        assert!(text.l > panel.l + 0.5, "enough contrast to read");
     }
 }

@@ -6,56 +6,54 @@
 //! using the same sections the browse and playlist containers draw, drawn
 //! through GPUI's virtualized [`list`].
 //!
-//! All matching lives in [`crate::model::search`]; this view only owns the text
-//! being typed (a [`TextField`], with caret, selection, and editing chords) and
-//! the last query it ran.
+//! All matching lives in [`crate::model::search`]; this view owns the text being
+//! typed (a [`TextField`], with caret, selection, editing chords, and clipboard
+//! paste) and the last query it ran. Selection and navigation come from
+//! [`RowList`]. `enter` submits a changed query and otherwise plays the selected
+//! result.
 
 use std::rc::Rc;
 
 use gpui::{
     div, list, prelude::*, px, AnyElement, ClickEvent, Context, Entity, FocusHandle, Focusable,
-    KeyDownEvent, ListAlignment, ListState, MouseDownEvent, Render, Subscription, Window,
+    KeyDownEvent, MouseDownEvent, Render, ScrollWheelEvent, Subscription, Window,
 };
 
 use crate::model::search::{self, Query};
-use crate::model::{PlaylistId, SongId};
-use crate::ui::albums::{self, AlbumSection, RowActions};
-use crate::ui::config_state::ConfigState;
+use crate::model::{InputAction, PlaylistId, SongId};
+use crate::ui::albums::{self, RowActions};
+use crate::ui::animation::Animator;
+use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::cover_store::CoverStore;
+use crate::ui::input::action_for_key;
 use crate::ui::library_state::LibraryState;
 use crate::ui::menu::SongMenuRequest;
+use crate::ui::row_list::{RowAction, RowList};
 use crate::ui::state::PlaybackState;
 use crate::ui::text_field::TextField;
-use crate::ui::theme::Theme;
-
-/// Extra rows rendered above and below the viewport. Roughly ±50 rows.
-const OVERDRAW_PX: f32 = 1200.0;
+use crate::ui::widgets::{panel_header, scroll_area, wheel_pixels};
 
 pub struct SearchView {
     library: Entity<LibraryState>,
     playback: Entity<PlaybackState>,
     covers: Entity<CoverStore>,
-    theme: Theme,
+    themed: Themed,
+    rows: RowList,
     /// The query box.
     input: TextField,
     /// The last query that was submitted, and what it warned about.
     query: Query,
+    /// The text of the last submitted query, so `enter` can tell "run this" from
+    /// "play the selected result".
+    submitted: String,
+    /// The library revision the results were last built from.
+    seen_revision: u64,
     warnings: Vec<String>,
-    /// The current result sections. Rebuilt on submit, not every frame.
-    sections: Rc<Vec<AlbumSection>>,
-    /// Set when the library changes, so results are re-run against it.
-    stale: bool,
-    /// Virtualized-list state.
-    list_state: ListState,
-    /// The row count the list was last reset to.
-    item_count: usize,
-    /// Set when the result set changed, so the list re-measures.
-    list_dirty: bool,
     focus_handle: FocusHandle,
     _observe: Subscription,
     _observe_covers: Subscription,
-    _observe_config: Subscription,
+    _observe_animator: Subscription,
 }
 
 impl SearchView {
@@ -64,35 +62,39 @@ impl SearchView {
         playback: Entity<PlaybackState>,
         covers: Entity<CoverStore>,
         config: Entity<ConfigState>,
+        animator: Entity<Animator>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let observe = cx.observe(&library, |this, _state, cx| {
-            this.stale = true;
+        let observe = cx.observe(&library, |this, state, cx| {
+            let revision = state.read(cx).revision();
+            if this.seen_revision != revision {
+                this.seen_revision = revision;
+                this.rows.mark_dirty();
+            }
             cx.notify();
         });
         let observe_covers = cx.observe(&covers, |_this, _state, cx| cx.notify());
-        let observe_config = cx.observe(&config, |this, config, cx| {
-            this.theme = config.read(cx).theme_for(Self::container_id(), Self::default_font_size());
-            cx.notify();
+        let observe_animator = cx.observe(&animator, |this, animator, cx| {
+            if this.rows.tick(animator.read(cx).dt()) {
+                cx.notify();
+            }
         });
-        let theme = config.read(cx).theme_for(Self::container_id(), Self::default_font_size());
+        let themed = Themed::new(&config, cx);
         Self {
             library,
             playback,
             covers,
-            theme,
+            themed,
+            rows: RowList::new(),
             input: TextField::default(),
             query: Query::default(),
+            submitted: String::new(),
+            seen_revision: 0,
             warnings: Vec::new(),
-            sections: Rc::new(Vec::new()),
-            stale: false,
-            list_state: ListState::new(0, ListAlignment::Top, px(OVERDRAW_PX)),
-            item_count: 0,
-            list_dirty: false,
             focus_handle: cx.focus_handle(),
             _observe: observe,
             _observe_covers: observe_covers,
-            _observe_config: observe_config,
+            _observe_animator: observe_animator,
         }
     }
 
@@ -105,16 +107,15 @@ impl SearchView {
     fn submit(&mut self, cx: &mut Context<Self>) {
         let (query, warnings) = search::parse(&self.input.value);
         self.query = query;
+        self.submitted = self.input.value.clone();
         self.warnings = warnings;
-        self.list_dirty = true;
-        self.recompute(cx);
+        self.rows.mark_dirty();
         cx.notify();
     }
 
-    /// Re-run the last query against the library. Does not notify — callers
-    /// decide, so this is safe to call from `render`.
-    fn recompute(&mut self, cx: &mut Context<Self>) {
-        self.sections = Rc::new(if self.input.is_empty() {
+    /// Build the result sections from the last submitted query.
+    fn build_sections(&self, cx: &Context<Self>) -> Vec<albums::AlbumSection> {
+        if self.input.is_empty() {
             // An empty box isn't a query for "everything" — that's the browse
             // container's job.
             Vec::new()
@@ -124,17 +125,29 @@ impl SearchView {
                 state.library(),
                 search::search(state.library(), &self.query),
             )
-        });
+        }
     }
 
-    fn summary(&self) -> String {
+    fn dispatch(&mut self, action: InputAction, cx: &mut Context<Self>) {
+        match self.rows.handle(action) {
+            RowAction::Play(playlist, index) => {
+                let playback = self.playback.clone();
+                self.library
+                    .update(cx, |state, cx| state.play_playlist(playlist, index, &playback, cx));
+            }
+            RowAction::Handled => cx.notify(),
+            RowAction::Ignored => {}
+        }
+    }
+
+    fn summary(&self, sections: &[albums::AlbumSection]) -> String {
         if self.input.is_empty() {
             "Type a query and press enter".to_string()
         } else if let Some(warning) = self.warnings.first() {
             warning.clone()
         } else {
-            let songs: usize = self.sections.iter().map(|s| s.tracks.len()).sum();
-            format!("{} songs in {} albums", songs, self.sections.len())
+            let songs: usize = sections.iter().map(|s| s.tracks.len()).sum();
+            format!("{} songs in {} albums", songs, sections.len())
         }
     }
 }
@@ -151,19 +164,25 @@ impl Focusable for SearchView {
     }
 }
 
-/// How the search view reacts to a row click: play the album from there.
+/// How the search view reacts to a row click: play the album from there, or
+/// extend/toggle the selection with a modifier.
 struct SearchRows;
 
 impl RowActions<SearchView> for SearchRows {
     fn activate(
         &self,
         view: &mut SearchView,
+        item_ix: usize,
         playlist: PlaylistId,
         index: usize,
-        _event: &ClickEvent,
+        event: &ClickEvent,
         _window: &mut Window,
         cx: &mut Context<SearchView>,
     ) {
+        if view.rows.click(item_ix, event.modifiers()) {
+            cx.notify();
+            return;
+        }
         let playback = view.playback.clone();
         view.library.update(cx, |state, cx| state.play_playlist(playlist, index, &playback, cx));
     }
@@ -171,56 +190,87 @@ impl RowActions<SearchView> for SearchRows {
     fn context(
         &self,
         view: &mut SearchView,
-        song: SongId,
+        item_ix: usize,
+        _song: SongId,
         context: Option<PlaylistId>,
         event: &MouseDownEvent,
         _window: &mut Window,
         cx: &mut Context<SearchView>,
     ) {
-        let request = SongMenuRequest { song, position: event.position, playlist: context };
+        let songs = view.rows.context_songs(item_ix);
+        let request = SongMenuRequest { songs, position: event.position, playlist: context };
         view.library.update(cx, |state, cx| state.request_song_menu(request, cx));
+    }
+
+    fn hover(
+        &self,
+        view: &mut SearchView,
+        item_ix: usize,
+        hovered: bool,
+        cx: &mut Context<SearchView>,
+    ) {
+        if view.rows.set_hover(item_ix, hovered) {
+            cx.notify();
+        }
     }
 }
 
 impl Render for SearchView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.themed.theme();
 
-        if self.stale {
-            self.stale = false;
-            self.list_dirty = true;
-            self.recompute(cx);
-        }
+        let fresh = self.rows.is_dirty().then(|| self.build_sections(cx));
+        self.rows.sync(theme, window, fresh);
 
-        let sections = self.sections.clone();
-        let items = Rc::new(albums::flatten(&sections));
-        if self.item_count != items.len() || self.list_dirty {
-            self.list_state.reset(items.len());
-            self.item_count = items.len();
-            self.list_dirty = false;
-        }
+        let sections = self.rows.sections();
+        let items = self.rows.items();
+        let title_cols = self.rows.title_cols();
+        let list_state = self.rows.list_state().clone();
 
         let current = self.playback.read(cx).metadata().id;
         let live_bitrate = self.playback.read(cx).live_bitrate();
         let actions: Rc<dyn RowActions<SearchView>> = Rc::new(SearchRows);
 
-        let summary = self.summary();
+        let summary = self.summary(&sections);
+        let hint_color = if self.warnings.is_empty() { theme.text_muted } else { theme.accent };
 
         let mut root = div()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 // The box owns plain typing and editing keys, including the
-                // selection chords. `escape` and unhandled command chords
-                // (`ctrl+tab`, `ctrl+shift+f`, …) bubble to the tab container.
+                // selection chords and paste. `escape` and unhandled command
+                // chords (`ctrl+tab`, `ctrl+shift+f`, …) bubble to the tab
+                // container.
                 if event.keystroke.key == "escape" {
                     return;
                 }
+                // Navigation keys move the result selection rather than the
+                // caret, so the box never sees them.
+                if let Some(action) = action_for_key(&event.keystroke) {
+                    if matches!(
+                        action,
+                        InputAction::SelectNext
+                            | InputAction::SelectPrev
+                            | InputAction::PageUp
+                            | InputAction::PageDown
+                    ) {
+                        this.dispatch(action, cx);
+                        cx.stop_propagation();
+                        return;
+                    }
+                }
                 if event.keystroke.key == "enter" {
-                    this.submit(cx);
+                    // A changed query runs; an unchanged one plays the selection.
+                    if this.input.value != this.submitted {
+                        this.submit(cx);
+                    } else {
+                        this.dispatch(InputAction::Activate, cx);
+                    }
                     cx.stop_propagation();
                     return;
                 }
-                if this.input.handle_key(event) {
+                let clipboard = cx.read_from_clipboard().and_then(|item| item.text());
+                if this.input.handle_key_with_clipboard(event, clipboard.as_deref()) {
                     cx.stop_propagation();
                     cx.notify();
                 }
@@ -230,31 +280,7 @@ impl Render for SearchView {
             .flex_col()
             .bg(theme.panel_bg)
             .font_family(theme.font)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_4()
-                    .px_4()
-                    .py_3()
-                    .child(
-                        div()
-                            .text_size(px(theme.cell_px() + 2.0))
-                            .text_color(theme.text)
-                            .child("Search"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(theme.small_px()))
-                            .text_color(if self.warnings.is_empty() {
-                                theme.text_muted
-                            } else {
-                                theme.accent
-                            })
-                            .child(summary),
-                    ),
-            );
+            .child(panel_header(theme, "Search", &summary, hint_color));
 
         if sections.is_empty() {
             root = root.child(
@@ -273,28 +299,39 @@ impl Render for SearchView {
         } else {
             let covers = self.covers.clone();
             let library = self.library.clone();
+            let highlight = self.rows.highlight();
             let render = cx.processor({
                 let sections = sections.clone();
                 let items = items.clone();
+                let title_cols = title_cols.clone();
                 let actions = actions.clone();
-                move |_this, ix: usize, window: &mut Window, cx: &mut Context<SearchView>| {
+                move |_this, ix: usize, _window: &mut Window, cx: &mut Context<SearchView>| {
                     albums::render_item(
                         theme,
                         ix,
                         &sections,
                         &items,
+                        &title_cols,
                         &covers,
                         &library,
                         current,
                         live_bitrate,
                         None,
+                        &highlight,
                         &actions,
-                        window,
                         cx,
                     )
                 }
             });
-            root = root.child(list(self.list_state.clone(), render).flex_1().w_full().min_h_0());
+            root = root.child(scroll_area(
+                list(list_state, render).size_full().into_any_element(),
+                cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                    if this.rows.wheel(wheel_pixels(event)) {
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                }),
+            ));
         }
 
         root.child(div().px_4().pb_3().child(search_box(theme, &self.input)))
@@ -302,7 +339,7 @@ impl Render for SearchView {
 }
 
 /// The query box: a magnifier, the editable text, and a hint.
-fn search_box(theme: Theme, input: &TextField) -> AnyElement {
+fn search_box(theme: crate::ui::theme::Theme, input: &TextField) -> AnyElement {
     div()
         .flex()
         .items_center()

@@ -53,6 +53,31 @@ impl TextField {
         })
     }
 
+    /// Handle an editing key, with clipboard text available for paste.
+    ///
+    /// Only the surrounding view has `App` access to read the clipboard, so it
+    /// passes the text in; `ctrl+v` inserts it at the caret. Everything else
+    /// falls through to [`handle_key`](Self::handle_key).
+    pub fn handle_key_with_clipboard(
+        &mut self,
+        event: &KeyDownEvent,
+        clipboard: Option<&str>,
+    ) -> bool {
+        let modifiers = event.keystroke.modifiers;
+        if modifiers.control
+            && !modifiers.alt
+            && !modifiers.platform
+            && event.keystroke.key == "v"
+        {
+            if let Some(text) = clipboard {
+                self.insert(text);
+                return true;
+            }
+            return false;
+        }
+        self.handle_key(event)
+    }
+
     /// Handle an editing key, returning whether it was consumed.
     pub fn handle_key(&mut self, event: &KeyDownEvent) -> bool {
         let modifiers = event.keystroke.modifiers;
@@ -401,5 +426,29 @@ mod tests {
         assert_eq!(prev_word("hello", 0), 0);
         assert_eq!(next_word("hello", 5), 5);
         assert_eq!(next_word("hello brave", 0), 6);
+    }
+
+    #[test]
+    fn ctrl_v_pastes_the_clipboard_at_the_caret() {
+        let mut field = TextField::new("ab");
+        field.handle_key(&key("left", None));
+        assert!(field.handle_key_with_clipboard(&key("ctrl-v", None), Some("XY")));
+        assert_eq!(field.value, "aXYb");
+        assert_eq!(field.caret, 3);
+    }
+
+    #[test]
+    fn ctrl_v_replaces_the_selection() {
+        let mut field = TextField::new("hello world");
+        field.handle_key(&key("ctrl-a", None));
+        field.handle_key_with_clipboard(&key("ctrl-v", None), Some("pasted"));
+        assert_eq!(field.value, "pasted");
+    }
+
+    #[test]
+    fn ctrl_v_without_clipboard_text_bubbles() {
+        let mut field = TextField::new("ab");
+        assert!(!field.handle_key_with_clipboard(&key("ctrl-v", None), None));
+        assert_eq!(field.value, "ab");
     }
 }

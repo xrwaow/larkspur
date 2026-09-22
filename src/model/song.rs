@@ -4,6 +4,7 @@ use std::time::Duration;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::probe::Probe;
 use lofty::tag::{Accessor, ItemKey, Tag};
+use serde::{Deserialize, Serialize};
 
 use super::cover::CoverState;
 use super::identity::{generate_song_id, SongId};
@@ -13,10 +14,14 @@ use super::lyrics::{load_sidecar, looks_like_lrc, parse_lrc, Lyrics};
 ///
 /// Static and per-file: title, artists, album, track position, duration,
 /// nominal bitrate, embedded lyrics, and cover state. The live playback
-/// telemetry (moving bitrate, elapsed time) lives in
-/// [`StreamingInfo`](super::streaming::StreamingInfo) instead — a
-/// different concern with a different lifetime.
-#[derive(Debug, Clone)]
+/// telemetry (moving bitrate, elapsed time) is a separate concern with a
+/// different lifetime and lives in the UI's playback state instead.
+///
+/// Serialize/Deserialize is derived so the scan cache can round-trip a song
+/// whole rather than mirroring every field. `cover` is skipped — the cache
+/// records only *whether* art exists ([`has_art`](Self::has_art)) and rebuilds
+/// the state on load, since decoded pixels aren't part of the metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SongMetadata {
     pub id: SongId,
     pub path: PathBuf,
@@ -42,6 +47,7 @@ pub struct SongMetadata {
     pub nominal_bitrate: Option<u32>,
     pub lyrics: Lyrics,
     pub duration: Duration,
+    #[serde(skip)]
     pub cover: CoverState,
 }
 

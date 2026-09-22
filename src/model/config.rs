@@ -11,8 +11,6 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
-use super::input::InputAction;
-
 /// Which palette the UI draws with.
 ///
 /// The `Theme` itself lives in the UI layer; the model only records *which*
@@ -23,16 +21,42 @@ pub enum ThemeKind {
     #[default]
     Dark,
     Light,
+    /// A palette derived from the current track's cover art. Falls back to
+    /// [`Dark`](Self::Dark) until a cover has been analysed.
+    Dynamic,
 }
 
 impl ThemeKind {
     /// Every selectable theme, in the order the settings panel lists them.
-    pub const ALL: [ThemeKind; 2] = [ThemeKind::Dark, ThemeKind::Light];
+    pub const ALL: [ThemeKind; 3] = [ThemeKind::Dark, ThemeKind::Light, ThemeKind::Dynamic];
 
     pub fn label(self) -> &'static str {
         match self {
             ThemeKind::Dark => "Dark",
             ThemeKind::Light => "Light",
+            ThemeKind::Dynamic => "Dynamic",
+        }
+    }
+}
+
+/// How the transport bar draws the waveform.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum WaveformStyle {
+    /// Amplitude bars.
+    #[default]
+    Bars,
+    /// A single flat progress line.
+    FlatLine,
+}
+
+impl WaveformStyle {
+    /// Every selectable style, in the order the settings panel lists them.
+    pub const ALL: [WaveformStyle; 2] = [WaveformStyle::Bars, WaveformStyle::FlatLine];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            WaveformStyle::Bars => "Bars",
+            WaveformStyle::FlatLine => "Line",
         }
     }
 }
@@ -98,10 +122,6 @@ pub const MIN_FONT_SIZE: f32 = 8.0;
 pub const MAX_FONT_SIZE: f32 = 32.0;
 
 /// Runtime configuration, loaded from and saved to disk.
-///
-/// `keybinds` is a placeholder until the input backend is settled (see
-/// [`InputAction`]); the value type is a `String` rather than a specific key
-/// type on purpose, and it isn't persisted yet.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Which palette to draw with.
@@ -118,8 +138,9 @@ pub struct Config {
     /// Directories synced into the library. This is the source of truth for
     /// scan roots — the command line only seeds it on a first run.
     pub roots: Vec<PathBuf>,
-    #[serde(skip)]
-    pub keybinds: HashMap<InputAction, String>,
+    /// How the transport bar draws the waveform.
+    #[serde(default)]
+    pub waveform: WaveformStyle,
 }
 
 impl Default for Config {
@@ -129,7 +150,7 @@ impl Default for Config {
             fonts: HashMap::new(),
             font_sizes: HashMap::new(),
             roots: Vec::new(),
-            keybinds: HashMap::new(),
+            waveform: WaveformStyle::default(),
         }
     }
 }
@@ -314,5 +335,23 @@ mod tests {
         assert_eq!(config.theme, ThemeKind::Light);
         assert_eq!(config.font_for("lyrics", FontKind::Tx02), FontKind::Tx02);
         assert_eq!(config.font_size_for("lyrics", 14.0), 16.0);
+    }
+
+    #[test]
+    fn waveform_defaults_to_bars_and_round_trips() {
+        assert_eq!(Config::default().waveform, WaveformStyle::Bars);
+        let mut config = Config::default();
+        config.waveform = WaveformStyle::FlatLine;
+        let bytes = serde_json::to_vec(&config).unwrap();
+        let back: Config = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.waveform, WaveformStyle::FlatLine);
+    }
+
+    #[test]
+    fn a_config_without_a_waveform_defaults_to_bars() {
+        // An older config predates the `waveform` field.
+        let json = r#"{"theme":"Dark","font_sizes":{},"roots":[]}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.waveform, WaveformStyle::Bars);
     }
 }

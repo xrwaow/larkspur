@@ -4,34 +4,28 @@ use std::sync::Arc;
 
 use gpui::{
     canvas, div, fill, point, prelude::*, px, size, AnyElement, Bounds, Context, Entity,
-    Keystroke, MouseButton, MouseDownEvent, PathBuilder, Pixels, Render, Rgba, Subscription, Window,
+    MouseButton, MouseDownEvent, PathBuilder, Pixels, Render, Rgba, Subscription, Window,
 };
 
+use crate::model::config::WaveformStyle;
 use crate::model::InputAction;
-use crate::ui::config_state::ConfigState;
+use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::format::format_duration;
 use crate::ui::state::PlaybackState;
 use crate::ui::theme::Theme;
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-pub enum WaveformStyle {
-    FlatLine,
-    Bars,
-}
-
 pub struct PlaybackView {
     /// Shared playback state. This view reads it and dispatches actions
     /// into it; it never owns the controller.
     state: Entity<PlaybackState>,
-    theme: Theme,
-    style: WaveformStyle,
+    config: Entity<ConfigState>,
+    themed: Themed,
     // Filled in by the seek-bar's canvas each time it paints, so
     // on_mouse_down can turn a window-relative click into a
     // bar-relative fraction without guessing at layout position.
     seek_bar_bounds: Rc<Cell<Bounds<Pixels>>>,
     _observe: Subscription,
-    _observe_config: Subscription,
 }
 
 impl PlaybackView {
@@ -43,18 +37,13 @@ impl PlaybackView {
         // Re-render whenever the shared state changes. The state owns the
         // ticker, so this view no longer polls for position updates.
         let observe = cx.observe(&state, |_this, _state, cx| cx.notify());
-        let observe_config = cx.observe(&config, |this, config, cx| {
-            this.theme = config.read(cx).theme_for(Self::container_id(), Self::default_font_size());
-            cx.notify();
-        });
-        let theme = config.read(cx).theme_for(Self::container_id(), Self::default_font_size());
+        let themed = Themed::new(&config, cx);
         Self {
             state,
-            theme,
-            style: WaveformStyle::Bars,
+            config,
+            themed,
             seek_bar_bounds: Rc::new(Cell::new(Bounds::default())),
             _observe: observe,
-            _observe_config: observe_config,
         }
     }
 
@@ -68,48 +57,11 @@ impl PlaybackView {
         });
     }
 
-    fn toggle_style(&mut self, cx: &mut Context<Self>) {
-        self.style = match self.style {
-            WaveformStyle::FlatLine => WaveformStyle::Bars,
-            WaveformStyle::Bars => WaveformStyle::FlatLine,
-        };
-        cx.notify();
-    }
-
     fn seek_fraction(&mut self, fraction: f32, cx: &mut Context<Self>) {
         self.state.update(cx, |state, cx| {
             state.seek_fraction(fraction);
             cx.notify();
         });
-    }
-}
-
-/// Map a key press to a backend-agnostic [`InputAction`].
-///
-/// This is the *only* place GPUI key names appear. Everything downstream
-/// matches on `InputAction`, so swapping or extending the input backend
-/// (say, a TUI) is a change to this one function. Views call this for every
-/// key they receive and act on the subset they own; the rest bubble up.
-pub(crate) fn action_for_key(keystroke: &Keystroke) -> Option<InputAction> {
-    let key = keystroke.key.as_str();
-    let modifiers = keystroke.modifiers;
-    match key {
-        // Tab switching, closing, and search are the tab container's.
-        "tab" if modifiers.control => Some(if modifiers.shift {
-            InputAction::PrevTab
-        } else {
-            InputAction::NextTab
-        }),
-        "w" if modifiers.control => Some(InputAction::CloseTab),
-        "f" if modifiers.control && modifiers.shift => Some(InputAction::ToggleSearch),
-        "escape" => Some(InputAction::CloseOverlay),
-        "left" => Some(InputAction::SeekBackward),
-        "right" => Some(InputAction::SeekForward),
-        "space" => Some(InputAction::TogglePause),
-        "up" => Some(InputAction::SelectPrev),
-        "down" => Some(InputAction::SelectNext),
-        "enter" => Some(InputAction::Activate),
-        _ => None,
     }
 }
 
@@ -125,7 +77,8 @@ const BAR_GAP: f32 = 1.0;
 
 impl Render for PlaybackView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
+        let theme = self.themed.theme();
+        let style = self.config.read(cx).waveform();
 
         // Snapshot the shared state once, then drop the borrow before
         // building elements.
@@ -177,7 +130,7 @@ impl Render for PlaybackView {
                 div()
                     .absolute()
                     .inset_0()
-                    .child(render_waveform(peaks, self.style, fraction, theme)),
+                    .child(render_waveform(peaks, style, fraction, theme)),
             )
             .on_mouse_down(
                 MouseButton::Left,
@@ -195,6 +148,8 @@ impl Render for PlaybackView {
                 }),
             );
 
+        // The waveform sits on top, the time labels under it, and the transport
+        // controls beneath both.
         div()
             .flex()
             .flex_col()
@@ -204,6 +159,25 @@ impl Render for PlaybackView {
             .w_full()
             .bg(theme.panel_bg)
             .font_family(theme.font)
+            .child(seek_bar)
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .items_center()
+                    .w(px(BAR_WIDTH))
+                    .text_size(px(theme.small_px()))
+                    .text_color(theme.text_muted)
+                    .child(format_duration(position))
+                    // The live bitrate now rides on the playing track's row in
+                    // the list views, next to its duration.
+                    .child(
+                        div()
+                            .text_size(px(theme.small_px()))
+                            .text_color(theme.text_muted)
+                            .child(format_duration(duration)),
+                    ),
+            )
             .child(
                 div()
                     .flex()
@@ -254,40 +228,6 @@ impl Render for PlaybackView {
                             this.dispatch(InputAction::NextTrack, cx);
                         }),
                     )),
-            )
-            .child(seek_bar)
-            .child(
-                // Current time — style toggle — total time. The toggle sits
-                // between them, under the waveform it switches.
-                div()
-                    .flex()
-                    .justify_between()
-                    .items_center()
-                    .w(px(BAR_WIDTH))
-                    .text_size(px(theme.small_px()))
-                    .text_color(theme.text_muted)
-                    .child(format_duration(position))
-                    .child(
-                        div()
-                            .id("style-toggle")
-                            .cursor_pointer()
-                            .text_size(px(theme.small_px()))
-                            .text_color(theme.text_faint)
-                            .hover(|d| d.text_color(theme.text))
-                            .on_click(cx.listener(|this, _event, _window, cx| this.toggle_style(cx)))
-                            .child(match self.style {
-                                WaveformStyle::Bars => "bars",
-                                WaveformStyle::FlatLine => "line",
-                            }),
-                    )
-                    // The live bitrate now rides on the playing track's row in
-                    // the list views, next to its duration.
-                    .child(
-                        div()
-                            .text_size(px(theme.small_px()))
-                            .text_color(theme.text_muted)
-                            .child(format_duration(duration)),
-                    ),
             )
     }
 }

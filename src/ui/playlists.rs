@@ -7,20 +7,36 @@
 //! Custom playlists are edited here: right-clicking one opens a menu to rename
 //! or delete it, and renaming happens inline. The settings button in the header
 //! opens the settings overlay in the center.
+//!
+//! A library produces *thousands* of rows (one per autogen album playlist, plus
+//! one per artist), and GPUI re-renders and re-lays-out every visible view on
+//! each frame it draws — so the rows are drawn through the virtualized
+//! [`list`], exactly like the track lists: only the rows near the viewport are
+//! ever built into elements. Without that, every hover, cover decode, or
+//! animation frame paid for thousands of rows of layout and the whole app ran
+//! at single-digit frames per second.
+
+use std::rc::Rc;
 
 use gpui::{
-    div, prelude::*, px, AnyElement, App, ClickEvent, Context, ElementId, Entity, FocusHandle,
-    KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, Render, Subscription, Window,
+    div, list, prelude::*, px, AnyElement, App, ClickEvent, Context, ElementId, Entity,
+    FocusHandle, KeyDownEvent, ListAlignment, ListState, MouseButton, MouseDownEvent, Pixels,
+    Point, Render, Subscription, Window,
 };
 
 use crate::model::PlaylistId;
-use crate::ui::config_state::ConfigState;
+use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::library_state::LibraryState;
 use crate::ui::menu::{context_menu, MenuHandler};
 use crate::ui::tabs::TabsView;
 use crate::ui::text_field::TextField;
 use crate::ui::theme::Theme;
+use crate::ui::widgets::{empty_hint, section_header};
+
+/// How far past the viewport the list renders, so a fast scroll doesn't pop
+/// rows in. Modest, since every rendered row is paid for each frame.
+const OVERDRAW_PX: f32 = 512.0;
 
 /// An open right-click menu on a custom playlist.
 struct PlaylistMenu {
@@ -33,15 +49,21 @@ pub struct PlaylistsView {
     /// Clicking a playlist opens it as a tab in the center — the rail is how
     /// tabs get created, so it holds the tab container.
     tabs: Entity<TabsView>,
-    theme: Theme,
+    themed: Themed,
     expanded_artist: Option<String>,
     /// The playlist being renamed inline, and its edit buffer.
     renaming: Option<(PlaylistId, TextField)>,
     /// The open right-click menu, if any.
     menu: Option<PlaylistMenu>,
     focus_handle: FocusHandle,
+    /// The flattened rows, rebuilt only when the library, the expansion, or the
+    /// rename state changes — never per frame.
+    rows: Rc<Vec<RailRow>>,
+    list_state: ListState,
+    /// Set by anything that changes what the rows show; the next render
+    /// rebuilds them.
+    dirty: bool,
     _observe: Subscription,
-    _observe_config: Subscription,
 }
 
 impl PlaylistsView {
@@ -51,22 +73,23 @@ impl PlaylistsView {
         config: Entity<ConfigState>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let observe = cx.observe(&library, |_this, _state, cx| cx.notify());
-        let observe_config = cx.observe(&config, |this, config, cx| {
-            this.theme = config.read(cx).theme_for(Self::container_id(), Self::default_font_size());
+        let observe = cx.observe(&library, |this, _state, cx| {
+            this.dirty = true;
             cx.notify();
         });
-        let theme = config.read(cx).theme_for(Self::container_id(), Self::default_font_size());
+        let themed = Themed::new(&config, cx);
         Self {
             library,
             tabs,
-            theme,
+            themed,
             expanded_artist: None,
             renaming: None,
             menu: None,
             focus_handle: cx.focus_handle(),
+            rows: Rc::new(Vec::new()),
+            list_state: ListState::new(0, ListAlignment::Top, px(OVERDRAW_PX)),
+            dirty: true,
             _observe: observe,
-            _observe_config: observe_config,
         }
     }
 
@@ -78,35 +101,22 @@ impl PlaylistsView {
                 self.library.update(cx, |state, cx| state.rename_playlist(id, title, cx));
             }
         }
+        self.dirty = true;
         cx.notify();
     }
 
     /// Cancel the inline rename.
     fn cancel_rename(&mut self, cx: &mut Context<Self>) {
         self.renaming = None;
+        self.dirty = true;
         cx.notify();
     }
-}
 
-impl Container for PlaylistsView {
-    fn container_id() -> &'static str {
-        "playlists"
-    }
-}
-
-/// A playlist row, snapshotted out of the library so the borrow is dropped
-/// before elements are built.
-struct Row {
-    id: PlaylistId,
-    title: String,
-    count: usize,
-}
-
-impl Render for PlaylistsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
-
-        let (custom, albums, artists, selected, scanning, discography) = {
+    /// Flatten the rail into rows. Runs only when the underlying data changed,
+    /// never per frame — the row *data* is cheap, but rebuilding it (and its
+    /// elements) every frame is what made the rail dominate frame time.
+    fn build_rows(&self, cx: &Context<Self>) -> Vec<RailRow> {
+        let (custom, albums, artists, discography) = {
             let state = self.library.read(cx);
             let lib = state.library();
 
@@ -135,50 +145,87 @@ impl Render for PlaylistsView {
                 })
                 .unwrap_or_default();
 
-            (custom, albums, artists, state.selected(), state.is_scanning(), discography)
+            (custom, albums, artists, discography)
         };
 
-        let mut items: Vec<AnyElement> = Vec::new();
+        let mut rows: Vec<RailRow> = Vec::new();
 
-        items.push(section_header(theme, "Playlists"));
-        items.push(nav_row(
-            theme,
-            ("new-playlist", 0u64),
-            "+  New Playlist".to_string(),
-            None,
-            false,
-            false,
-            cx.listener(|this, _event, window, cx| {
-                let id = this.library.update(cx, |state, cx| state.new_playlist(cx));
-                this.tabs.update(cx, |tabs, cx| tabs.open_playlist(id, window, cx));
-            }),
-        ));
+        rows.push(RailRow::Header("Playlists"));
+        rows.push(RailRow::NewPlaylist);
         if custom.is_empty() {
-            items.push(empty_hint(theme, "No custom playlists yet"));
+            rows.push(RailRow::NoCustom);
         }
         for row in custom {
-            let id = row.id;
-
             // The row being renamed shows an editable field instead of a label.
-            if let Some((renaming, field)) = &self.renaming {
-                if *renaming == id {
-                    items.push(rename_row(theme, field));
-                    continue;
+            if self.renaming.as_ref().is_some_and(|(renaming, _)| *renaming == row.id) {
+                rows.push(RailRow::Rename);
+            } else {
+                rows.push(RailRow::Custom(row));
+            }
+        }
+
+        rows.push(RailRow::Header("Albums"));
+        for row in albums {
+            rows.push(RailRow::Album(row));
+        }
+
+        rows.push(RailRow::Header("Artists"));
+        for (index, artist) in artists.into_iter().enumerate() {
+            let expanded = self.expanded_artist.as_deref() == Some(artist.as_str());
+            rows.push(RailRow::Artist { index, name: artist, expanded });
+            if expanded {
+                for row in &discography {
+                    rows.push(RailRow::Discography(row.clone()));
                 }
             }
+        }
 
-            let row_el = nav_row(
+        rows
+    }
+
+    /// Render one row of the flattened rail. Called by the virtualized list
+    /// only for rows near the viewport.
+    fn render_row(
+        &mut self,
+        theme: Theme,
+        row: &RailRow,
+        selected: Option<PlaylistId>,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        // Every row carries the list's item spacing, matching the gap the old
+        // unvirtualized column had between children.
+        let row = match row {
+            RailRow::Header(label) => section_header(theme, label),
+            RailRow::NewPlaylist => nav_row(
                 theme,
-                ("custom", id.0),
-                row.title,
-                Some(row.count),
-                selected == Some(id),
+                ("new-playlist", 0u64),
+                "+  New Playlist".to_string(),
+                None,
                 false,
-                cx.listener(move |this, _event, window, cx| {
+                false,
+                cx.listener(|this, _event, window, cx| {
+                    let id = this.library.update(cx, |state, cx| state.new_playlist(cx));
                     this.tabs.update(cx, |tabs, cx| tabs.open_playlist(id, window, cx));
                 }),
-            );
-            items.push(
+            ),
+            RailRow::NoCustom => empty_hint(theme, "No custom playlists yet"),
+            RailRow::Rename => {
+                let field = &self.renaming.as_ref().expect("rename row without a rename").1;
+                rename_row(theme, field)
+            }
+            RailRow::Custom(row) => {
+                let id = row.id;
+                let row_el = nav_row(
+                    theme,
+                    ("custom", id.0),
+                    row.title.clone(),
+                    Some(row.count),
+                    selected == Some(id),
+                    false,
+                    cx.listener(move |this, _event, window, cx| {
+                        this.tabs.update(cx, |tabs, cx| tabs.open_playlist(id, window, cx));
+                    }),
+                );
                 div()
                     .id(("custom-menu-target", id.0))
                     .w_full()
@@ -187,71 +234,122 @@ impl Render for PlaylistsView {
                     .on_mouse_down(
                         MouseButton::Right,
                         cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
-                            this.menu = Some(PlaylistMenu { position: event.position, playlist: id });
+                            this.menu =
+                                Some(PlaylistMenu { position: event.position, playlist: id });
                             cx.notify();
                         }),
                     )
                     .child(row_el)
-                    .into_any_element(),
-            );
-        }
+                    .into_any_element()
+            }
+            RailRow::Album(row) => {
+                let id = row.id;
+                nav_row(
+                    theme,
+                    ("album", id.0),
+                    row.title.clone(),
+                    Some(row.count),
+                    selected == Some(id),
+                    false,
+                    cx.listener(move |this, _event, window, cx| {
+                        this.tabs.update(cx, |tabs, cx| tabs.open_playlist(id, window, cx));
+                    }),
+                )
+            }
+            RailRow::Artist { index, name, expanded } => {
+                let expanded = *expanded;
+                let label = if expanded { format!("▾  {name}") } else { format!("▸  {name}") };
+                let toggled = name.clone();
+                nav_row(
+                    theme,
+                    ("artist", *index as u64),
+                    label,
+                    None,
+                    false,
+                    false,
+                    cx.listener(move |this, _event, _window, cx| {
+                        this.expanded_artist =
+                            if this.expanded_artist.as_deref() == Some(toggled.as_str()) {
+                                None
+                            } else {
+                                Some(toggled.clone())
+                            };
+                        this.dirty = true;
+                        cx.notify();
+                    }),
+                )
+            }
+            RailRow::Discography(row) => {
+                let id = row.id;
+                nav_row(
+                    theme,
+                    ("discography", id.0),
+                    row.title.clone(),
+                    Some(row.count),
+                    selected == Some(id),
+                    true,
+                    cx.listener(move |this, _event, window, cx| {
+                        this.tabs.update(cx, |tabs, cx| tabs.open_playlist(id, window, cx));
+                    }),
+                )
+            }
+        };
+        div().pb_1().child(row).into_any_element()
+    }
+}
 
-        items.push(section_header(theme, "Albums"));
-        for row in albums {
-            let id = row.id;
-            items.push(nav_row(
-                theme,
-                ("album", id.0),
-                row.title,
-                Some(row.count),
-                selected == Some(id),
-                false,
-                cx.listener(move |this, _event, window, cx| {
-                    this.tabs.update(cx, |tabs, cx| tabs.open_playlist(id, window, cx));
-                }),
-            ));
-        }
+impl Container for PlaylistsView {
+    fn container_id() -> &'static str {
+        "playlists"
+    }
+}
 
-        items.push(section_header(theme, "Artists"));
-        for (index, artist) in artists.into_iter().enumerate() {
-            let expanded = self.expanded_artist.as_deref() == Some(artist.as_str());
-            let label = if expanded { format!("▾  {artist}") } else { format!("▸  {artist}") };
-            let toggled = artist.clone();
-            items.push(nav_row(
-                theme,
-                ("artist", index as u64),
-                label,
-                None,
-                false,
-                false,
-                cx.listener(move |this, _event, _window, cx| {
-                    this.expanded_artist =
-                        if this.expanded_artist.as_deref() == Some(toggled.as_str()) {
-                            None
-                        } else {
-                            Some(toggled.clone())
-                        };
-                    cx.notify();
-                }),
-            ));
+/// A playlist row, snapshotted out of the library so the borrow is dropped
+/// before elements are built.
+#[derive(Clone)]
+struct Row {
+    id: PlaylistId,
+    title: String,
+    count: usize,
+}
 
-            if expanded {
-                for row in &discography {
-                    let id = row.id;
-                    items.push(nav_row(
-                        theme,
-                        ("discography", id.0),
-                        row.title.clone(),
-                        Some(row.count),
-                        selected == Some(id),
-                        true,
-                        cx.listener(move |this, _event, window, cx| {
-                            this.tabs.update(cx, |tabs, cx| tabs.open_playlist(id, window, cx));
-                        }),
-                    ));
-                }
+/// One flattened row of the rail — the unit the virtualized list renders.
+enum RailRow {
+    Header(&'static str),
+    NewPlaylist,
+    /// The "no custom playlists" hint.
+    NoCustom,
+    Custom(Row),
+    /// The inline rename field, shown in place of the custom row being renamed.
+    Rename,
+    Album(Row),
+    Artist { index: usize, name: String, expanded: bool },
+    /// An album within an expanded artist's discography (rendered indented).
+    Discography(Row),
+}
+
+impl Render for PlaylistsView {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.themed.theme();
+        let scanning = self.library.read(cx).is_scanning();
+        let selected = self.library.read(cx).selected();
+
+        if self.dirty {
+            self.dirty = false;
+            self.rows = Rc::new(self.build_rows(cx));
+            // Update the row count without resetting the scroll position —
+            // expanding an artist shouldn't fling the rail back to the top.
+            let count = self.rows.len();
+            let old = self.list_state.item_count();
+            if old != count {
+                self.list_state.splice(0..old, count);
             }
         }
+
+        let rows = self.rows.clone();
+        let render = cx.processor(move |this, ix, _window: &mut Window, cx: &mut Context<Self>| {
+            this.render_row(theme, &rows[ix], selected, cx)
+        });
 
         let mut root = div()
             .relative()
@@ -272,7 +370,8 @@ impl Render for PlaylistsView {
                         _ => {}
                     }
                     if let Some((_, field)) = &mut this.renaming {
-                        if field.handle_key(event) {
+                        let clipboard = cx.read_from_clipboard().and_then(|item| item.text());
+                        if field.handle_key_with_clipboard(event, clipboard.as_deref()) {
                             cx.stop_propagation();
                             cx.notify();
                         }
@@ -321,15 +420,11 @@ impl Render for PlaylistsView {
             )
             .child(
                 div()
-                    .id("playlists-scroll")
                     .flex_1()
-                    .overflow_y_scroll()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
+                    .min_h_0()
+                    .w_full()
                     .px_2()
-                    .pb_2()
-                    .children(items),
+                    .child(list(self.list_state.clone(), render).size_full()),
             );
 
         if let Some(menu) = &self.menu {
@@ -346,6 +441,7 @@ impl Render for PlaylistsView {
             let rename: MenuHandler = Box::new(cx.listener(move |this, _event, window, cx| {
                 this.menu = None;
                 this.renaming = Some((playlist, TextField::new(title.clone())));
+                this.dirty = true;
                 window.focus(&this.focus_handle);
                 cx.notify();
             }));
@@ -369,27 +465,6 @@ impl Render for PlaylistsView {
     }
 }
 
-fn section_header(theme: Theme, label: &str) -> AnyElement {
-    div()
-        .px_2()
-        .pt_3()
-        .pb_1()
-        .text_size(px(theme.small_px()))
-        .text_color(theme.text_faint)
-        .child(label.to_uppercase())
-        .into_any_element()
-}
-
-fn empty_hint(theme: Theme, label: &str) -> AnyElement {
-    div()
-        .px_2()
-        .py_1()
-        .text_size(px(theme.small_px()))
-        .text_color(theme.text_faint)
-        .child(label.to_string())
-        .into_any_element()
-}
-
 fn settings_button(
     theme: Theme,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
@@ -408,7 +483,7 @@ fn settings_button(
         .into_any_element()
 }
 
-/// The editable row shown while renaming a playlist.
+/// The editable row shown while renaming.
 fn rename_row(theme: Theme, field: &TextField) -> AnyElement {
     div()
         .px_2()

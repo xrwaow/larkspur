@@ -36,6 +36,10 @@ pub struct LibraryState {
     roots: Vec<PathBuf>,
     /// The playlist whose tab is active, for the rail's highlight.
     selected: Option<PlaylistId>,
+    /// Bumped whenever the songs or playlists actually change, so views can
+    /// tell a real edit from a highlight-only notification and skip a needless
+    /// rebuild.
+    revision: u64,
     /// A playlist a view asked to open (the song menu's "Go to playlist"). The
     /// tab container picks it up — so a row in the browse view can open a tab
     /// without holding a handle to the container that owns it.
@@ -74,6 +78,7 @@ impl LibraryState {
             cache: Some(cache),
             roots,
             selected: None,
+            revision: 0,
             pending_open_playlist: None,
             pending_artist_view: None,
             pending_song_menu: None,
@@ -94,6 +99,13 @@ impl LibraryState {
 
     pub fn selected(&self) -> Option<PlaylistId> {
         self.selected
+    }
+
+    /// A counter bumped whenever the songs or playlists change. Views compare it
+    /// to their last-seen value, so a highlight-only notification (a tab
+    /// switch) doesn't trigger a rebuild.
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     pub fn is_scanning(&self) -> bool {
@@ -161,6 +173,7 @@ impl LibraryState {
     pub fn new_playlist(&mut self, cx: &mut Context<Self>) -> PlaylistId {
         let id = self.library.create_custom("New Playlist");
         self.selected = Some(id);
+        self.revision += 1;
         self.persist();
         cx.notify();
         id
@@ -168,6 +181,16 @@ impl LibraryState {
 
     pub fn add_song(&mut self, playlist: PlaylistId, song: SongId, cx: &mut Context<Self>) {
         if self.library.add_song(playlist, song) {
+            self.revision += 1;
+            self.persist();
+            cx.notify();
+        }
+    }
+
+    /// Add several songs to a custom playlist at once (a bulk selection).
+    pub fn add_songs(&mut self, playlist: PlaylistId, songs: Vec<SongId>, cx: &mut Context<Self>) {
+        if self.library.add_songs(playlist, &songs) {
+            self.revision += 1;
             self.persist();
             cx.notify();
         }
@@ -175,13 +198,42 @@ impl LibraryState {
 
     pub fn remove_song(&mut self, playlist: PlaylistId, song: SongId, cx: &mut Context<Self>) {
         if self.library.remove_song(playlist, song) {
+            self.revision += 1;
             self.persist();
             cx.notify();
         }
     }
 
+    /// Remove several songs from a custom playlist at once (a bulk selection).
+    pub fn remove_songs(
+        &mut self,
+        playlist: PlaylistId,
+        songs: Vec<SongId>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.library.remove_songs(playlist, &songs) {
+            self.revision += 1;
+            self.persist();
+            cx.notify();
+        }
+    }
+
+    /// Create a custom playlist holding `songs`, and ask the tab container to
+    /// open it. Returns its id.
+    pub fn new_playlist_from(&mut self, songs: Vec<SongId>, cx: &mut Context<Self>) -> PlaylistId {
+        let id = self.library.create_custom("New Playlist");
+        self.library.add_songs(id, &songs);
+        self.selected = Some(id);
+        self.pending_open_playlist = Some(id);
+        self.revision += 1;
+        self.persist();
+        cx.notify();
+        id
+    }
+
     pub fn rename_playlist(&mut self, playlist: PlaylistId, title: String, cx: &mut Context<Self>) {
         if self.library.rename(playlist, title) {
+            self.revision += 1;
             self.persist();
             cx.notify();
         }
@@ -189,6 +241,7 @@ impl LibraryState {
 
     pub fn delete_playlist(&mut self, playlist: PlaylistId, cx: &mut Context<Self>) {
         if self.library.remove_playlist(playlist).is_some() {
+            self.revision += 1;
             self.ensure_selection();
             self.persist();
             cx.notify();
@@ -203,10 +256,27 @@ impl LibraryState {
         playback: &Entity<PlaybackState>,
         cx: &mut Context<Self>,
     ) {
-        let paths: Vec<PathBuf> = self
+        let songs = self
             .library
-            .songs_of(playlist)
-            .into_iter()
+            .playlist(playlist)
+            .map(|playlist| playlist.song_ids.clone())
+            .unwrap_or_default();
+        self.play(&songs, start, playback, cx);
+    }
+
+    /// Replace the play queue with `songs`, starting at `start`. Nothing is
+    /// persisted — this is how a playlist, or an ad-hoc selection, becomes the
+    /// queue.
+    pub fn play(
+        &self,
+        songs: &[SongId],
+        start: usize,
+        playback: &Entity<PlaybackState>,
+        cx: &mut Context<Self>,
+    ) {
+        let paths: Vec<PathBuf> = songs
+            .iter()
+            .filter_map(|id| self.library.get(*id))
             .map(|song| song.path.clone())
             .collect();
         if paths.is_empty() {
@@ -282,6 +352,7 @@ impl LibraryState {
                 state.cache = Some(cache);
                 state.merge_scanned(library);
                 state.scanning = false;
+                state.revision += 1;
                 // The synced-path list may have changed while we were scanning.
                 if let Some(cache) = state.cache.as_mut() {
                     cache.retain_roots(&state.roots);

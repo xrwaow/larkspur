@@ -6,20 +6,19 @@
 /// into every view's key handling.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum InputAction {
-    Quit,
     NextTrack,
     PrevTrack,
     TogglePause,
     SeekForward,
     SeekBackward,
-    VolumeUp,
-    VolumeDown,
-    FocusLeftPane,
-    FocusRightPane,
     /// Move the playlist selection down a row.
     SelectNext,
     /// Move the playlist selection up a row.
     SelectPrev,
+    /// Scroll the active list down by a page.
+    PageDown,
+    /// Scroll the active list up by a page.
+    PageUp,
     /// Play the selected row.
     Activate,
     /// Switch to the next center tab.

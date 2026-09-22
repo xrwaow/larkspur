@@ -25,13 +25,14 @@ use gpui::{
 };
 
 use crate::model::{InputAction, PlaylistId, TabId};
+use crate::ui::animation::Animator;
 use crate::ui::browse::BrowseView;
 use crate::ui::config_state::ConfigState;
 use crate::ui::container::Container;
 use crate::ui::cover_store::CoverStore;
+use crate::ui::input::action_for_key;
 use crate::ui::library_state::LibraryState;
 use crate::ui::menu::{context_menu, song_menu_items, MenuHandler, SongMenuRequest};
-use crate::ui::playback::action_for_key;
 use crate::ui::playlist::PlaylistView;
 use crate::ui::search::SearchView;
 use crate::ui::settings::SettingsView;
@@ -50,6 +51,7 @@ pub struct TabsView {
     playback: Entity<PlaybackState>,
     covers: Entity<CoverStore>,
     config: Entity<ConfigState>,
+    animator: Entity<Animator>,
     theme: Theme,
     browse: Entity<BrowseView>,
     search: Entity<SearchView>,
@@ -65,8 +67,14 @@ pub struct TabsView {
     /// The open song context menu, if any. Rendered here, on top of every
     /// container, since rows anywhere can raise it.
     menu: Option<SongMenuRequest>,
+    /// The window title last set, so the titlebar is only touched on change.
+    last_title: String,
+    /// Set when the library notified, so the request poll only runs when
+    /// something may actually be pending rather than every frame.
+    library_dirty: bool,
     focus_handle: FocusHandle,
     _observe: Subscription,
+    _observe_playback: Subscription,
     _observe_config: Subscription,
 }
 
@@ -76,6 +84,7 @@ impl TabsView {
         playback: Entity<PlaybackState>,
         covers: Entity<CoverStore>,
         config: Entity<ConfigState>,
+        animator: Entity<Animator>,
         cx: &mut Context<Self>,
     ) -> Self {
         let browse = cx.new(|cx| {
@@ -84,6 +93,7 @@ impl TabsView {
                 playback.clone(),
                 covers.clone(),
                 config.clone(),
+                animator.clone(),
                 cx,
             )
         });
@@ -93,11 +103,16 @@ impl TabsView {
                 playback.clone(),
                 covers.clone(),
                 config.clone(),
+                animator.clone(),
                 cx,
             )
         });
         let settings = cx.new(|cx| SettingsView::new(config.clone(), cx));
-        let observe = cx.observe(&library, |_this, _state, cx| cx.notify());
+        let observe = cx.observe(&library, |this, _state, cx| {
+            this.library_dirty = true;
+            cx.notify();
+        });
+        let observe_playback = cx.observe(&playback, |_this, _state, cx| cx.notify());
         let observe_config = cx.observe(&config, |this, config, cx| {
             this.theme = config.read(cx).theme_for(Self::container_id(), Self::default_font_size());
             cx.notify();
@@ -108,6 +123,7 @@ impl TabsView {
             playback,
             covers,
             config,
+            animator,
             theme,
             browse,
             search,
@@ -117,8 +133,11 @@ impl TabsView {
             search_open: false,
             settings_open: false,
             menu: None,
+            last_title: String::new(),
+            library_dirty: false,
             focus_handle: cx.focus_handle(),
             _observe: observe,
+            _observe_playback: observe_playback,
             _observe_config: observe_config,
         }
     }
@@ -145,6 +164,7 @@ impl TabsView {
                     self.playback.clone(),
                     self.covers.clone(),
                     self.config.clone(),
+                    self.animator.clone(),
                     id,
                     cx,
                 )
@@ -167,6 +187,7 @@ impl TabsView {
                     self.playback.clone(),
                     self.covers.clone(),
                     self.config.clone(),
+                    self.animator.clone(),
                     cx,
                 );
                 browse.set_artist_filter(Some(artist.clone()), cx);
@@ -371,20 +392,37 @@ impl Render for TabsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.theme;
 
-        // A row's "Go to playlist" left a request behind; open it now that we
-        // have a window.
-        if let Some(id) = self.library.update(cx, |state, _cx| state.take_open_playlist()) {
-            self.open_playlist(id, window, cx);
+        // The titlebar names the current track while one is loaded, and falls
+        // back to the app name otherwise.
+        let title = {
+            let state = self.playback.read(cx);
+            let song = state.metadata();
+            if song.id != 0 && !state.ended() {
+                format!("Playing {}", song.display_title())
+            } else {
+                "Larkspur".to_string()
+            }
+        };
+        if self.last_title != title {
+            self.last_title = title.clone();
+            window.set_window_title(&title);
         }
-        // A row's "Go to artist" left a request behind; open (or focus) that
-        // artist's own tab.
-        if let Some(artist) = self.library.update(cx, |state, _cx| state.take_artist_view()) {
-            self.open_artist(artist, window, cx);
-        }
-        // A row's right-click left a song menu behind; adopt it.
-        if let Some(request) = self.library.read(cx).pending_song_menu().cloned() {
-            self.library.update(cx, |state, _cx| state.clear_song_menu());
-            self.menu = Some(request);
+
+        // A row's "Go to playlist" / "Go to artist" / right-click left a
+        // request behind; pick it up when the library notified (and only then,
+        // so an unrelated frame doesn't poll).
+        if self.library_dirty {
+            self.library_dirty = false;
+            if let Some(id) = self.library.update(cx, |state, _cx| state.take_open_playlist()) {
+                self.open_playlist(id, window, cx);
+            }
+            if let Some(artist) = self.library.update(cx, |state, _cx| state.take_artist_view()) {
+                self.open_artist(artist, window, cx);
+            }
+            if let Some(request) = self.library.read(cx).pending_song_menu().cloned() {
+                self.library.update(cx, |state, _cx| state.clear_song_menu());
+                self.menu = Some(request);
+            }
         }
 
         self.prune(cx);
@@ -444,7 +482,7 @@ impl Render for TabsView {
         let menu_element = self.menu.clone().map(|menu| {
             let weak = cx.entity().downgrade();
             let items: Vec<(String, MenuHandler)> =
-                song_menu_items(&self.library, menu.song, menu.playlist, cx)
+                song_menu_items(&self.library, &self.playback, &menu.songs, menu.playlist, cx)
                     .into_iter()
                     .map(|(label, handler)| {
                         let weak = weak.clone();

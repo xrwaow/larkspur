@@ -1,14 +1,13 @@
 use gpui::{
-    div, img, prelude::*, px, rgb, AnyElement, Context, Entity, ObjectFit, Render, Subscription,
-    Window,
+    div, img, prelude::*, px, rgb, AnyElement, Context, Entity, ObjectFit, Render, Rgba,
+    Subscription, Window,
 };
 
-use crate::model::{CoverState, SongStatus};
-use crate::ui::config_state::ConfigState;
+use crate::model::{CoverState, SongId, SongStatus, ThemeKind};
+use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::cover_store::{CoverImage, CoverStore};
 use crate::ui::state::PlaybackState;
-use crate::ui::theme::Theme;
 
 /// The now-playing cover square.
 ///
@@ -16,10 +15,19 @@ use crate::ui::theme::Theme;
 /// or paused — dimmed while paused. Reads both the playback state (which track)
 /// and the cover store (its decoded art), observing each so it re-renders when
 /// the track changes or a decode lands.
+///
+/// It also feeds the dynamic theme: when that theme is selected it pushes the
+/// current cover's dominant colour (which the cover store derives at decode
+/// time) into [`ConfigState`], which every view reads its palette from. The
+/// last colour is kept when a new track's art hasn't decoded yet.
 pub struct CoverView {
     state: Entity<PlaybackState>,
     covers: Entity<CoverStore>,
-    theme: Theme,
+    config: Entity<ConfigState>,
+    themed: Themed,
+    /// The last cover pushed to the dynamic theme, so a cover is only pushed
+    /// once and the previous colour survives a track change.
+    accent: Option<(SongId, Rgba)>,
     _observe: Subscription,
     _observe_covers: Subscription,
     _observe_config: Subscription,
@@ -40,25 +48,32 @@ impl CoverView {
         // once an id is known, so this is cheap even at the ticker's rate.
         let observe = cx.observe(&state, |this, state, cx| {
             this.request_current(&state, cx);
+            this.sync_accent(cx);
             cx.notify();
         });
-        let observe_covers = cx.observe(&covers, |_this, _covers, cx| cx.notify());
-        let observe_config = cx.observe(&config, |this, config, cx| {
-            this.theme = config.read(cx).theme_for(Self::container_id(), Self::default_font_size());
+        let observe_covers = cx.observe(&covers, |this, _covers, cx| {
+            this.sync_accent(cx);
             cx.notify();
         });
-        let theme = config.read(cx).theme_for(Self::container_id(), Self::default_font_size());
+        let observe_config = cx.observe(&config, |this, _config, cx| {
+            this.sync_accent(cx);
+            cx.notify();
+        });
+        let themed = Themed::new(&config, cx);
 
         let mut this = Self {
             state: state.clone(),
             covers,
-            theme,
+            config,
+            themed,
+            accent: None,
             _observe: observe,
             _observe_covers: observe_covers,
             _observe_config: observe_config,
         };
         // A track may already be loaded before we start observing.
         this.request_current(&state, cx);
+        this.sync_accent(cx);
         this
     }
 
@@ -76,6 +91,26 @@ impl CoverView {
         }
         self.covers.update(cx, |store, cx| store.request(id, path, has_art, cx));
     }
+
+    /// Push the current cover's accent into the config, if the dynamic theme is
+    /// selected. A no-op otherwise, so the theme never changes when the user
+    /// hasn't asked for it.
+    fn sync_accent(&mut self, cx: &mut Context<Self>) {
+        if self.config.read(cx).theme_kind() != ThemeKind::Dynamic {
+            return;
+        }
+        let id = self.state.read(cx).metadata().id;
+        if id == 0 || self.accent.as_ref().is_some_and(|(cached, _)| *cached == id) {
+            return;
+        }
+        let Some(accent) = self.covers.read(cx).accent(id) else {
+            // Art not decoded yet: keep the previous colour rather than
+            // flashing back to the default palette.
+            return;
+        };
+        self.accent = Some((id, accent));
+        self.config.update(cx, |config, cx| config.set_dynamic_accent(Some(accent), cx));
+    }
 }
 
 impl Container for CoverView {
@@ -86,6 +121,7 @@ impl Container for CoverView {
 
 impl Render for CoverView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.themed.theme();
         let id = self.state.read(cx).metadata().id;
         let paused = self.state.read(cx).status() == SongStatus::Paused;
         let cover = self.covers.read(cx).cover(id);
@@ -95,9 +131,9 @@ impl Render for CoverView {
                 .size_full()
                 .object_fit(ObjectFit::Cover)
                 .into_any_element(),
-            Some(CoverImage::Loading) => placeholder(self.theme, "Loading…"),
+            Some(CoverImage::Loading) => placeholder(theme, "Loading…"),
             // Nothing playing, no art, or no art on this file.
-            Some(CoverImage::Missing) | None => placeholder(self.theme, "♪"),
+            Some(CoverImage::Missing) | None => placeholder(theme, "♪"),
         };
 
         div()
@@ -110,7 +146,7 @@ impl Render for CoverView {
 }
 
 /// The stand-in shown while there's no art to draw.
-fn placeholder(theme: Theme, label: &str) -> AnyElement {
+fn placeholder(theme: crate::ui::theme::Theme, label: &str) -> AnyElement {
     div()
         .size_full()
         .flex()

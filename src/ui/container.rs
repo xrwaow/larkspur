@@ -253,13 +253,6 @@ impl Workspace {
     pub fn push<C: Container>(&mut self, entity: Entity<C>) {
         self.modules.insert(C::container_id(), entity.into());
     }
-
-    /// Register a module under an explicit id rather than its type's
-    /// [`Container::container_id`]. Needed for filler panels, where one
-    /// placeholder type has to reserve several sections of the layout.
-    pub fn push_as<C: Container>(&mut self, id: &'static str, entity: Entity<C>) {
-        self.modules.insert(id, entity.into());
-    }
 }
 
 impl Render for Workspace {
@@ -410,20 +403,4 @@ fn render_child(
             }
         });
     d.child(render_layout(&child.layout, modules)).into_any_element()
-}
-
-/// A do-nothing placeholder panel, useful for reserving a section of
-/// the layout before its real module exists.
-pub struct EmptyView;
-
-impl Container for EmptyView {
-    fn container_id() -> &'static str {
-        "empty"
-    }
-}
-
-impl Render for EmptyView {
-    fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
-        div().size_full().bg(rgb(0x141414))
-    }
 }

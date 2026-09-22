@@ -7,10 +7,13 @@
 //! and a long playlist is virtualized through GPUI's [`list`].
 //!
 //! One view exists per open playlist tab, so it holds the playlist it shows and
-//! its own selected row — two tabs keep two independent cursors. `↑`/`↓` move
-//! the selection and `enter` plays it; right-clicking a track opens the shared
-//! song menu (go to artist / go to playlist, plus remove-from-playlist in a
-//! custom one). Renaming and deleting the playlist itself live in the left rail.
+//! its own selection — two tabs keep two independent cursors. Selection,
+//! navigation, paging, and the highlight fade come from [`RowList`]; this view
+//! only says that a plain click selects and a double click plays. Right-clicking
+//! a track opens the shared song menu (go to artist / go to playlist, plus
+//! remove-from-playlist in a custom one); a right-click on a multi-row selection
+//! offers the bulk operations. Renaming and deleting the playlist itself live in
+//! the left rail.
 //!
 //! A custom playlist also carries an "Add songs" bar pinned to the bottom, just
 //! above the transport: type in it and matching library songs pull up above it,
@@ -21,27 +24,27 @@ use std::rc::Rc;
 
 use gpui::{
     div, list, prelude::*, px, AnyElement, ClickEvent, Context, Entity, FocusHandle,
-    Focusable, KeyDownEvent, ListAlignment, ListState, MouseDownEvent, Render, Subscription, Window,
+    Focusable, KeyDownEvent, MouseDownEvent, Render, ScrollWheelEvent, Subscription, Window,
 };
 
 use crate::model::search;
 use crate::model::{InputAction, PlaylistId, SongId};
-use crate::ui::albums::{self, AlbumSection, RowActions};
-use crate::ui::config_state::ConfigState;
+use crate::ui::albums::{self, RowActions};
+use crate::ui::animation::Animator;
+use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::cover_store::CoverStore;
+use crate::ui::input::action_for_key;
 use crate::ui::library_state::LibraryState;
 use crate::ui::menu::SongMenuRequest;
-use crate::ui::playback::action_for_key;
+use crate::ui::row_list::{RowAction, RowList};
 use crate::ui::state::PlaybackState;
 use crate::ui::text_field::TextField;
 use crate::ui::theme::Theme;
+use crate::ui::widgets::{scroll_area, section_header, wheel_pixels};
 
 /// How many "add songs" candidates to render at once.
 const ADD_LIST_CAP: usize = 200;
-
-/// Extra rows rendered above and below the viewport. Roughly ±50 rows.
-const OVERDRAW_PX: f32 = 1200.0;
 
 pub struct PlaylistView {
     library: Entity<LibraryState>,
@@ -49,12 +52,11 @@ pub struct PlaylistView {
     covers: Entity<CoverStore>,
     /// The playlist this tab shows.
     playlist: PlaylistId,
-    theme: Theme,
-    /// The playlist's section (empty when the playlist is gone). Rebuilt when
-    /// the library changes, not every frame.
-    sections: Rc<Vec<AlbumSection>>,
+    themed: Themed,
+    rows: RowList,
     is_custom: bool,
-    dirty: bool,
+    /// The library revision the rows were last built from.
+    seen_revision: u64,
     /// The add-songs query box.
     add_query: TextField,
     /// Add-songs candidates, recomputed when the query or library changes.
@@ -62,17 +64,11 @@ pub struct PlaylistView {
     add_stale: bool,
     /// Focus for the add-songs box, so it only takes keys once clicked.
     add_focus: FocusHandle,
-    /// Row index selected within this playlist (keyboard navigation).
-    selected_row: Option<usize>,
-    /// Virtualized-list state.
-    list_state: ListState,
-    /// The row count the list was last reset to.
-    item_count: usize,
     focus_handle: FocusHandle,
     _observe: Subscription,
     _observe_playback: Subscription,
     _observe_covers: Subscription,
-    _observe_config: Subscription,
+    _observe_animator: Subscription,
 }
 
 impl PlaylistView {
@@ -81,45 +77,47 @@ impl PlaylistView {
         playback: Entity<PlaybackState>,
         covers: Entity<CoverStore>,
         config: Entity<ConfigState>,
+        animator: Entity<Animator>,
         playlist: PlaylistId,
         cx: &mut Context<Self>,
     ) -> Self {
-        let observe = cx.observe(&library, |this, _state, cx| {
-            this.dirty = true;
-            this.add_stale = true;
+        let observe = cx.observe(&library, |this, state, cx| {
+            let revision = state.read(cx).revision();
+            if this.seen_revision != revision {
+                this.seen_revision = revision;
+                this.rows.mark_dirty();
+                this.is_custom = is_custom(&state, this.playlist, cx);
+                this.add_stale = true;
+            }
             cx.notify();
         });
         let observe_playback = cx.observe(&playback, |_this, _state, cx| cx.notify());
         let observe_covers = cx.observe(&covers, |_this, _state, cx| cx.notify());
-        let observe_config = cx.observe(&config, |this, config, cx| {
-            this.theme = config.read(cx).theme_for(Self::container_id(), Self::default_font_size());
-            cx.notify();
+        let observe_animator = cx.observe(&animator, |this, animator, cx| {
+            if this.rows.tick(animator.read(cx).dt()) {
+                cx.notify();
+            }
         });
-        let theme = config.read(cx).theme_for(Self::container_id(), Self::default_font_size());
-        // Start on the first row, so `enter` plays the playlist immediately
-        // instead of needing an arrow press first.
-        let rows = library.read(cx).library().songs_of(playlist).len();
+        let themed = Themed::new(&config, cx);
+        let is_custom = is_custom(&library, playlist, cx);
         Self {
             library,
             playback,
             covers,
             playlist,
-            theme,
-            sections: Rc::new(Vec::new()),
-            is_custom: false,
-            dirty: true,
+            themed,
+            rows: RowList::new(),
+            is_custom,
+            seen_revision: 0,
             add_query: TextField::default(),
             add_results: Vec::new(),
             add_stale: false,
             add_focus: cx.focus_handle(),
-            selected_row: (rows > 0).then_some(0),
-            list_state: ListState::new(0, ListAlignment::Top, px(OVERDRAW_PX)),
-            item_count: 0,
             focus_handle: cx.focus_handle(),
             _observe: observe,
             _observe_playback: observe_playback,
             _observe_covers: observe_covers,
-            _observe_config: observe_config,
+            _observe_animator: observe_animator,
         }
     }
 
@@ -128,38 +126,17 @@ impl PlaylistView {
         self.focus_handle.clone()
     }
 
-    /// How many rows this playlist has.
-    fn row_count(&self, cx: &Context<Self>) -> usize {
-        self.library.read(cx).library().songs_of(self.playlist).len()
-    }
-
-    fn select_row(&mut self, row: Option<usize>, cx: &mut Context<Self>) {
-        if self.selected_row != row {
-            self.selected_row = row;
-            cx.notify();
+    fn dispatch(&mut self, action: InputAction, cx: &mut Context<Self>) {
+        match self.rows.handle(action) {
+            RowAction::Play(playlist, index) => self.play(playlist, index, cx),
+            RowAction::Handled => cx.notify(),
+            RowAction::Ignored => {}
         }
     }
 
-    /// Move the selection down a row, clamped to the last.
-    fn select_next(&mut self, cx: &mut Context<Self>) {
-        let next = step_down(self.selected_row, self.row_count(cx));
-        self.select_row(next, cx);
-    }
-
-    /// Move the selection up a row, clamped to the first.
-    fn select_prev(&mut self, cx: &mut Context<Self>) {
-        let previous = step_up(self.selected_row, self.row_count(cx));
-        self.select_row(previous, cx);
-    }
-
-    /// Play this playlist from the selected row.
-    fn activate(&mut self, cx: &mut Context<Self>) {
-        if let Some(row) = self.selected_row {
-            let playback = self.playback.clone();
-            let playlist = self.playlist;
-            self.library
-                .update(cx, |state, cx| state.play_playlist(playlist, row, &playback, cx));
-        }
+    fn play(&mut self, playlist: PlaylistId, index: usize, cx: &mut Context<Self>) {
+        let playback = self.playback.clone();
+        self.library.update(cx, |state, cx| state.play_playlist(playlist, index, &playback, cx));
     }
 
     /// Recompute the add-songs candidates from the current query. An empty
@@ -187,18 +164,11 @@ impl PlaylistView {
         };
         self.add_results = results;
     }
+}
 
-    /// Handle the actions this view owns. Transport keys belong to the tab
-    /// container (it forwards them to playback), so a playlist tab and a
-    /// browse tab respond to space and the arrows the same way.
-    fn dispatch(&mut self, action: InputAction, cx: &mut Context<Self>) {
-        match action {
-            InputAction::SelectNext => self.select_next(cx),
-            InputAction::SelectPrev => self.select_prev(cx),
-            InputAction::Activate => self.activate(cx),
-            _ => {}
-        }
-    }
+/// Whether `playlist` is a user-owned custom one.
+fn is_custom(library: &Entity<LibraryState>, playlist: PlaylistId, cx: &gpui::App) -> bool {
+    library.read(cx).library().playlist(playlist).is_some_and(|p| p.is_custom())
 }
 
 impl Container for PlaylistView {
@@ -214,62 +184,78 @@ impl Focusable for PlaylistView {
 }
 
 /// How the playlist view reacts to a row: single click selects, double click
-/// plays.
+/// plays, and a modifier extends or toggles the selection.
 struct PlaylistRows;
 
 impl RowActions<PlaylistView> for PlaylistRows {
     fn activate(
         &self,
         view: &mut PlaylistView,
+        item_ix: usize,
         playlist: PlaylistId,
         index: usize,
         event: &ClickEvent,
         _window: &mut Window,
         cx: &mut Context<PlaylistView>,
     ) {
+        // A modifier extends or toggles the selection; a plain click selects.
+        if view.rows.click(item_ix, event.modifiers()) {
+            cx.notify();
+            return;
+        }
         if event.click_count() >= 2 {
-            let playback = view.playback.clone();
-            view.library
-                .update(cx, |state, cx| state.play_playlist(playlist, index, &playback, cx));
+            view.play(playlist, index, cx);
         } else {
-            view.select_row(Some(index), cx);
+            cx.notify();
         }
     }
 
     fn context(
         &self,
         view: &mut PlaylistView,
-        song: SongId,
+        item_ix: usize,
+        _song: SongId,
         context: Option<PlaylistId>,
         event: &MouseDownEvent,
         _window: &mut Window,
         cx: &mut Context<PlaylistView>,
     ) {
-        let request = SongMenuRequest { song, position: event.position, playlist: context };
+        let songs = view.rows.context_songs(item_ix);
+        let request = SongMenuRequest { songs, position: event.position, playlist: context };
         view.library.update(cx, |state, cx| state.request_song_menu(request, cx));
+    }
+
+    fn hover(
+        &self,
+        view: &mut PlaylistView,
+        item_ix: usize,
+        hovered: bool,
+        cx: &mut Context<PlaylistView>,
+    ) {
+        if view.rows.set_hover(item_ix, hovered) {
+            cx.notify();
+        }
     }
 }
 
 impl Render for PlaylistView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
+        let theme = self.themed.theme();
 
-        if self.dirty {
-            self.dirty = false;
-            let state = self.library.read(cx);
-            let library = state.library();
-            self.is_custom =
-                library.playlist(self.playlist).map(|p| p.is_custom()).unwrap_or(false);
-            self.sections = Rc::new(
-                albums::section_for_playlist(library, self.playlist).into_iter().collect(),
-            );
-        }
         if self.add_stale {
             self.add_stale = false;
             self.recompute_add(cx);
         }
 
-        let sections = self.sections.clone();
+        let playlist = self.playlist;
+        let fresh = self.rows.is_dirty().then(|| {
+            albums::section_for_playlist(self.library.read(cx).library(), playlist)
+                .into_iter()
+                .collect()
+        });
+        self.rows.sync(theme, window, fresh);
+
+        let sections = self.rows.sections();
         let is_custom = self.is_custom;
         let Some(section) = sections.first() else {
             return div()
@@ -283,11 +269,9 @@ impl Render for PlaylistView {
                 .child("This playlist is gone");
         };
 
-        let items = Rc::new(albums::flatten(&sections));
-        if self.item_count != items.len() {
-            self.list_state.reset(items.len());
-            self.item_count = items.len();
-        }
+        let items = self.rows.items();
+        let title_cols = self.rows.title_cols();
+        let list_state = self.rows.list_state().clone();
 
         let current = self.playback.read(cx).metadata().id;
         let live_bitrate = self.playback.read(cx).live_bitrate();
@@ -308,18 +292,20 @@ impl Render for PlaylistView {
 
         if section.tracks.is_empty() {
             // No rows to virtualize: draw the header and the hint directly.
+            let highlight = self.rows.highlight();
             let header = albums::render_item(
                 theme,
                 0,
                 &sections,
                 &items,
+                &title_cols,
                 &self.covers,
                 &self.library,
                 current,
                 live_bitrate,
-                Some(self.playlist),
+                Some(playlist),
+                &highlight,
                 &actions,
-                window,
                 cx,
             );
             root = root.child(
@@ -346,29 +332,39 @@ impl Render for PlaylistView {
         } else {
             let covers = self.covers.clone();
             let library = self.library.clone();
-            let playlist = self.playlist;
+            let highlight = self.rows.highlight();
             let render = cx.processor({
                 let sections = sections.clone();
                 let items = items.clone();
+                let title_cols = title_cols.clone();
                 let actions = actions.clone();
-                move |_this, ix: usize, window: &mut Window, cx: &mut Context<PlaylistView>| {
+                move |_this, ix: usize, _window: &mut Window, cx: &mut Context<PlaylistView>| {
                     albums::render_item(
                         theme,
                         ix,
                         &sections,
                         &items,
+                        &title_cols,
                         &covers,
                         &library,
                         current,
                         live_bitrate,
                         Some(playlist),
+                        &highlight,
                         &actions,
-                        window,
                         cx,
                     )
                 }
             });
-            root = root.child(list(self.list_state.clone(), render).flex_1().w_full().min_h_0());
+            root = root.child(scroll_area(
+                list(list_state, render).size_full().into_any_element(),
+                cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                    if this.rows.wheel(wheel_pixels(event)) {
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                }),
+            ));
         }
 
         // A custom playlist's add-songs bar, pinned above the transport.
@@ -432,7 +428,8 @@ impl Render for PlaylistView {
                     .w_full()
                     .track_focus(&self.add_focus)
                     .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
-                        if this.add_query.handle_key(event) {
+                        let clipboard = cx.read_from_clipboard().and_then(|item| item.text());
+                        if this.add_query.handle_key_with_clipboard(event, clipboard.as_deref()) {
                             this.recompute_add(cx);
                             cx.stop_propagation();
                             cx.notify();
@@ -491,49 +488,4 @@ fn add_row(
         )
         .child(div().text_size(px(theme.cell_px())).text_color(theme.accent).child("+"))
         .into_any_element()
-}
-
-fn section_header(theme: Theme, label: &str) -> AnyElement {
-    div()
-        .pb_1()
-        .text_size(px(theme.small_px()))
-        .text_color(theme.text_faint)
-        .child(label.to_uppercase())
-        .into_any_element()
-}
-
-/// The row to select when moving down: the next one, clamped to the last.
-/// `None` when the playlist is empty.
-fn step_down(current: Option<usize>, count: usize) -> Option<usize> {
-    let last = count.checked_sub(1)?;
-    Some(current.map_or(0, |i| (i + 1).min(last)))
-}
-
-/// The row to select when moving up: the previous one, clamped to the first.
-fn step_up(current: Option<usize>, count: usize) -> Option<usize> {
-    if count == 0 {
-        return None;
-    }
-    Some(current.map_or(0, |i| i.saturating_sub(1)))
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{step_down, step_up};
-
-    #[test]
-    fn stepping_down_walks_and_clamps() {
-        assert_eq!(step_down(None, 3), Some(0), "nothing selected -> first row");
-        assert_eq!(step_down(Some(0), 3), Some(1));
-        assert_eq!(step_down(Some(2), 3), Some(2), "clamped at the last row");
-        assert_eq!(step_down(Some(0), 0), None, "empty playlist");
-    }
-
-    #[test]
-    fn stepping_up_walks_and_clamps() {
-        assert_eq!(step_up(None, 3), Some(0));
-        assert_eq!(step_up(Some(2), 3), Some(1));
-        assert_eq!(step_up(Some(0), 3), Some(0), "clamped at the first row");
-        assert_eq!(step_up(Some(0), 0), None, "empty playlist");
-    }
 }

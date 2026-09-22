@@ -48,8 +48,13 @@ thiserror = "1"
 
 [profile.dev]
 opt-level = 1 # keep our own crate fast to compile
+# GPUI compiles its element inspector and a pile of per-frame debug checks
+# behind `debug_assertions`. Leaving them on in a dev build is a large chunk of
+# frame time, so a debug `cargo run` turns them off.
+debug-assertions = false
 
 # ...but fully optimize dependencies: symphonia/rodio/gpui are painfully
 # slow un-optimized in debug, and they're where the time actually goes.
 [profile.dev.package."*"]
 opt-level = 3
+debug-assertions = false

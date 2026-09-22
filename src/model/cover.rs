@@ -23,8 +23,9 @@ impl DecodedImage {
 /// Distinguishes "haven't tried yet", "in flight", and "genuinely has no
 /// art" so the UI doesn't re-attempt decodes every frame or flash a
 /// placeholder→real swap mid-load.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub enum CoverState {
+    #[default]
     NotRequested,
     Loading,
     Ready(Arc<DecodedImage>),

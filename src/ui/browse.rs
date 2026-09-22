@@ -7,49 +7,45 @@
 //! the rows near the viewport (plus a little overdraw) instead of all of them.
 //! The advanced search container renders the very same grouping from a parsed
 //! query, and opening a playlist renders one section of it.
-
-use std::rc::Rc;
+//!
+//! Selection, keyboard navigation, paging, and the highlight fade all live in
+//! [`RowList`]; this view only says that activating a row plays the album from
+//! it.
 
 use gpui::{
-    div, list, prelude::*, px, ClickEvent, Context, Entity, FocusHandle, ListAlignment, ListState,
-    MouseDownEvent, Render, Subscription, Window,
+    div, list, prelude::*, px, ClickEvent, Context, Entity, FocusHandle, KeyDownEvent,
+    MouseDownEvent, Render, ScrollWheelEvent, Subscription, Window,
 };
 
-use crate::model::{PlaylistId, SongId};
+use crate::model::{InputAction, PlaylistId, SongId};
 use crate::ui::albums::{self, RowActions};
-use crate::ui::config_state::ConfigState;
+use crate::ui::animation::Animator;
+use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::cover_store::CoverStore;
+use crate::ui::input::action_for_key;
 use crate::ui::library_state::LibraryState;
 use crate::ui::menu::SongMenuRequest;
+use crate::ui::row_list::{RowAction, RowList};
 use crate::ui::state::PlaybackState;
-use crate::ui::theme::Theme;
-
-/// Extra rows rendered above and below the viewport, so scrolling a little
-/// doesn't pop rows (or their covers) in. Roughly ±50 rows.
-const OVERDRAW_PX: f32 = 1200.0;
+use crate::ui::widgets::{scroll_area, wheel_pixels};
 
 pub struct BrowseView {
     library: Entity<LibraryState>,
     playback: Entity<PlaybackState>,
     covers: Entity<CoverStore>,
-    theme: Theme,
-    /// The current album sections. Rebuilt when the library changes, not every
-    /// frame.
-    sections: Rc<Vec<albums::AlbumSection>>,
+    themed: Themed,
+    rows: RowList,
     /// When set, the library is scoped to this artist's discography.
     artist_filter: Option<String>,
-    /// Set when the library changes, so the sections are rebuilt.
-    dirty: bool,
-    /// Virtualized-list state, owned by the view as GPUI requires.
-    list_state: ListState,
-    /// The row count the list was last reset to.
-    item_count: usize,
+    /// The library revision the rows were last built from, so a highlight-only
+    /// notify (a tab switch) doesn't rebuild them.
+    seen_revision: u64,
     focus_handle: FocusHandle,
     _observe: Subscription,
     _observe_playback: Subscription,
     _observe_covers: Subscription,
-    _observe_config: Subscription,
+    _observe_animator: Subscription,
 }
 
 impl BrowseView {
@@ -58,34 +54,38 @@ impl BrowseView {
         playback: Entity<PlaybackState>,
         covers: Entity<CoverStore>,
         config: Entity<ConfigState>,
+        animator: Entity<Animator>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let observe = cx.observe(&library, |this, _state, cx| {
-            this.dirty = true;
+        let observe = cx.observe(&library, |this, state, cx| {
+            let revision = state.read(cx).revision();
+            if this.seen_revision != revision {
+                this.seen_revision = revision;
+                this.rows.mark_dirty();
+            }
             cx.notify();
         });
         let observe_playback = cx.observe(&playback, |_this, _state, cx| cx.notify());
         let observe_covers = cx.observe(&covers, |_this, _state, cx| cx.notify());
-        let observe_config = cx.observe(&config, |this, config, cx| {
-            this.theme = config.read(cx).theme_for(Self::container_id(), Self::default_font_size());
-            cx.notify();
+        let observe_animator = cx.observe(&animator, |this, animator, cx| {
+            if this.rows.tick(animator.read(cx).dt()) {
+                cx.notify();
+            }
         });
-        let theme = config.read(cx).theme_for(Self::container_id(), Self::default_font_size());
+        let themed = Themed::new(&config, cx);
         Self {
             library,
             playback,
             covers,
-            theme,
-            sections: Rc::new(Vec::new()),
+            themed,
+            rows: RowList::new(),
             artist_filter: None,
-            dirty: true,
-            list_state: ListState::new(0, ListAlignment::Top, px(OVERDRAW_PX)),
-            item_count: 0,
+            seen_revision: 0,
             focus_handle: cx.focus_handle(),
             _observe: observe,
             _observe_playback: observe_playback,
             _observe_covers: observe_covers,
-            _observe_config: observe_config,
+            _observe_animator: observe_animator,
         }
     }
 
@@ -98,9 +98,34 @@ impl BrowseView {
     pub fn set_artist_filter(&mut self, artist: Option<String>, cx: &mut Context<Self>) {
         if self.artist_filter != artist {
             self.artist_filter = artist;
-            self.dirty = true;
+            self.rows.mark_dirty();
             cx.notify();
         }
+    }
+
+    fn dispatch(&mut self, action: InputAction, cx: &mut Context<Self>) {
+        match self.rows.handle(action) {
+            RowAction::Play(playlist, index) => self.play(playlist, index, cx),
+            RowAction::Handled => cx.notify(),
+            RowAction::Ignored => {}
+        }
+    }
+
+    fn play(&mut self, playlist: PlaylistId, index: usize, cx: &mut Context<Self>) {
+        let playback = self.playback.clone();
+        self.library.update(cx, |state, cx| state.play_playlist(playlist, index, &playback, cx));
+    }
+
+    /// Snapshot the library into sections, scoped to the artist filter when one
+    /// is set.
+    fn build_sections(&self, cx: &Context<Self>) -> Vec<albums::AlbumSection> {
+        let mut sections = albums::all_sections(self.library.read(cx).library());
+        if let Some(artist) = &self.artist_filter {
+            sections.retain(|section| section_matches_artist(section, artist));
+            // A discography reads newest release first, undated albums last.
+            sort_by_year(&mut sections);
+        }
+        sections
     }
 }
 
@@ -110,63 +135,72 @@ impl Container for BrowseView {
     }
 }
 
-/// How the browse view reacts to a row click: play the album from there.
+/// How the browse view reacts to a row click: play the album from there, or
+/// extend/toggle the selection with a modifier.
 struct BrowseRows;
 
 impl RowActions<BrowseView> for BrowseRows {
     fn activate(
         &self,
         view: &mut BrowseView,
+        item_ix: usize,
         playlist: PlaylistId,
         index: usize,
-        _event: &ClickEvent,
+        event: &ClickEvent,
         _window: &mut Window,
         cx: &mut Context<BrowseView>,
     ) {
-        let playback = view.playback.clone();
-        view.library.update(cx, |state, cx| state.play_playlist(playlist, index, &playback, cx));
+        // A modifier extends or toggles the selection; a plain click plays.
+        if view.rows.click(item_ix, event.modifiers()) {
+            cx.notify();
+            return;
+        }
+        view.play(playlist, index, cx);
     }
 
     fn context(
         &self,
         view: &mut BrowseView,
-        song: SongId,
+        item_ix: usize,
+        _song: SongId,
         context: Option<PlaylistId>,
         event: &MouseDownEvent,
         _window: &mut Window,
         cx: &mut Context<BrowseView>,
     ) {
-        let request = SongMenuRequest { song, position: event.position, playlist: context };
+        let songs = view.rows.context_songs(item_ix);
+        let request = SongMenuRequest { songs, position: event.position, playlist: context };
         view.library.update(cx, |state, cx| state.request_song_menu(request, cx));
+    }
+
+    fn hover(
+        &self,
+        view: &mut BrowseView,
+        item_ix: usize,
+        hovered: bool,
+        cx: &mut Context<BrowseView>,
+    ) {
+        if view.rows.set_hover(item_ix, hovered) {
+            cx.notify();
+        }
     }
 }
 
 impl Render for BrowseView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.themed.theme();
 
-        if self.dirty {
-            self.dirty = false;
-            let filter = self.artist_filter.clone();
-            let mut sections = {
-                let state = self.library.read(cx);
-                albums::all_sections(state.library())
-            };
-            if let Some(artist) = &filter {
-                sections.retain(|section| section_matches_artist(section, artist));
-            }
-            self.sections = Rc::new(sections);
-        }
-        let sections = self.sections.clone();
-        let items = Rc::new(albums::flatten(&sections));
-        if self.item_count != items.len() {
-            self.list_state.reset(items.len());
-            self.item_count = items.len();
-        }
+        let fresh = self.rows.is_dirty().then(|| self.build_sections(cx));
+        self.rows.sync(theme, window, fresh);
+
+        let sections = self.rows.sections();
+        let items = self.rows.items();
+        let title_cols = self.rows.title_cols();
+        let list_state = self.rows.list_state().clone();
 
         let current = self.playback.read(cx).metadata().id;
         let live_bitrate = self.playback.read(cx).live_bitrate();
-        let actions: Rc<dyn RowActions<BrowseView>> = Rc::new(BrowseRows);
+        let actions: std::rc::Rc<dyn RowActions<BrowseView>> = std::rc::Rc::new(BrowseRows);
 
         let songs: usize = sections.iter().map(|section| section.tracks.len()).sum();
         // An artist tab titles itself with the artist; the library tab is the
@@ -176,6 +210,11 @@ impl Render for BrowseView {
 
         let mut root = div()
             .track_focus(&self.focus_handle)
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+                if let Some(action) = action_for_key(&event.keystroke) {
+                    this.dispatch(action, cx);
+                }
+            }))
             .size_full()
             .flex()
             .flex_col()
@@ -222,28 +261,39 @@ impl Render for BrowseView {
         } else {
             let covers = self.covers.clone();
             let library = self.library.clone();
+            let highlight = self.rows.highlight();
             let render = cx.processor({
                 let sections = sections.clone();
                 let items = items.clone();
+                let title_cols = title_cols.clone();
                 let actions = actions.clone();
-                move |_this, ix: usize, window: &mut Window, cx: &mut Context<BrowseView>| {
+                move |_this, ix: usize, _window: &mut Window, cx: &mut Context<BrowseView>| {
                     albums::render_item(
                         theme,
                         ix,
                         &sections,
                         &items,
+                        &title_cols,
                         &covers,
                         &library,
                         current,
                         live_bitrate,
                         None,
+                        &highlight,
                         &actions,
-                        window,
                         cx,
                     )
                 }
             });
-            root = root.child(list(self.list_state.clone(), render).flex_1().w_full().min_h_0());
+            root = root.child(scroll_area(
+                list(list_state, render).size_full().into_any_element(),
+                cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                    if this.rows.wheel(wheel_pixels(event)) {
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                }),
+            ));
         }
 
         root
@@ -260,9 +310,19 @@ fn section_matches_artist(section: &albums::AlbumSection, artist: &str) -> bool 
             .any(|track| track.artist.split(", ").any(|name| name == artist))
 }
 
+/// Sort sections newest release first, with undated albums below the dated ones.
+fn sort_by_year(sections: &mut [albums::AlbumSection]) {
+    sections.sort_by(|a, b| match (a.year.parse::<u16>().ok(), b.year.parse::<u16>().ok()) {
+        (Some(year_a), Some(year_b)) => year_b.cmp(&year_a).then_with(|| a.album.cmp(&b.album)),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => a.album.cmp(&b.album),
+    });
+}
+
 #[cfg(test)]
 mod tests {
-    use super::section_matches_artist;
+    use super::{section_matches_artist, sort_by_year};
     use crate::model::PlaylistId;
     use crate::ui::albums::{AlbumSection, TrackRow};
 
@@ -303,5 +363,25 @@ mod tests {
             &section("X", &["Chris Lake, Grimes, NPC"]),
             "Grimes"
         ));
+    }
+
+    fn dated(album: &str, year: &str) -> AlbumSection {
+        let mut section = section("A", &["A"]);
+        section.album = album.to_string();
+        section.year = year.to_string();
+        section
+    }
+
+    #[test]
+    fn discography_sorts_newest_first_with_undated_last() {
+        let mut sections = vec![
+            dated("Old", "1999"),
+            dated("Undated", ""),
+            dated("New", "2020"),
+            dated("Middle", "2010"),
+        ];
+        sort_by_year(&mut sections);
+        let order: Vec<&str> = sections.iter().map(|s| s.album.as_str()).collect();
+        assert_eq!(order, vec!["New", "Middle", "Old", "Undated"]);
     }
 }

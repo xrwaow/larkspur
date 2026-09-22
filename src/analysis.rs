@@ -12,20 +12,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use opus::{Channels, Decoder as OpusCodec};
-use symphonia::core::audio::SampleBuffer;
-use symphonia::core::codecs::{DecoderOptions, CODEC_TYPE_OPUS};
-use symphonia::core::errors::Error as SymphoniaError;
-
 use crate::bitrate::{units_to_duration, BitrateProfile};
-use crate::decode::open_track;
+use crate::decode::{open_track, PacketDecoder};
 
 /// Samples per waveform peak, before bucketing down.
 const PEAK_WINDOW: usize = 512;
-
-/// Opus decodes internally at 48 kHz, and one packet is at most 120 ms.
-const OPUS_SAMPLE_RATE: u32 = 48_000;
-const MAX_OPUS_FRAMES: usize = 5760;
 
 /// Everything the UI wants from a track, from a single pass.
 pub struct TrackAnalysis {
@@ -43,7 +34,7 @@ pub fn analyze_track(
 ) -> anyhow::Result<TrackAnalysis> {
     let opened = open_track(path, false)?;
     let track_id = opened.track_id;
-    let (time_base, sample_rate, codec, channels) = {
+    let (time_base, sample_rate, channels) = {
         let track = opened
             .format
             .tracks()
@@ -53,30 +44,14 @@ pub fn analyze_track(
         (
             track.codec_params.time_base,
             track.codec_params.sample_rate,
-            track.codec_params.codec,
             track.codec_params.channels.map(|c| c.count()).unwrap_or(2),
         )
     };
 
-    let is_opus = codec == CODEC_TYPE_OPUS;
+    // One decoder or the other, chosen by the shared `PacketDecoder` — Opus
+    // goes to libopus, everything else to symphonia.
+    let mut decoder = PacketDecoder::new(&opened.codec_params, channels)?;
     let mut format = opened.format;
-
-    // One decoder or the other, never both.
-    let mut opus = if is_opus {
-        Some(OpusCodec::new(
-            OPUS_SAMPLE_RATE,
-            if channels == 1 { Channels::Mono } else { Channels::Stereo },
-        )?)
-    } else {
-        None
-    };
-    let mut opus_scratch = vec![0.0f32; MAX_OPUS_FRAMES * channels];
-    let mut decoder = if is_opus {
-        None
-    } else {
-        Some(symphonia::default::get_codecs().make(&opened.codec_params, &DecoderOptions::default())?)
-    };
-    let mut sample_buf: Option<SampleBuffer<f32>> = None;
 
     let bucket_secs = bucket.as_secs_f64().max(1e-6);
     let mut peaks: Vec<f32> = Vec::new();
@@ -102,24 +77,8 @@ pub fn analyze_track(
         byte_counts[index] += packet.data.len() as u64;
 
         // Waveform: decode this packet to samples and fold them into peaks.
-        if let Some(opus) = opus.as_mut() {
-            if let Ok(frames) = opus.decode_float(&packet.data, &mut opus_scratch, false) {
-                push_peaks(&opus_scratch[..frames * channels], &mut peaks);
-            }
-        } else if let Some(decoder) = decoder.as_mut() {
-            match decoder.decode(&packet) {
-                Ok(decoded) => {
-                    if sample_buf.is_none() {
-                        sample_buf =
-                            Some(SampleBuffer::new(decoded.capacity() as u64, *decoded.spec()));
-                    }
-                    let buf = sample_buf.as_mut().unwrap();
-                    buf.copy_interleaved_ref(decoded);
-                    push_peaks(buf.samples(), &mut peaks);
-                }
-                Err(SymphoniaError::DecodeError(_)) => continue,
-                Err(e) => return Err(e.into()),
-            }
+        if let Some(samples) = decoder.decode(&packet) {
+            push_peaks(samples, &mut peaks);
         }
     }
 

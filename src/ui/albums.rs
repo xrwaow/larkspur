@@ -11,6 +11,7 @@
 //! raising a container's font size scales the columns with the text rather than
 //! misaligning them.
 
+use std::collections::BTreeSet;
 use std::rc::Rc;
 use std::time::Duration;
 
@@ -114,7 +115,7 @@ fn section(library: &Library, group: AlbumGroup) -> Option<AlbumSection> {
                         .clone()
                         .unwrap_or_else(|| first.album_artist().to_string())
                 },
-                album_meta(first, songs.len(), total_secs),
+                album_meta(songs.len(), total_secs),
                 // A custom playlist spans arbitrary tracks, so a single release
                 // year would be misleading — only albums carry one.
                 if custom {
@@ -163,19 +164,13 @@ fn custom_artist(songs: &[&SongMetadata]) -> String {
     }
 }
 
-/// The `format | bitrate | N Tracks | Time:…` line under an album title.
-fn album_meta(song: &SongMetadata, tracks: usize, total_secs: u64) -> String {
-    let format = song
-        .path
-        .extension()
-        .and_then(|e| e.to_str())
-        .map(|e| e.to_ascii_lowercase())
-        .unwrap_or_else(|| "audio".to_string());
-    let labelled = match song.nominal_bitrate {
-        Some(bps) => format!("{format}-{}kbps", (bps as f64 / 1000.0).round() as u32),
-        None => format,
-    };
-    format!("{labelled} | {tracks} Tracks | Time:{}", format_secs(total_secs))
+/// The `N Tracks | Time:…` line under an album title.
+///
+/// The file format and the album-level bitrate are deliberately left out: the
+/// bitrate that matters is per *song* (and live while it plays), and it's shown
+/// on each row in the same format either way.
+fn album_meta(tracks: usize, total_secs: u64) -> String {
+    format!("{tracks} Tracks | Time:{}", format_secs(total_secs))
 }
 
 /// One drawable row of an album list.
@@ -217,13 +212,150 @@ pub fn flatten(sections: &[AlbumSection]) -> Vec<ListItem> {
     items
 }
 
+/// The item indices that hold a track (not an album header), in order.
+pub fn selectable_indices(items: &[ListItem]) -> Vec<usize> {
+    items
+        .iter()
+        .enumerate()
+        .filter(|(_, item)| !matches!(item, ListItem::Header(_)))
+        .map(|(ix, _)| ix)
+        .collect()
+}
+
+/// The song a row holds, if it's a track row.
+pub fn row_song(items: &[ListItem], sections: &[AlbumSection], ix: usize) -> Option<SongId> {
+    match items.get(ix)? {
+        ListItem::Track { section, index } => {
+            sections.get(*section)?.tracks.get(*index).map(|track| track.song)
+        }
+        ListItem::Compact(section) => {
+            sections.get(*section)?.tracks.first().map(|track| track.song)
+        }
+        ListItem::Header(_) => None,
+    }
+}
+
+/// The playlist and track index a row plays from, if it's a track row.
+pub fn row_target(
+    items: &[ListItem],
+    sections: &[AlbumSection],
+    ix: usize,
+) -> Option<(PlaylistId, usize)> {
+    match items.get(ix)? {
+        ListItem::Track { section, index } => Some((sections.get(*section)?.playlist, *index)),
+        ListItem::Compact(section) => Some((sections.get(*section)?.playlist, 0)),
+        ListItem::Header(_) => None,
+    }
+}
+
+/// The next selectable row after `current` in `direction` (`forward` = down),
+/// clamped to the ends. `None` when there are no selectable rows.
+pub fn step_selectable(items: &[ListItem], current: Option<usize>, forward: bool) -> Option<usize> {
+    let selectable = selectable_indices(items);
+    let Some(&first) = selectable.first() else { return None };
+    let Some(&last) = selectable.last() else { return None };
+    let Some(current) = current else {
+        return Some(if forward { first } else { last });
+    };
+    match selectable.iter().position(|&i| i == current) {
+        Some(position) if forward => Some(selectable[(position + 1).min(selectable.len() - 1)]),
+        Some(position) => Some(selectable[position.saturating_sub(1)]),
+        None => Some(first),
+    }
+}
+
+/// A set of selected rows in a flattened album list.
+///
+/// Rows are identified by their index in the flattened [`ListItem`] list, so a
+/// range is just a span of item indices. Headers aren't selectable;
+/// [`selectable_indices`] is what a range walks.
+#[derive(Default, Clone)]
+pub struct Selection {
+    selected: BTreeSet<usize>,
+    /// Where a shift-click range extends from — the last row clicked without a
+    /// modifier.
+    anchor: Option<usize>,
+}
+
+impl Selection {
+    pub fn is_empty(&self) -> bool {
+        self.selected.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.selected.len()
+    }
+
+    pub fn contains(&self, ix: usize) -> bool {
+        self.selected.contains(&ix)
+    }
+
+    /// The lowest selected item index, if any.
+    pub fn first(&self) -> Option<usize> {
+        self.selected.iter().next().copied()
+    }
+
+    /// Every selected item index, in order.
+    pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
+        self.selected.iter().copied()
+    }
+
+    pub fn clear(&mut self) {
+        self.selected.clear();
+        self.anchor = None;
+    }
+
+    /// Select exactly `ix` and make it the anchor.
+    pub fn set_single(&mut self, ix: usize) {
+        self.selected.clear();
+        self.selected.insert(ix);
+        self.anchor = Some(ix);
+    }
+
+    /// Add or remove `ix` (ctrl-click), making it the anchor.
+    pub fn toggle(&mut self, ix: usize) {
+        if !self.selected.remove(&ix) {
+            self.selected.insert(ix);
+        }
+        self.anchor = Some(ix);
+    }
+
+    /// Extend the selection from the anchor to `ix` (shift-click), selecting
+    /// every selectable row in between.
+    pub fn extend_to(&mut self, ix: usize, items: &[ListItem]) {
+        let Some(anchor) = self.anchor else {
+            return self.set_single(ix);
+        };
+        let selectable = selectable_indices(items);
+        let (Some(from), Some(to)) = (
+            selectable.iter().position(|&i| i == anchor),
+            selectable.iter().position(|&i| i == ix),
+        ) else {
+            return self.set_single(ix);
+        };
+        let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
+        self.selected = selectable[lo..=hi].iter().copied().collect();
+    }
+
+    /// The songs the selection covers, in list order.
+    pub fn songs(&self, items: &[ListItem], sections: &[AlbumSection]) -> Vec<SongId> {
+        self.selected
+            .iter()
+            .filter_map(|&ix| row_song(items, sections, ix))
+            .collect()
+    }
+}
+
 /// How a list reacts to a row. Implemented per view so the shared renderer
 /// doesn't need to know which container it's drawing.
 pub trait RowActions<V: Render>: 'static {
     /// A row was clicked (single or double, per the event's `click_count`).
+    /// `item_ix` is the row's index in the flattened list; `index` is its track
+    /// index within `playlist`.
     fn activate(
         &self,
         view: &mut V,
+        item_ix: usize,
         playlist: PlaylistId,
         index: usize,
         event: &ClickEvent,
@@ -231,16 +363,21 @@ pub trait RowActions<V: Render>: 'static {
         cx: &mut Context<V>,
     );
 
-    /// A row was right-clicked.
+    /// A row was right-clicked. `item_ix` is the row's index in the flattened
+    /// list.
     fn context(
         &self,
         view: &mut V,
+        item_ix: usize,
         song: SongId,
         context: Option<PlaylistId>,
         event: &MouseDownEvent,
         window: &mut Window,
         cx: &mut Context<V>,
     );
+
+    /// A row's hover state changed.
+    fn hover(&self, view: &mut V, item_ix: usize, hovered: bool, cx: &mut Context<V>);
 }
 
 /// Render one row — what `gpui::list` calls for each visible (and overdraw)
@@ -251,18 +388,21 @@ pub fn render_item<V: Render + 'static>(
     ix: usize,
     sections: &[AlbumSection],
     items: &[ListItem],
+    title_cols: &[f32],
     covers: &Entity<CoverStore>,
     library: &Entity<LibraryState>,
     current: SongId,
     live_bitrate: Option<u32>,
     context: Option<PlaylistId>,
+    highlight: &crate::ui::row_list::Highlight,
     actions: &Rc<dyn RowActions<V>>,
-    window: &Window,
     cx: &mut Context<V>,
 ) -> AnyElement {
     let item = items[ix];
     let section = &sections[item.section()];
     let playlist = section.playlist;
+    let selection = highlight.selection(ix);
+    let hover = highlight.hover(ix);
 
     match item {
         ListItem::Header(_) => {
@@ -280,33 +420,57 @@ pub fn render_item<V: Render + 'static>(
             let on_click = {
                 let actions = actions.clone();
                 cx.listener(move |view, event: &ClickEvent, window, cx| {
-                    actions.activate(view, playlist, 0, event, window, cx)
+                    actions.activate(view, ix, playlist, 0, event, window, cx)
                 })
             };
             let on_right_click = {
                 let actions = actions.clone();
                 cx.listener(move |view, event: &MouseDownEvent, window, cx| {
-                    actions.context(view, song, context, event, window, cx)
+                    actions.context(view, ix, song, context, event, window, cx)
                 })
             };
-            compact_row(theme, track, cover, playing, false, bitrate, on_click, on_right_click)
+            let on_hover = {
+                let actions = actions.clone();
+                cx.listener(move |view, hovered: &bool, _window, cx| {
+                    actions.hover(view, ix, *hovered, cx)
+                })
+            };
+            compact_row(
+                theme,
+                track,
+                &section.year,
+                cover,
+                playing,
+                selection,
+                hover,
+                bitrate,
+                on_click,
+                on_right_click,
+                on_hover,
+            )
         }
         ListItem::Track { index, .. } => {
             let track = &section.tracks[index];
             let song = track.song;
             let playing = current == song;
             let bitrate = row_bitrate(playing, track.nominal_bitrate, live_bitrate);
-            let title_col = title_column_width(window, theme, &section.tracks);
+            let title_col = title_cols.get(item.section()).copied().unwrap_or(0.0);
             let on_click = {
                 let actions = actions.clone();
                 cx.listener(move |view, event: &ClickEvent, window, cx| {
-                    actions.activate(view, playlist, index, event, window, cx)
+                    actions.activate(view, ix, playlist, index, event, window, cx)
                 })
             };
             let on_right_click = {
                 let actions = actions.clone();
                 cx.listener(move |view, event: &MouseDownEvent, window, cx| {
-                    actions.context(view, song, context, event, window, cx)
+                    actions.context(view, ix, song, context, event, window, cx)
+                })
+            };
+            let on_hover = {
+                let actions = actions.clone();
+                cx.listener(move |view, hovered: &bool, _window, cx| {
+                    actions.hover(view, ix, *hovered, cx)
                 })
             };
             track_row(
@@ -314,11 +478,13 @@ pub fn render_item<V: Render + 'static>(
                 track,
                 index,
                 playing,
-                false,
+                selection,
+                hover,
                 title_col,
                 bitrate,
                 on_click,
                 on_right_click,
+                on_hover,
             )
         }
     }
@@ -417,15 +583,19 @@ pub fn album_header(theme: Theme, section: &AlbumSection, cover: Option<CoverIma
 
 /// A one-track section, compressed into a single row with its cover on the
 /// left instead of a header plus one line.
+#[allow(clippy::too_many_arguments)]
 pub fn compact_row(
     theme: Theme,
     track: &TrackRow,
+    year: &str,
     cover: Option<CoverImage>,
     playing: bool,
-    active: bool,
+    selection: Option<f32>,
+    hover: Option<f32>,
     bitrate: Option<u32>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_right_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     div()
         .id(("album-single", track.song))
@@ -436,12 +606,13 @@ pub fn compact_row(
         .px_4()
         .py_2()
         .cursor_pointer()
-        .bg(row_background(theme, playing, active, 0))
-        .hover(|d| d.bg(theme.row_hover))
+        .bg(row_background(theme, playing, selection, hover, 0))
+        .on_hover(on_hover)
         .on_click(on_click)
         .on_mouse_down(MouseButton::Right, on_right_click)
         .child(thumbnail(theme, cover, THUMB_SMALL_PX))
         .child(title_and_artist(theme, track, playing, true))
+        .child(year_cell(theme, year))
         .child(bitrate_cell(theme, bitrate))
         .child(duration_cell(theme, track))
         .into_any_element()
@@ -455,11 +626,13 @@ pub fn track_row(
     track: &TrackRow,
     index: usize,
     playing: bool,
-    active: bool,
+    selection: Option<f32>,
+    hover: Option<f32>,
     title_col: f32,
     bitrate: Option<u32>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_right_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     let id: ElementId = ("album-track", track.song).into();
 
@@ -472,7 +645,8 @@ pub fn track_row(
         .px_4()
         .py_1()
         .cursor_pointer()
-        .bg(row_background(theme, playing, active, index))
+        .bg(row_background(theme, playing, selection, hover, index))
+        .on_hover(on_hover)
         .hover(|d| d.bg(theme.row_hover))
         .on_click(on_click)
         .on_mouse_down(MouseButton::Right, on_right_click)
@@ -547,15 +721,36 @@ fn title_and_artist(
     .into_any_element()
 }
 
-/// The row background: playing wins, then the keyboard selection, then the
-/// zebra stripe.
-fn row_background(theme: Theme, playing: bool, active: bool, index: usize) -> gpui::Rgba {
+/// The row background: playing wins, then the selection crossfade, then the
+/// hover crossfade, then the zebra stripe.
+fn row_background(
+    theme: Theme,
+    playing: bool,
+    selection: Option<f32>,
+    hover: Option<f32>,
+    index: usize,
+) -> gpui::Rgba {
     if playing {
-        theme.row_playing
-    } else if active {
-        theme.row_active
-    } else {
-        theme.row_bg(index)
+        return theme.row_playing;
+    }
+    let mut background = theme.row_bg(index);
+    if let Some(fade) = selection {
+        background = blend(background, theme.row_active, fade);
+    }
+    if let Some(fade) = hover {
+        background = blend(background, theme.row_hover, fade);
+    }
+    background
+}
+
+/// Linear blend from `from` to `to`, for a selection highlight fading in.
+fn blend(from: gpui::Rgba, to: gpui::Rgba, t: f32) -> gpui::Rgba {
+    let t = t.clamp(0.0, 1.0);
+    gpui::Rgba {
+        r: from.r + (to.r - from.r) * t,
+        g: from.g + (to.g - from.g) * t,
+        b: from.b + (to.b - from.b) * t,
+        a: from.a + (to.a - from.a) * t,
     }
 }
 
@@ -580,6 +775,19 @@ fn duration_cell(theme: Theme, track: &TrackRow) -> AnyElement {
         .text_size(px(theme.small_px()))
         .text_color(theme.text_faint)
         .child(format_duration(Duration::from_secs(track.secs)))
+        .into_any_element()
+}
+
+/// The release year, right-aligned just left of the bitrate. Empty when the
+/// tags declare none.
+fn year_cell(theme: Theme, year: &str) -> AnyElement {
+    div()
+        .w(px(theme.font_size * 3.0))
+        .flex_none()
+        .text_right()
+        .text_size(px(theme.small_px()))
+        .text_color(theme.text_faint)
+        .child(year.to_string())
         .into_any_element()
 }
 
@@ -739,5 +947,40 @@ mod tests {
         assert!(matches!(items[3], ListItem::Header(1)));
         assert!(matches!(items[4], ListItem::Compact(2)));
         assert_eq!(items[4].section(), 2);
+    }
+
+    #[test]
+    fn step_selectable_walks_tracks_and_clamps() {
+        let sections = vec![section_with_tracks(2)];
+        let items = flatten(&sections); // Header, Track 0, Track 1
+        assert_eq!(step_selectable(&items, None, true), Some(1));
+        assert_eq!(step_selectable(&items, Some(1), true), Some(2));
+        assert_eq!(step_selectable(&items, Some(2), true), Some(2), "clamped at the last");
+        assert_eq!(step_selectable(&items, Some(2), false), Some(1));
+        assert_eq!(step_selectable(&items, Some(1), false), Some(1), "clamped at the first");
+        assert_eq!(step_selectable(&[], None, true), None, "no rows");
+    }
+
+    #[test]
+    fn selection_ranges_skip_headers() {
+        let sections = vec![section_with_tracks(2), section_with_tracks(2)];
+        let items = flatten(&sections); // Header, T0, T1, Header, T0, T1
+        let mut selection = Selection::default();
+        selection.set_single(1);
+        selection.extend_to(4, &items);
+        assert_eq!(selection.len(), 3, "rows 1, 2, 4 — the header at 3 is skipped");
+        assert!(selection.contains(1) && selection.contains(2) && selection.contains(4));
+        assert!(!selection.contains(3));
+        assert_eq!(selection.songs(&items, &sections).len(), 3);
+    }
+
+    #[test]
+    fn selection_toggle_adds_then_removes() {
+        let mut selection = Selection::default();
+        selection.toggle(3);
+        assert!(selection.contains(3));
+        selection.toggle(3);
+        assert!(!selection.contains(3));
+        assert!(selection.is_empty());
     }
 }

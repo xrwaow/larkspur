@@ -12,15 +12,14 @@
 use std::collections::{HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use super::config::Config;
 use super::cover::CoverState;
-use super::identity::SongId;
 use super::library::Library;
-use super::lyrics::{self, Lyrics};
+use super::lyrics;
 use super::playlist::Playlist;
 use super::song::SongMetadata;
 
@@ -48,61 +47,36 @@ pub struct SyncReport {
 
 /// The durable subset of a song, cached between launches: everything except
 /// decoded pixels (the cover cache owns those).
+/// One cached song: the metadata exactly as loaded, plus the two cache-only
+/// bits — when the file was last read, and whether it declares cover art
+/// (decoded pixels live in the cover cache instead, not in the metadata).
+///
+/// Holding a whole [`SongMetadata`] rather than mirroring its fields means the
+/// mapping can't drift when the schema grows.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct CachedSong {
-    id: SongId,
-    path: PathBuf,
+    song: SongMetadata,
     modified: SystemTime,
-    song_name: Option<String>,
-    artists: Vec<String>,
-    album_name: Option<String>,
-    album_artist: Option<String>,
-    track_position: Option<u16>,
-    year: Option<u16>,
-    nominal_bitrate: Option<u32>,
-    duration_secs: f64,
     has_cover: bool,
-    lyrics: Lyrics,
 }
 
 impl CachedSong {
     fn from_song(song: &SongMetadata, modified: SystemTime) -> Self {
         Self {
-            id: song.id,
-            path: song.path.clone(),
+            song: song.clone(),
             modified,
-            song_name: song.song_name.clone(),
-            artists: song.artists.clone(),
-            album_name: song.album_name.clone(),
-            album_artist: song.album_artist.clone(),
-            track_position: song.track_position,
-            year: song.year,
-            nominal_bitrate: song.nominal_bitrate,
-            duration_secs: song.duration.as_secs_f64(),
             has_cover: !matches!(song.cover, CoverState::Missing),
-            lyrics: song.lyrics.clone(),
         }
     }
 
     fn to_song(&self) -> SongMetadata {
-        SongMetadata {
-            id: self.id,
-            path: self.path.clone(),
-            song_name: self.song_name.clone(),
-            artists: self.artists.clone(),
-            album_name: self.album_name.clone(),
-            album_artist: self.album_artist.clone(),
-            track_position: self.track_position,
-            year: self.year,
-            nominal_bitrate: self.nominal_bitrate,
-            lyrics: self.lyrics.clone(),
-            duration: Duration::from_secs_f64(self.duration_secs),
-            cover: if self.has_cover {
-                CoverState::NotRequested
-            } else {
-                CoverState::Missing
-            },
-        }
+        let mut song = self.song.clone();
+        song.cover = if self.has_cover {
+            CoverState::NotRequested
+        } else {
+            CoverState::Missing
+        };
+        song
     }
 }
 
@@ -120,8 +94,9 @@ struct CacheFile {
 
 /// Bumped whenever the cached shape changes. v2: `nominal_bitrate` moved from
 /// kbps (as lofty reports it) to bits per second. v3: songs carry `year` and
-/// their lyrics (embedded or from a `.lrc` sidecar).
-const CACHE_VERSION: u32 = 3;
+/// their lyrics (embedded or from a `.lrc` sidecar). v4: a song is cached
+/// whole (`SongMetadata`) instead of as a mirrored field list.
+const CACHE_VERSION: u32 = 4;
 
 /// Persisted library state: where we scanned, per-directory stamps, and the
 /// cached song metadata.
@@ -153,7 +128,7 @@ impl LibraryCache {
                 path,
                 roots: cache.roots,
                 dirs: cache.dirs,
-                entries: cache.songs.into_iter().map(|s| (s.path.clone(), s)).collect(),
+                entries: cache.songs.into_iter().map(|s| (s.song.path.clone(), s)).collect(),
                 playlists: cache.playlists,
                 next_playlist_id: cache.next_playlist_id,
             },
@@ -181,11 +156,9 @@ impl LibraryCache {
     /// Populate `library` from the cache without touching the filesystem —
     /// the instant-start path before (or instead of) a sync.
     pub fn install(&self, library: &mut Library) {
-        for entry in self.entries.values() {
-            library.songs.insert(entry.id, entry.to_song());
-        }
-        library.playlists = self.playlists.iter().map(|p| (p.id, p.clone())).collect();
-        library.next_playlist_id = self.next_playlist_id;
+        let songs = self.entries.values().map(|entry| (entry.song.id, entry.to_song())).collect();
+        let playlists = self.playlists.iter().map(|p| (p.id, p.clone())).collect();
+        library.install(songs, playlists, self.next_playlist_id);
     }
 
     /// Bring `library` up to date with `roots` on disk, reusing cached
@@ -214,7 +187,7 @@ impl LibraryCache {
                 report.reused += self
                     .entries
                     .values()
-                    .filter(|e| e.path.starts_with(&root.path))
+                    .filter(|e| e.song.path.starts_with(&root.path))
                     .count();
                 continue;
             }
@@ -259,7 +232,7 @@ impl LibraryCache {
         // Rebuild the library's song map from the (now current) cache, then
         // drop dangling references and refresh autogen playlists. Custom
         // playlists the library already holds are left alone.
-        library.songs = self.entries.values().map(|e| (e.id, e.to_song())).collect();
+        library.replace_songs(self.entries.values().map(|e| (e.song.id, e.to_song())).collect());
         library.prune();
         library.rebuild_auto();
 
@@ -269,8 +242,8 @@ impl LibraryCache {
     /// Persist the library (its playlists and id counter, plus the cached
     /// song metadata) to disk.
     pub fn save(&mut self, library: &Library) -> anyhow::Result<()> {
-        self.playlists = library.playlists.values().cloned().collect();
-        self.next_playlist_id = library.next_playlist_id;
+        self.playlists = library.playlists().into_iter().cloned().collect();
+        self.next_playlist_id = library.next_playlist_id();
 
         let file = CacheFile {
             version: CACHE_VERSION,
@@ -410,6 +383,7 @@ fn source_stamp(path: &Path) -> Option<SystemTime> {
 mod tests {
     use super::*;
     use crate::model::{CoverState, Lyrics};
+    use std::time::Duration;
 
     /// A unique temp directory per test, cleaned up by the caller's drop.
     struct TempDir(PathBuf);
@@ -536,7 +510,7 @@ mod tests {
 
         let mut reloaded = Library::default();
         LibraryCache::open(cache_path).install(&mut reloaded);
-        assert_eq!(reloaded.songs.len(), 1);
+        assert_eq!(reloaded.song_count(), 1);
         assert_eq!(reloaded.get(42).unwrap().album(), "Visions");
         let song = reloaded.get(42).unwrap();
         assert_eq!(song.year, Some(2012), "the year survives the cache");
@@ -608,8 +582,8 @@ mod tests {
 
         let mut library = Library::default();
         LibraryCache::open(cache_path).install(&mut library);
-        assert!(library.songs.is_empty());
-        assert!(library.playlists.is_empty());
+        assert_eq!(library.song_count(), 0);
+        assert!(library.playlists().is_empty());
     }
 
     #[test]

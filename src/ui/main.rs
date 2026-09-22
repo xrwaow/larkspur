@@ -6,6 +6,7 @@ use gpui::{
 
 use larkspur::audio::PlaybackController;
 use larkspur::model::{Config, LibraryCache};
+use larkspur::ui::animation::Animator;
 use larkspur::ui::config_state::ConfigState;
 use larkspur::ui::container::Workspace;
 use larkspur::ui::cover::CoverView;
@@ -87,6 +88,11 @@ fn main() {
                 // square and the browse/search thumbnails.
                 let cover_store = cx.new(|cx| CoverStore::new(cache_dir().join("covers"), cx));
 
+                // The shared frame clock: animations (selection fades, lyric
+                // scrolling) observe this; the transport's coarse readouts tick
+                // on the slow rate instead.
+                let animator = cx.new(Animator::new);
+
                 // The center is the tab container; the rail opens playlists
                 // into it, so it needs a handle to the tabs.
                 let tabs = cx.new(|cx| {
@@ -95,6 +101,7 @@ fn main() {
                         playback_state.clone(),
                         cover_store.clone(),
                         config_state.clone(),
+                        animator.clone(),
                         cx,
                     )
                 });
@@ -103,7 +110,9 @@ fn main() {
                 });
 
                 let playback = cx.new(|cx| PlaybackView::new(playback_state.clone(), config_state.clone(), cx));
-                let lyrics = cx.new(|cx| LyricsView::new(playback_state.clone(), config_state.clone(), cx));
+                let lyrics = cx.new(|cx| {
+                    LyricsView::new(playback_state.clone(), config_state.clone(), animator.clone(), cx)
+                });
                 let cover = cx.new(|cx| {
                     CoverView::new(playback_state.clone(), cover_store.clone(), config_state.clone(), cx)
                 });

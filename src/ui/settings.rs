@@ -14,12 +14,12 @@ use std::path::PathBuf;
 
 use gpui::{
     div, prelude::*, px, AnyElement, App, ClickEvent, Context, Entity, FocusHandle, Focusable,
-    KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, Render, Subscription, Window,
+    KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, Render, Window,
 };
 
-use crate::model::config::{FontKind, ThemeKind, MAX_FONT_SIZE, MIN_FONT_SIZE};
+use crate::model::config::{FontKind, ThemeKind, WaveformStyle, MAX_FONT_SIZE, MIN_FONT_SIZE};
 use crate::ui::browse::BrowseView;
-use crate::ui::config_state::ConfigState;
+use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::lyrics::LyricsView;
 use crate::ui::menu::{context_menu, MenuHandler};
@@ -30,6 +30,7 @@ use crate::ui::search::SearchView;
 use crate::ui::tabs::TabsView;
 use crate::ui::text_field::TextField;
 use crate::ui::theme::Theme;
+use crate::ui::widgets::panel_header;
 
 /// An open per-container typeface menu: where it was raised and which container
 /// it edits.
@@ -40,28 +41,22 @@ struct FontMenu {
 
 pub struct SettingsView {
     config: Entity<ConfigState>,
-    theme: Theme,
+    themed: Themed,
     path: TextField,
     /// The open typeface menu, if any.
     font_menu: Option<FontMenu>,
     focus_handle: FocusHandle,
-    _observe: Subscription,
 }
 
 impl SettingsView {
     pub fn new(config: Entity<ConfigState>, cx: &mut Context<Self>) -> Self {
-        let theme = config.read(cx).theme_for(Self::container_id(), Self::default_font_size());
-        let observe = cx.observe(&config, |this, config, cx| {
-            this.theme = config.read(cx).theme_for(Self::container_id(), Self::default_font_size());
-            cx.notify();
-        });
+        let themed = Themed::new(&config, cx);
         Self {
             config,
-            theme,
+            themed,
             path: TextField::default(),
             font_menu: None,
             focus_handle: cx.focus_handle(),
-            _observe: observe,
         }
     }
 
@@ -123,9 +118,10 @@ struct ContainerRow {
 
 impl Render for SettingsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
+        let theme = self.themed.theme();
         let config = self.config.read(cx);
         let theme_kind = config.theme_kind();
+        let waveform = config.waveform();
         let roots: Vec<PathBuf> = config.roots().to_vec();
         let rows: Vec<ContainerRow> = containers()
             .into_iter()
@@ -144,9 +140,10 @@ impl Render for SettingsView {
         items.push(section(theme, "Theme"));
         let theme_buttons = ThemeKind::ALL.iter().map(|kind| {
             let kind = *kind;
-            theme_button(
+            choice_button(
                 theme,
-                kind,
+                ("theme", kind as usize),
+                kind.label(),
                 theme_kind == kind,
                 cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                     this.config.update(cx, |config, cx| config.set_theme(kind, cx));
@@ -154,6 +151,22 @@ impl Render for SettingsView {
             )
         });
         items.push(div().flex().gap_2().px_4().pb_2().children(theme_buttons).into_any_element());
+
+        // --- waveform style ---
+        items.push(section(theme, "Waveform"));
+        let waveform_buttons = WaveformStyle::ALL.iter().map(|style| {
+            let style = *style;
+            choice_button(
+                theme,
+                ("waveform", style as usize),
+                style.label(),
+                waveform == style,
+                cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                    this.config.update(cx, |config, cx| config.set_waveform(style, cx));
+                }),
+            )
+        });
+        items.push(div().flex().gap_2().px_4().pb_2().children(waveform_buttons).into_any_element());
 
         // --- typeface + font size, per container ---
         items.push(section(theme, "Font"));
@@ -215,7 +228,8 @@ impl Render for SettingsView {
                     this.add_path(cx);
                     return;
                 }
-                if this.path.handle_key(event) {
+                let clipboard = cx.read_from_clipboard().and_then(|item| item.text());
+                if this.path.handle_key_with_clipboard(event, clipboard.as_deref()) {
                     cx.notify();
                 }
             }))
@@ -224,19 +238,7 @@ impl Render for SettingsView {
             .flex_col()
             .bg(theme.panel_bg)
             .font_family(theme.font)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_4()
-                    .px_4()
-                    .py_3()
-                    .child(div().text_base().text_color(theme.text).child("Settings"))
-                    .child(
-                        div().text_size(px(theme.small_px())).text_color(theme.text_faint).child("esc"),
-                    ),
-            )
+            .child(panel_header(theme, "Settings", "esc", theme.text_faint))
             .child(
                 div()
                     .id("settings-scroll")
@@ -268,14 +270,15 @@ fn section(theme: Theme, label: &str) -> AnyElement {
         .into_any_element()
 }
 
-fn theme_button(
+fn choice_button(
     theme: Theme,
-    kind: ThemeKind,
+    id: impl Into<gpui::ElementId>,
+    label: &str,
     active: bool,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     div()
-        .id(("theme", kind as usize))
+        .id(id.into())
         .px_3()
         .py_1()
         .rounded_md()
@@ -285,7 +288,7 @@ fn theme_button(
         .when(!active, |d| d.bg(theme.row_active).text_color(theme.text))
         .hover(|d| d.bg(theme.row_hover))
         .on_click(on_click)
-        .child(kind.label())
+        .child(label.to_string())
         .into_any_element()
 }
 

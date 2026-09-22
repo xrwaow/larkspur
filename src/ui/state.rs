@@ -20,6 +20,7 @@ use gpui::Context;
 use crate::analysis::{analyze_track, TrackAnalysis};
 use crate::audio::PlaybackController;
 use crate::model::{InputAction, SongMetadata, SongStatus};
+use crate::ui::animation::SLOW_FPS;
 
 /// How many bars a waveform is reduced to.
 const WAVEFORM_BUCKETS: usize = 240;
@@ -32,10 +33,10 @@ const BITRATE_BUCKET: Duration = Duration::from_secs(1);
 /// smoothing between its updates.
 const MAX_EXTRAPOLATION: Duration = Duration::from_millis(200);
 
-/// Tick interval while audio is playing (≈60 fps progress).
-const PLAYING_TICK: Duration = Duration::from_millis(16);
-/// Tick interval while idle — just fast enough to notice external changes.
-const IDLE_TICK: Duration = Duration::from_millis(250);
+/// How often the state samples the player. Fast enough to notice a track
+/// draining promptly; the *notify* rate is separate — the transport re-renders
+/// on the slow clock ([`SLOW_FPS`]), not every sample.
+const TICK: Duration = Duration::from_millis(100);
 
 /// The current track's waveform peaks + live-bitrate curve, computed off the
 /// UI thread in a single pass when the track changes.
@@ -72,7 +73,9 @@ pub struct PlaybackState {
     /// current one.
     generation: u64,
     /// Last values we rendered, so a tick only notifies on real change.
-    last_position: Duration,
+    /// The position is quantized to the slow clock, so the transport re-renders
+    /// at [`SLOW_FPS`] rather than every sample.
+    last_coarse: i64,
     last_status: SongStatus,
     /// The live bitrate currently shown, refreshed every [`BITRATE_BUCKET`].
     live_bitrate_bps: Option<u32>,
@@ -95,7 +98,7 @@ impl PlaybackState {
             controller,
             analysis: TrackAnalysisState::Loading,
             generation: 0,
-            last_position: Duration::ZERO,
+            last_coarse: -1,
             last_status: status,
             live_bitrate_bps: None,
             last_bitrate_at: Duration::ZERO,
@@ -119,6 +122,26 @@ impl PlaybackState {
 
     pub fn position(&self) -> Duration {
         self.display_position
+    }
+
+    /// The position projected to *this instant*, rather than to the last tick.
+    ///
+    /// [`position`](Self::position) is only refreshed when the ticker runs, so
+    /// it can be up to a tick stale. A consumer on its own clock — the lyrics
+    /// panel timing a scroll to land on a line's timestamp — needs finer
+    /// resolution than that.
+    pub fn live_position(&self) -> Duration {
+        if !self.controller.is_playing() {
+            return self.display_position;
+        }
+        match self.anchor {
+            Some((at, base)) => {
+                let elapsed =
+                    Instant::now().saturating_duration_since(at).min(MAX_EXTRAPOLATION);
+                base + elapsed
+            }
+            None => self.display_position,
+        }
     }
 
     /// The current track's waveform peaks, if the analysis is ready.
@@ -255,8 +278,11 @@ impl PlaybackState {
 
         let position = self.display_position_now();
         self.display_position = position;
-        if position != self.last_position {
-            self.last_position = position;
+        // Report the position only once per slow tick, so a playing track
+        // re-renders the transport at `SLOW_FPS` instead of every sample.
+        let coarse = (position.as_secs_f32() * SLOW_FPS) as i64;
+        if coarse != self.last_coarse {
+            self.last_coarse = coarse;
             changed = true;
         }
 
@@ -285,13 +311,7 @@ impl PlaybackState {
     fn start_ticker(&self, cx: &mut Context<Self>) {
         cx.spawn(async move |this, cx| {
             loop {
-                // Smooth while playing; cheap while idle.
-                let interval = match this.read_with(cx, |state, _| state.is_playing()) {
-                    Ok(true) => PLAYING_TICK,
-                    Ok(false) => IDLE_TICK,
-                    Err(_) => break,
-                };
-                cx.background_executor().timer(interval).await;
+                cx.background_executor().timer(TICK).await;
 
                 if this
                     .update(cx, |state, cx| {
@@ -344,6 +364,7 @@ impl PlaybackState {
         self.analysis = TrackAnalysisState::Loading;
         self.live_bitrate_bps = None;
         self.last_bitrate_at = Duration::ZERO;
+        self.last_coarse = -1;
         self.anchor = None;
         self.display_position = self.controller.position();
 
