@@ -172,6 +172,12 @@ fn default_visualizer() -> bool {
     true
 }
 
+/// The serde default for [`Config::lyrics_fade`] — like the visualizer, the
+/// field postdates the first configs, and an older file should gain the fade.
+fn default_lyrics_fade() -> bool {
+    true
+}
+
 /// Runtime configuration, loaded from and saved to disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -199,6 +205,10 @@ pub struct Config {
     /// Whether the spectrum-bar band above the lyrics is shown.
     #[serde(default = "default_visualizer")]
     pub visualizer: bool,
+    /// Whether the lyrics panel fades its content into the background at the
+    /// top and bottom edges, so lines dissolve rather than being cut off.
+    #[serde(default = "default_lyrics_fade")]
+    pub lyrics_fade: bool,
     /// Where the window was when the app last ran, so it reopens the same
     /// size and position.
     #[serde(default)]
@@ -215,6 +225,7 @@ impl Default for Config {
             roots: Vec::new(),
             waveform: WaveformStyle::default(),
             visualizer: default_visualizer(),
+            lyrics_fade: default_lyrics_fade(),
             window: None,
         }
     }
@@ -456,6 +467,24 @@ mod tests {
         let json = r#"{"theme":"Dark","font_sizes":{},"roots":[]}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.visualizer);
+    }
+
+    #[test]
+    fn lyrics_fade_defaults_on_and_round_trips() {
+        assert!(Config::default().lyrics_fade);
+        let mut config = Config::default();
+        config.lyrics_fade = false;
+        let bytes = serde_json::to_vec(&config).unwrap();
+        let back: Config = serde_json::from_slice(&bytes).unwrap();
+        assert!(!back.lyrics_fade);
+    }
+
+    #[test]
+    fn a_config_without_a_lyrics_fade_field_defaults_to_on() {
+        // An older config predates the `lyrics_fade` field.
+        let json = r#"{"theme":"Dark","font_sizes":{},"roots":[]}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.lyrics_fade);
     }
 
     #[test]

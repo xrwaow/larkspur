@@ -12,6 +12,7 @@ pub mod introspect;
 pub mod layout;
 pub mod library_state;
 pub mod lyrics;
+pub mod marquee;
 pub mod menu;
 pub mod playback;
 pub mod playback_state;

@@ -27,17 +27,18 @@
 use std::time::Duration;
 
 use gpui::{
-    div, prelude::*, px, relative, AnyElement, ClickEvent, Context, Entity, Render, Subscription,
-    Window,
+    div, linear_color_stop, linear_gradient, prelude::*, px, relative, AnyElement, ClickEvent,
+    Context, Entity, Hsla, Render, Subscription, Window,
 };
 
 use crate::model::{LyricLine, Lyrics, SongId};
 use crate::ui::animation::{Animator, Tween};
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
+use crate::ui::marquee::{self, Marquee};
 use crate::ui::playback_state::PlaybackState;
 use crate::ui::theme::Theme;
-use crate::ui::widgets::{blend, empty_hint, panel_header};
+use crate::ui::widgets::{blend, empty_hint};
 
 /// How long the lyric stack takes to slide to a new line — and therefore how
 /// far *before* a line's timestamp the slide starts, so it lands on time.
@@ -46,8 +47,14 @@ const TRANSITION_SECS: f32 = 0.20;
 /// A slide further than this many lines (a seek) snaps instead of scrolling.
 const SNAP_LINES: f32 = 5.0;
 
+/// The header title's column, in characters. The rail is a fixed 240 px (see
+/// `layout::app_layout`), so this is what fits beside the "Lyrics" hint; a
+/// longer title fades and slides on hover.
+const LYRIC_TITLE_CHARS: usize = 16;
+
 pub struct LyricsView {
     state: Entity<PlaybackState>,
+    config: Entity<ConfigState>,
     themed: Themed,
     /// The pixel offset the stack is drawn at while it eases into place.
     offset: Tween,
@@ -59,6 +66,9 @@ pub struct LyricsView {
     /// The track the state above belongs to, so a track change snaps rather than
     /// scrolling from the previous song's position.
     song: SongId,
+    /// The header title's marquee — the same fade/slide/spring-back the list
+    /// rows use.
+    title_marquee: Marquee,
     _observe: Subscription,
     _observe_animator: Subscription,
 }
@@ -75,20 +85,24 @@ impl LyricsView {
             cx.notify();
         });
         let observe_animator = cx.observe(&animator, |this, animator, cx| {
-            let moved = this.offset.tick(animator.read(cx).dt());
+            let dt = animator.read(cx).dt();
+            let moved = this.offset.tick(dt);
+            let marquee = this.title_marquee.tick(dt);
             let changed = this.sync(cx);
-            if moved || changed {
+            if moved || marquee || changed {
                 cx.notify();
             }
         });
         let themed = Themed::new(&config, cx);
         let mut this = Self {
             state,
+            config,
             themed,
             offset: Tween::new(0.0),
             anchor: None,
             position: Duration::ZERO,
             song: 0,
+            title_marquee: Marquee::new(),
             _observe: observe,
             _observe_animator: observe_animator,
         };
@@ -161,18 +175,23 @@ impl Container for LyricsView {
 }
 
 impl Render for LyricsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.themed.theme();
         let offset = self.offset.value();
         let anchor = self.anchor.unwrap_or(0);
         let position = self.position;
         let transition = Duration::from_secs_f32(TRANSITION_SECS);
+        let lyrics_fade = self.config.read(cx).lyrics_fade();
+        let title_advance = marquee::char_advance(window, theme);
+        let title_width = title_advance * LYRIC_TITLE_CHARS as f32;
+        let title_offset = self.title_marquee.offset();
 
         // The body is built against the borrowed lyrics, so nothing is cloned
         // per frame — the click handlers only need `cx` immutably.
         let state = self.state.read(cx);
         let metadata = state.metadata();
         let title = metadata.display_title();
+        let title_travel = marquee::travel_for(&title, title_width, LYRIC_TITLE_CHARS);
 
         let body: AnyElement = match &metadata.lyrics {
             Lyrics::None => empty_hint(theme, "No lyrics for this track.", false),
@@ -271,16 +290,70 @@ impl Render for LyricsView {
             .flex_col()
             .bg(theme.rail_bg)
             .font_family(theme.font)
-            .child(panel_header(
-                theme,
-                &title,
-                theme.cell_px(),
-                None,
-                None,
-                Some(("Lyrics", theme.text_faint)),
-            ))
-            .child(div().flex_1().min_h_0().child(body))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_4()
+                    .px_4()
+                    .py_3()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .child(marquee::marquee_text(
+                                theme,
+                                "lyrics-title",
+                                &title,
+                                title_width,
+                                LYRIC_TITLE_CHARS,
+                                title_offset,
+                                theme.text,
+                                theme.rail_bg,
+                                cx.listener(move |this, hovered: &bool, _window, cx| {
+                                    if this.title_marquee.set_hovered(*hovered, title_travel) {
+                                        cx.notify();
+                                    }
+                                }),
+                            )),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(theme.small_px()))
+                            .text_color(theme.text_faint)
+                            .child("Lyrics"),
+                    ),
+            )
+            .child(
+                div()
+                    .relative()
+                    .flex_1()
+                    .min_h_0()
+                    .child(body)
+                    .when(lyrics_fade, |d| {
+                        d.child(panel_fade(theme, true)).child(panel_fade(theme, false))
+                    }),
+            )
     }
+}
+
+/// A gradient that fades the lyrics panel's content into its background at the
+/// top or bottom edge, so lines dissolve rather than being cut off.
+fn panel_fade(theme: Theme, top: bool) -> AnyElement {
+    let opaque = Hsla::from(theme.rail_bg);
+    let clear = opaque.alpha(0.0);
+    let (from, to) = if top { (opaque, clear) } else { (clear, opaque) };
+    div()
+        .absolute()
+        .left(px(0.0))
+        .right(px(0.0))
+        .h(px(theme.font_size * 2.0))
+        .when(top, |d| d.top(px(0.0)))
+        .when(!top, |d| d.bottom(px(0.0)))
+        .bg(linear_gradient(180.0, linear_color_stop(from, 0.0), linear_color_stop(to, 1.0)))
+        .into_any_element()
 }
 
 /// The line the stack should be laid out around at `position`.

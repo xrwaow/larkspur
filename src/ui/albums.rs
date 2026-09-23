@@ -16,8 +16,8 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use gpui::{
-    div, img, prelude::*, px, AnyElement, App, ClickEvent, Context, ElementId, Entity, MouseButton,
-    MouseDownEvent, ObjectFit, Window,
+    canvas, div, fill, img, point, prelude::*, px, size, AnyElement, App, Bounds, ClickEvent,
+    Context, ElementId, Entity, MouseButton, MouseDownEvent, ObjectFit, Pixels, Rgba, Window,
 };
 
 use crate::model::search::AlbumGroup;
@@ -25,17 +25,44 @@ use crate::model::{Library, PlaylistId, SongId, SongMetadata};
 use crate::ui::cover_store::{CoverImage, CoverStore};
 use crate::ui::format::{format_bitrate, format_duration};
 use crate::ui::library_state::LibraryState;
+use crate::ui::marquee;
+use crate::ui::row_list::{Cell, Highlight};
 use crate::ui::theme::Theme;
 use crate::ui::widgets::blend;
 
 /// Cover thumbnail size in an album header.
 pub const THUMB_PX: f32 = 64.0;
 
-/// Cover thumbnail size in a compressed one-track section.
-const THUMB_SMALL_PX: f32 = 40.0;
+/// The most characters a title column shows before its text fades and slides.
+pub const MAX_TITLE_CHARS: usize = 48;
 
-const MIN_TITLE_CHARS: usize = 8;
-const MAX_TITLE_CHARS: usize = 70;
+/// The most characters an artist column shows before its text fades and slides.
+pub const MAX_ARTIST_CHARS: usize = 48;
+
+/// The fixed title/artist column widths, in px.
+///
+/// Both are sized to a maximum character count rather than to the longest
+/// string in a section, so every playlist lays its columns out identically and
+/// songs line up across tabs. Text longer than its column fades at the edge and
+/// slides on hover (see [`marquee::marquee_text`]).
+#[derive(Clone, Copy, Debug)]
+pub struct Columns {
+    pub title: f32,
+    pub artist: f32,
+}
+
+impl Columns {
+    /// Measure the columns for `theme`'s font. The font is monospace, so one
+    /// character's advance times the max count gives the width without shaping
+    /// every title.
+    pub fn measure(window: &Window, theme: Theme) -> Self {
+        let advance = marquee::char_advance(window, theme);
+        Self {
+            title: advance * MAX_TITLE_CHARS as f32,
+            artist: advance * MAX_ARTIST_CHARS as f32,
+        }
+    }
+}
 
 /// One track row, snapshotted out of the library.
 pub struct TrackRow {
@@ -385,6 +412,17 @@ pub trait RowActions<V: Render>: 'static {
 
     /// A row's hover state changed.
     fn hover(&self, view: &mut V, item_ix: usize, hovered: bool, cx: &mut Context<V>);
+
+    /// A row's title or artist cell hover state changed, so its marquee slides
+    /// on its own.
+    fn cell_hover(
+        &self,
+        view: &mut V,
+        item_ix: usize,
+        cell: Cell,
+        hovered: bool,
+        cx: &mut Context<V>,
+    );
 }
 
 /// The read-only backdrop every row renderer shares: where a row's looks
@@ -396,21 +434,34 @@ pub struct RowContext<'a> {
     pub library: &'a Entity<LibraryState>,
     /// The currently-playing song, if it is one.
     pub current: SongId,
+    /// Whether audio is actually playing, so the playing row's equalizer only
+    /// animates while it should.
+    pub playing: bool,
+    /// The shared clock's elapsed seconds, driving the equalizer's motion.
+    pub eq_phase: f32,
     /// The playing song's live bitrate — shown on its row instead of the
     /// declared one.
     pub live_bitrate: Option<u32>,
     /// The playlist the row's menu offers as a destination (the open one).
     pub context: Option<PlaylistId>,
-    pub highlight: &'a crate::ui::row_list::Highlight,
+    pub highlight: &'a Highlight,
 }
 
 /// How one row paints: the colours that make up its background and the
 /// bitrate cell's contents.
 struct RowPaint {
     theme: Theme,
+    /// This row is the current track.
     playing: bool,
+    /// Audio is actually playing (the equalizer animates only then).
+    audio_playing: bool,
+    eq_phase: f32,
     selection: Option<f32>,
     hover: Option<f32>,
+    /// The title cell's marquee offset, in px.
+    title_offset: f32,
+    /// The artist cell's marquee offset, in px — each slides on its own hover.
+    artist_offset: f32,
     bitrate: Option<u32>,
 }
 
@@ -423,7 +474,7 @@ pub fn render_item<V: Render + 'static>(
     ix: usize,
     sections: &[AlbumSection],
     items: &[ListItem],
-    title_cols: &[f32],
+    columns: &Columns,
     actions: Option<&Rc<dyn RowActions<V>>>,
     cx: &mut Context<V>,
 ) -> AnyElement {
@@ -434,8 +485,12 @@ pub fn render_item<V: Render + 'static>(
     let paint = RowPaint {
         theme: context.theme,
         playing: false,
+        audio_playing: context.playing,
+        eq_phase: context.eq_phase,
         selection: context.highlight.selection(ix),
         hover: context.highlight.hover(ix),
+        title_offset: 0.0,
+        artist_offset: 0.0,
         bitrate: None,
     };
 
@@ -454,6 +509,22 @@ pub fn render_item<V: Render + 'static>(
             let paint = RowPaint {
                 playing,
                 bitrate: row_bitrate(playing, track.nominal_bitrate, context.live_bitrate),
+                title_offset: cell_offset(
+                    context.highlight,
+                    ix,
+                    Cell::Title,
+                    &track.title,
+                    columns.title,
+                    MAX_TITLE_CHARS,
+                ),
+                artist_offset: cell_offset(
+                    context.highlight,
+                    ix,
+                    Cell::Artist,
+                    &track.artist,
+                    columns.artist,
+                    MAX_ARTIST_CHARS,
+                ),
                 ..paint
             };
             let actions = actions.expect("a compact row is interactive");
@@ -475,7 +546,30 @@ pub fn render_item<V: Render + 'static>(
                     actions.hover(view, ix, *hovered, cx)
                 })
             };
-            compact_row(&paint, track, &section.year, cover, on_click, on_right_click, on_hover)
+            let on_title_hover = {
+                let actions = actions.clone();
+                cx.listener(move |view, hovered: &bool, _window, cx| {
+                    actions.cell_hover(view, ix, Cell::Title, *hovered, cx)
+                })
+            };
+            let on_artist_hover = {
+                let actions = actions.clone();
+                cx.listener(move |view, hovered: &bool, _window, cx| {
+                    actions.cell_hover(view, ix, Cell::Artist, *hovered, cx)
+                })
+            };
+            compact_row(
+                &paint,
+                track,
+                &section.year,
+                columns,
+                cover,
+                on_click,
+                on_right_click,
+                on_hover,
+                on_title_hover,
+                on_artist_hover,
+            )
         }
         ListItem::Track { index, .. } => {
             let track = &section.tracks[index];
@@ -484,9 +578,24 @@ pub fn render_item<V: Render + 'static>(
             let paint = RowPaint {
                 playing,
                 bitrate: row_bitrate(playing, track.nominal_bitrate, context.live_bitrate),
+                title_offset: cell_offset(
+                    context.highlight,
+                    ix,
+                    Cell::Title,
+                    &track.title,
+                    columns.title,
+                    MAX_TITLE_CHARS,
+                ),
+                artist_offset: cell_offset(
+                    context.highlight,
+                    ix,
+                    Cell::Artist,
+                    &track.artist,
+                    columns.artist,
+                    MAX_ARTIST_CHARS,
+                ),
                 ..paint
             };
-            let title_col = title_cols.get(item.section()).copied().unwrap_or(0.0);
             let actions = actions.expect("a track row is interactive");
             let on_click = {
                 let actions = actions.clone();
@@ -506,7 +615,29 @@ pub fn render_item<V: Render + 'static>(
                     actions.hover(view, ix, *hovered, cx)
                 })
             };
-            track_row(&paint, track, index, title_col, on_click, on_right_click, on_hover)
+            let on_title_hover = {
+                let actions = actions.clone();
+                cx.listener(move |view, hovered: &bool, _window, cx| {
+                    actions.cell_hover(view, ix, Cell::Title, *hovered, cx)
+                })
+            };
+            let on_artist_hover = {
+                let actions = actions.clone();
+                cx.listener(move |view, hovered: &bool, _window, cx| {
+                    actions.cell_hover(view, ix, Cell::Artist, *hovered, cx)
+                })
+            };
+            track_row(
+                &paint,
+                track,
+                index,
+                columns,
+                on_click,
+                on_right_click,
+                on_hover,
+                on_title_hover,
+                on_artist_hover,
+            )
         }
     }
 }
@@ -527,29 +658,6 @@ fn request_cover<V: Render + 'static>(
     if let Some((path, has_art)) = found {
         covers.update(cx, |store, cx| store.request(song, path, has_art, cx));
     }
-}
-
-/// Width of the title column: the longest title in the section, in pixels.
-///
-/// The font is monospace, so measuring one character's advance and multiplying
-/// by the character count gives the column width without shaping every title.
-/// This is what keeps the artist name starting at the same x on every row.
-pub fn title_column_width(window: &Window, theme: Theme, tracks: &[TrackRow]) -> f32 {
-    let text_system = window.text_system();
-    let font_id = text_system.resolve_font(&gpui::font(theme.font));
-    let advance = text_system
-        .ch_advance(font_id, px(theme.cell_px()))
-        .map(f32::from)
-        .unwrap_or(theme.cell_px() * 0.6);
-
-    let chars = tracks
-        .iter()
-        .map(|track| track.title.chars().count())
-        .max()
-        .unwrap_or(MIN_TITLE_CHARS)
-        .clamp(MIN_TITLE_CHARS, MAX_TITLE_CHARS);
-
-    chars as f32 * advance
 }
 
 /// An album's header: thumbnail, artist, title with the year right-aligned on
@@ -611,17 +719,23 @@ pub fn album_header(theme: Theme, section: &AlbumSection, cover: Option<CoverIma
 }
 
 /// A one-track section, compressed into a single row with its cover on the
-/// left instead of a header plus one line.
+/// left instead of a header plus one line. The cover is sized to the number
+/// column, so the song name starts at the same x as a playlist row's.
+#[allow(clippy::too_many_arguments)]
 fn compact_row(
     paint: &RowPaint,
     track: &TrackRow,
     year: &str,
+    columns: &Columns,
     cover: Option<CoverImage>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_right_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
+    on_title_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
+    on_artist_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     let theme = paint.theme;
+    let background = row_background(theme, paint.playing, paint.selection, paint.hover, 0);
     div()
         .id(("album-single", track.song))
         .w_full()
@@ -631,35 +745,55 @@ fn compact_row(
         .px_4()
         .py_2()
         .cursor_pointer()
-        .bg(row_background(theme, paint.playing, paint.selection, paint.hover, 0))
+        .bg(background)
         .on_hover(on_hover)
         .on_click(on_click)
         .on_mouse_down(MouseButton::Right, on_right_click)
-        .child(thumbnail(theme, cover, THUMB_SMALL_PX))
-        .child(title_and_artist(theme, track, paint.playing, true))
+        .child(thumbnail(theme, cover, theme.num_col()))
+        .child(title_cell(
+            theme,
+            track,
+            paint.playing,
+            columns,
+            paint.title_offset,
+            background,
+            on_title_hover,
+        ))
+        .child(artist_cell(
+            theme,
+            track,
+            columns,
+            paint.artist_offset,
+            background,
+            on_artist_hover,
+        ))
+        // Fill the gap so the numeric columns stay right-aligned.
+        .child(div().flex_1().min_w_0())
         .child(year_cell(theme, year))
         .child(bitrate_cell(theme, paint.bitrate))
         .child(duration_cell(theme, track))
         .into_any_element()
 }
 
-/// One track row: number, title, artist, bitrate, duration. The playing row
-/// is drawn in the accent colour.
+/// One track row: number (or the playing row's equalizer), title, artist,
+/// bitrate, duration. The playing row is drawn in the accent colour.
+#[allow(clippy::too_many_arguments)]
 fn track_row(
     paint: &RowPaint,
     track: &TrackRow,
     index: usize,
-    title_col: f32,
+    columns: &Columns,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_right_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
+    on_title_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
+    on_artist_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     let id: ElementId = ("album-track", track.song).into();
     let theme = paint.theme;
     let playing = paint.playing;
+    let background = row_background(theme, playing, paint.selection, paint.hover, index);
 
-    // A fixed title column, so the artist starts at the same x on every row
-    // of this album.
     div()
         .id(id)
         .w_full()
@@ -669,30 +803,34 @@ fn track_row(
         .px_4()
         .py_1()
         .cursor_pointer()
-        .bg(row_background(theme, playing, paint.selection, paint.hover, index))
+        .bg(background)
         .on_hover(on_hover)
-        .hover(|d| d.bg(theme.row_hover))
         .on_click(on_click)
         .on_mouse_down(MouseButton::Right, on_right_click)
-        .child(
-            div()
-                .w(px(theme.num_col()))
-                .flex_none()
-                .text_right()
-                .text_size(px(theme.small_px()))
-                .text_color(theme.text_faint)
-                .child(format!("{:02}.", track.number)),
-        )
-        .child(
-            div()
-                .w(px(title_col))
-                .flex_none()
-                .truncate()
-                .text_size(px(theme.cell_px()))
-                .text_color(if playing { theme.accent } else { theme.text })
-                .child(track.title.clone()),
-        )
-        .child(title_and_artist(theme, track, playing, false))
+        .child(if playing {
+            eq_icon(theme, paint.eq_phase, paint.audio_playing)
+        } else {
+            number_cell(theme, track.number)
+        })
+        .child(title_cell(
+            theme,
+            track,
+            playing,
+            columns,
+            paint.title_offset,
+            background,
+            on_title_hover,
+        ))
+        .child(artist_cell(
+            theme,
+            track,
+            columns,
+            paint.artist_offset,
+            background,
+            on_artist_hover,
+        ))
+        // Fill the gap so the numeric columns stay right-aligned.
+        .child(div().flex_1().min_w_0())
         // Always reserve the action column, so rows keep identical children and
         // the numeric columns stay put.
         .child(div().w(px(theme.action_col())).flex_none())
@@ -701,32 +839,143 @@ fn track_row(
         .into_any_element()
 }
 
-/// The artist cell. In a compressed row the title rides along with it (there's
-/// no separate column), otherwise the title is already drawn separately.
-fn title_and_artist(
+/// The marquee offset to draw a cell's text at: the in-flight slide if there is
+/// one, else fully slid when the cell is hovered, else at rest.
+fn cell_offset(
+    highlight: &Highlight,
+    ix: usize,
+    cell: Cell,
+    text: &str,
+    width: f32,
+    max_chars: usize,
+) -> f32 {
+    match highlight.marquee_offset(ix, cell) {
+        Some(offset) => offset,
+        None if highlight.cell_hovered(ix, cell) => -marquee::travel_for(text, width, max_chars),
+        None => 0.0,
+    }
+}
+
+/// The title cell: a fixed column that fades and slides when it overflows.
+#[allow(clippy::too_many_arguments)]
+fn title_cell(
     theme: Theme,
     track: &TrackRow,
     playing: bool,
-    include_title: bool,
+    columns: &Columns,
+    offset: f32,
+    background: Rgba,
+    on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    let mut cell = div().flex_1().min_w_0().flex().items_center().gap_2();
-    if include_title {
-        cell = cell.child(
-            div()
-                .truncate()
-                .text_size(px(theme.cell_px()))
-                .text_color(if playing { theme.accent } else { theme.text })
-                .child(track.title.clone()),
-        );
-    }
-    cell.child(
-        div()
-            .truncate()
-            .text_size(px(theme.cell_px()))
-            .text_color(theme.text_muted)
-            .child(track.artist.clone()),
+    marquee::marquee_text(
+        theme,
+        ("row-title", track.song),
+        &track.title,
+        columns.title,
+        MAX_TITLE_CHARS,
+        offset,
+        if playing { theme.accent } else { theme.text },
+        background,
+        on_hover,
     )
-    .into_any_element()
+}
+
+/// The artist cell: a fixed column that fades and slides when it overflows.
+fn artist_cell(
+    theme: Theme,
+    track: &TrackRow,
+    columns: &Columns,
+    offset: f32,
+    background: Rgba,
+    on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    marquee::marquee_text(
+        theme,
+        ("row-artist", track.song),
+        &track.artist,
+        columns.artist,
+        MAX_ARTIST_CHARS,
+        offset,
+        theme.text_muted,
+        background,
+        on_hover,
+    )
+}
+
+/// The track-number cell, right-aligned in the number column.
+fn number_cell(theme: Theme, number: usize) -> AnyElement {
+    div()
+        .w(px(theme.num_col()))
+        .flex_none()
+        .text_right()
+        .text_size(px(theme.small_px()))
+        .text_color(theme.text_faint)
+        .child(format!("{number:02}."))
+        .into_any_element()
+}
+
+/// How many bars the equalizer draws.
+const EQ_BARS: usize = 3;
+
+/// Width of one equalizer bar, and the gap between them, in px.
+const EQ_BAR_PX: f32 = 2.0;
+const EQ_GAP_PX: f32 = 2.0;
+
+/// The playing row's equalizer: a few small bars in the accent colour, dancing
+/// while the track plays and resting when it's paused. It takes the number
+/// column's place, so the row still lines up.
+fn eq_icon(theme: Theme, phase: f32, playing: bool) -> AnyElement {
+    let height = theme.font_size * 0.95;
+    let levels = eq_levels(phase, playing);
+    let width = EQ_BARS as f32 * EQ_BAR_PX + (EQ_BARS - 1) as f32 * EQ_GAP_PX;
+    div()
+        .w(px(theme.num_col()))
+        .flex_none()
+        .h(px(height))
+        .flex()
+        .justify_end()
+        .child(
+            canvas(
+                |_bounds, _window, _cx| (),
+                move |bounds, _prepaint, window, _cx| {
+                    paint_eq(window, bounds, &levels, theme.accent);
+                },
+            )
+            .w(px(width))
+            .h_full(),
+        )
+        .into_any_element()
+}
+
+/// The bar heights (0..1) at `phase` seconds. Each bar runs at its own speed
+/// and offset so the three never move in lockstep; a paused track rests at a
+/// short, even profile.
+fn eq_levels(phase: f32, playing: bool) -> [f32; EQ_BARS] {
+    if !playing {
+        return [0.30, 0.55, 0.40];
+    }
+    let mut levels = [0.0; EQ_BARS];
+    for (i, level) in levels.iter_mut().enumerate() {
+        let speed = 5.0 + i as f32 * 1.7;
+        let offset = i as f32 * 1.9;
+        let wave = (phase * speed + offset).sin().abs();
+        *level = 0.22 + 0.78 * wave;
+    }
+    levels
+}
+
+/// Paint the equalizer's bars, bottom-aligned in `bounds`.
+fn paint_eq(window: &mut Window, bounds: Bounds<Pixels>, levels: &[f32; EQ_BARS], color: Rgba) {
+    let height = f32::from(bounds.size.height);
+    let origin_x = f32::from(bounds.origin.x);
+    let origin_y = f32::from(bounds.origin.y);
+    for (i, level) in levels.iter().enumerate() {
+        let bar_height = (level * height).max(2.0);
+        let x = origin_x + i as f32 * (EQ_BAR_PX + EQ_GAP_PX);
+        let y = origin_y + (height - bar_height);
+        let bar = Bounds::new(point(px(x), px(y)), size(px(EQ_BAR_PX), px(bar_height)));
+        window.paint_quad(fill(bar, color));
+    }
 }
 
 /// The row background: playing wins, then the selection crossfade, then the

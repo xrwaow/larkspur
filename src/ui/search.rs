@@ -68,7 +68,7 @@ impl SearchView {
             Themed::with_container(BrowseView::container_id(), BrowseView::default_font_size(), &config, cx);
         Self {
             themed,
-            list: AlbumListView::new(library, playback, covers, Play::Result),
+            list: AlbumListView::new(library, playback, covers, animator, Play::Result),
             input: TextField::default(),
             query: Query::default(),
             submitted: String::new(),

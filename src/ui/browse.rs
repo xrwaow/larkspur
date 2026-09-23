@@ -48,7 +48,7 @@ impl BrowseView {
         let themed = Themed::new(&config, cx);
         Self {
             themed,
-            list: AlbumListView::new(library, playback, covers, Play::Playlist),
+            list: AlbumListView::new(library, playback, covers, animator, Play::Playlist),
             source: Source::Library,
             scope_title: None,
             focus_handle: cx.focus_handle(),

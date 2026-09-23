@@ -24,7 +24,7 @@ use crate::ui::input::action_for_key;
 use crate::ui::library_state::LibraryState;
 use crate::ui::menu::SongMenuRequest;
 use crate::ui::playback_state::PlaybackState;
-use crate::ui::row_list::{RowAction, RowList};
+use crate::ui::row_list::{Cell, RowAction, RowList};
 use crate::ui::theme::Theme;
 use crate::ui::widgets::{scroll_area, wheel_pixels};
 
@@ -76,6 +76,8 @@ pub struct AlbumListView {
     library: Entity<LibraryState>,
     playback: Entity<PlaybackState>,
     covers: Entity<CoverStore>,
+    /// The shared frame clock, read for the playing row's equalizer phase.
+    animator: Entity<Animator>,
     play: Play,
     rows: RowList,
     /// The library revision the rows were last built from, so a highlight-only
@@ -88,9 +90,10 @@ impl AlbumListView {
         library: Entity<LibraryState>,
         playback: Entity<PlaybackState>,
         covers: Entity<CoverStore>,
+        animator: Entity<Animator>,
         play: Play,
     ) -> Self {
-        Self { library, playback, covers, play, rows: RowList::new(), seen_revision: 0 }
+        Self { library, playback, covers, animator, play, rows: RowList::new(), seen_revision: 0 }
     }
 
     pub fn library(&self) -> &Entity<LibraryState> {
@@ -211,6 +214,19 @@ impl<V: AlbumList> RowActions<V> for Rows {
             cx.notify();
         }
     }
+
+    fn cell_hover(
+        &self,
+        view: &mut V,
+        item_ix: usize,
+        cell: Cell,
+        hovered: bool,
+        cx: &mut Context<V>,
+    ) {
+        if view.list_mut().rows.set_cell_hover(item_ix, cell, hovered) {
+            cx.notify();
+        }
+    }
 }
 
 /// The subscriptions an album list subs to: library revisions rebuild the
@@ -241,7 +257,11 @@ pub fn observe<V: AlbumList>(
     let _playback = playback.map(|playback| cx.observe(playback, |_this, _state, cx| cx.notify()));
     let _covers = cx.observe(covers, |_this, _state, cx| cx.notify());
     let _animator = cx.observe(animator, |this, animator, cx| {
-        if this.list_mut().rows.tick(animator.read(cx).dt()) {
+        let dt = animator.read(cx).dt();
+        let moved = this.list_mut().rows.tick(dt);
+        // Keep the playing row's equalizer moving even when nothing else is.
+        let playing = this.list().playback().read(cx).is_playing();
+        if moved || playing {
             cx.notify();
         }
     });
@@ -259,10 +279,12 @@ pub fn render_rows<V: AlbumList>(
 ) -> gpui::AnyElement {
     let list = view.list();
     let current = list.playback.read(cx).metadata().id;
+    let playing = list.playback.read(cx).is_playing();
     let live_bitrate = list.playback.read(cx).live_bitrate();
     let sections = list.rows.sections();
     let items = list.rows.items();
-    let title_cols = list.rows.title_cols();
+    let columns = list.rows.columns();
+    let eq_phase = list.animator.read(cx).elapsed();
     let list_state = list.rows.list_state().clone();
     let highlight = list.rows.highlight();
     let covers = list.covers.clone();
@@ -275,11 +297,13 @@ pub fn render_rows<V: AlbumList>(
             covers: &covers,
             library: &library,
             current,
+            playing,
+            eq_phase,
             live_bitrate,
             context,
             highlight: &highlight,
         };
-        albums::render_item(&row, ix, &sections, &items, &title_cols, Some(&actions), cx)
+        albums::render_item(&row, ix, &sections, &items, &columns, Some(&actions), cx)
     });
     scroll_area(
         gpui::list(list_state, render).size_full().into_any_element(),

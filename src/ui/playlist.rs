@@ -80,7 +80,7 @@ impl PlaylistView {
         let is_custom = is_custom(&library, playlist, cx);
         Self {
             themed,
-            list: AlbumListView::new(library, playback, covers, Play::Playlist),
+            list: AlbumListView::new(library, playback, covers, animator, Play::Playlist),
             playlist,
             is_custom,
             add_query: TextField::default(),
@@ -202,7 +202,7 @@ impl Render for PlaylistView {
         if section.tracks.is_empty() {
             // No rows to virtualize: draw the header and the hint directly.
             let items = self.list.rows().items();
-            let title_cols = self.list.rows().title_cols();
+            let columns = self.list.rows().columns();
             let highlight = self.list.rows().highlight();
             let actions: Option<Rc<dyn RowActions<Self>>> = None;
             let row = albums::RowContext {
@@ -210,11 +210,14 @@ impl Render for PlaylistView {
                 covers: self.list.covers(),
                 library: self.list.library(),
                 current: self.list.playback().read(cx).metadata().id,
+                playing: self.list.playback().read(cx).is_playing(),
+                eq_phase: 0.0,
                 live_bitrate: self.list.playback().read(cx).live_bitrate(),
                 context: Some(playlist),
                 highlight: &highlight,
             };
-            let header = albums::render_item(&row, 0, &sections, &items, &title_cols, actions.as_ref(), cx);
+            let header =
+                albums::render_item(&row, 0, &sections, &items, &columns, actions.as_ref(), cx);
             root = root.child(
                 div()
                     .flex_1()
