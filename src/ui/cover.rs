@@ -6,7 +6,7 @@ use gpui::{
 use crate::model::{SongId, ThemeKind};
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
-use crate::ui::cover_store::{CoverImage, CoverStore};
+use crate::ui::cover_store::{CoverStore, FullCover};
 use crate::ui::playback_state::PlaybackState;
 
 /// The now-playing cover square.
@@ -89,7 +89,7 @@ impl CoverView {
         if id == 0 || path.as_os_str().is_empty() {
             return;
         }
-        self.covers.update(cx, |store, cx| store.request(id, path, has_art, cx));
+        self.covers.update(cx, |store, cx| store.request_full(id, path, has_art, cx));
     }
 
     /// Push the current cover's accent into the config, if the dynamic theme is
@@ -123,16 +123,16 @@ impl Render for CoverView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.themed.theme();
         let id = self.state.read(cx).metadata().id;
-        let cover = self.covers.read(cx).cover(id);
+        let cover = self.covers.read(cx).full(id);
 
         let art: AnyElement = match cover {
-            Some(CoverImage::Ready(image)) => img(image)
+            Some(FullCover::Ready(image)) => img(image)
                 .size_full()
                 .object_fit(ObjectFit::Cover)
                 .into_any_element(),
-            Some(CoverImage::Loading) => placeholder(theme, "Loading…"),
+            Some(FullCover::Loading) => placeholder(theme, "Loading…"),
             // Nothing playing, no art, or no art on this file.
-            Some(CoverImage::Missing) | None => placeholder(theme, "♪"),
+            Some(FullCover::Missing) | None => placeholder(theme, "♪"),
         };
 
         div()

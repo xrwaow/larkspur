@@ -5,10 +5,17 @@
 //! into this entity, so a library of covers populates progressively instead of
 //! blocking the first frame.
 //!
-//! Two tiers, as the model's [`CoverCache`] describes them: decoded pixels are
-//! downscaled once and held in a byte-budgeted LRU, and each downscaled image
-//! is written to `~/.cache/larkspur/covers/<id>.jpg` so a later launch skips
-//! re-decoding embedded art entirely.
+//! Two tiers, as the model's [`CoverCache`] describes them. A larger (Lanczos3)
+//! **master** is written to `~/.cache/larkspur/covers-v2/<id>.jpg` so a later
+//! launch skips decoding the file's embedded art, and each launch derives its
+//! on-screen variants from that master at the window's physical pixel sizes, so
+//! each is drawn at roughly 1:1 instead of being shrunk by the GPU from a single
+//! oversized image.
+//!
+//! The two variants are cached separately, because their sizes differ by orders
+//! of magnitude. The small **thumbnails** are the bulk of the entries and sit in
+//! the model's byte-budgeted LRU; the large **full** now-playing cover is kept
+//! only for the current track (and a couple of recent ones), in a tiny slot.
 //!
 //! The store also derives each cover's **dominant colour** at decode time (it
 //! already has the pixels in hand, off-thread) and exposes it via
@@ -16,21 +23,60 @@
 //! no view has to analyse an image itself.
 
 use std::collections::{HashMap, HashSet};
+use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use gpui::{Context, Hsla, RenderImage, Rgba};
+use image::codecs::jpeg::JpegEncoder;
+use image::imageops::FilterType;
+use image::DynamicImage;
 use lofty::file::TaggedFileExt;
 use lofty::probe::Probe;
 
 use crate::model::{CoverCache, DecodedImage, SongId};
+use crate::ui::albums::THUMB_PX;
+use crate::ui::cover::CoverView;
 
-/// The largest edge a cached cover is downscaled to. Covers are decoded at
-/// multi-megapixel sizes; the UI never needs more than a few hundred pixels.
-const MAX_COVER_PX: u32 = 300;
+/// The largest edge kept in the disk-tier master. Big enough to derive the
+/// now-playing square at any display scale from, without upscaling before the
+/// GPU draws it. Fixed rather than scale-derived: the master is written once and
+/// shared across launches, so it must not bake in one display's assumptions.
+/// `shrink` never upsizes, so small embedded art stays untouched.
+const MASTER_PX: u32 = 1024;
 
-/// Byte budget for decoded covers held in memory (~180 covers at 300²).
+/// JPEG quality for the disk-tier master. Covers are re-encoded here, so this
+/// is the only lossy step; keep it high enough that it never shows.
+const MASTER_QUALITY: u8 = 92;
+
+/// Byte budget for decoded **thumbnails** held in memory. Thumbs are tiny
+/// (~20 KB at 2x), so this holds thousands of them — the browse grid's working
+/// set. The full now-playing cover is not in here; it lives in a tiny slot.
 const COVER_MEMORY_BUDGET: usize = 64 * 1024 * 1024;
+
+/// How many full-size now-playing covers to keep, so skipping back a track or
+/// two is instant. Deliberately small: these are the only large images held.
+const FULL_SLOTS: usize = 2;
+
+/// The physical-pixel sizes to derive for one cover, resolved once from the
+/// window's scale factor so each variant is drawn at roughly 1:1.
+#[derive(Clone, Copy)]
+struct Sizes {
+    /// The now-playing square's long edge.
+    full: u32,
+    /// The browse thumbnail's (square) edge.
+    thumb: u32,
+}
+
+impl Sizes {
+    /// Resolve logical sizes to physical pixels for a display `scale`.
+    fn for_scale(scale: f32) -> Self {
+        Self {
+            full: (CoverView::SIZE * scale).round().max(1.0) as u32,
+            thumb: (THUMB_PX * scale).round().max(1.0) as u32,
+        }
+    }
+}
 
 /// What the UI can draw for a song's cover right now.
 #[derive(Clone)]
@@ -43,37 +89,69 @@ pub enum CoverImage {
     Missing,
 }
 
+/// The now-playing cover — the **full** variant, derived only for the track
+/// that's on screen rather than kept for the whole library.
+#[derive(Clone)]
+pub enum FullCover {
+    /// Requested; the decode is in flight.
+    Loading,
+    /// Decoded and GPU-ready — hand it straight to `img()`.
+    Ready(Arc<RenderImage>),
+    /// The file has no embedded art.
+    Missing,
+}
+
 pub struct CoverStore {
+    /// Byte-budgeted LRU of the small browse **thumbnails**, the bulk of the
+    /// entries. Mirrored by `images`.
     cache: CoverCache<RenderImage>,
-    /// What the UI can draw, keyed by song. `Ready` entries mirror the cache's
-    /// contents; the `Loading`/`Missing` markers carry no pixels and are tiny.
+    /// The physical sizes every cover is derived at, fixed for this window.
+    sizes: Sizes,
+    /// What the UI can draw for a thumbnail, keyed by song. `Ready` entries
+    /// mirror the cache's contents; the `Loading`/`Missing` markers carry no
+    /// pixels and are tiny.
     images: HashMap<SongId, CoverImage>,
+    /// The full now-playing covers, most-recent first, capped at [`FULL_SLOTS`].
+    /// Only tracks just shown live here; a small `Vec` beats an LRU for the
+    /// read-only borrow `full` needs.
+    fulls: Vec<(SongId, FullCover)>,
     /// Each decoded cover's dominant colour, for the dynamic theme. Tiny, and
     /// kept even after the pixels are evicted.
     accents: HashMap<SongId, Rgba>,
-    /// Ids with a decode in flight, so a second ask doesn't spawn a second one.
+    /// Ids with a thumbnail decode in flight, so a second ask doesn't spawn a
+    /// second one.
     in_flight: HashSet<SongId>,
+    /// Ids with a full-cover decode in flight, separately deduped.
+    full_in_flight: HashSet<SongId>,
 }
 
 impl CoverStore {
-    pub fn new(disk_dir: PathBuf, cx: &mut Context<Self>) -> Self {
+    pub fn new(disk_dir: PathBuf, scale: f32, cx: &mut Context<Self>) -> Self {
         let _ = cx;
         Self {
             cache: CoverCache::new(disk_dir, COVER_MEMORY_BUDGET),
+            sizes: Sizes::for_scale(scale),
             images: HashMap::new(),
+            fulls: Vec::new(),
             accents: HashMap::new(),
             in_flight: HashSet::new(),
+            full_in_flight: HashSet::new(),
         }
     }
 
-    /// The cover for `id`, if anything is known about it yet.
+    /// The thumbnail for `id`, if anything is known about it yet.
     pub fn cover(&self, id: SongId) -> Option<CoverImage> {
         self.images.get(&id).cloned()
     }
 
-    /// The cover for an optional song id — `None` in, `None` out.
+    /// The thumbnail for an optional song id — `None` in, `None` out.
     pub fn cover_of(&self, id: Option<SongId>) -> Option<CoverImage> {
         id.and_then(|id| self.cover(id))
+    }
+
+    /// The full now-playing cover for `id`, if it's one of the recent tracks.
+    pub fn full(&self, id: SongId) -> Option<FullCover> {
+        self.fulls.iter().find(|(song, _)| *song == id).map(|(_, cover)| cover.clone())
     }
 
     /// A cover's dominant colour, once it's been decoded — the dynamic theme's
@@ -82,7 +160,8 @@ impl CoverStore {
         self.accents.get(&id).copied()
     }
 
-    /// Ask for `id`'s cover, decoding it off-thread the first time.
+    /// Ask for `id`'s **thumbnail**, decoding it off-thread the first time. This
+    /// is what the browse rows request for every song.
     ///
     /// `has_art` is the song's declared availability, so a song with no
     /// embedded picture is recorded as [`CoverImage::Missing`] without ever
@@ -106,10 +185,11 @@ impl CoverStore {
         self.in_flight.insert(id);
 
         let disk_path = self.cache.disk_path(id);
+        let sizes = self.sizes;
         cx.spawn(async move |this, cx| {
             let decoded = cx
                 .background_executor()
-                .spawn(async move { load_cover(&path, &disk_path) })
+                .spawn(async move { load_thumb(&path, &disk_path, sizes) })
                 .await;
 
             this.update(cx, |store, cx| {
@@ -127,8 +207,49 @@ impl CoverStore {
         .detach();
     }
 
-    /// Put a decoded image in the byte-budgeted cache and mirror the result —
-    /// including any evictions — into the UI map, so the two never diverge.
+    /// Ask for `id`'s **full** now-playing cover, deriving it from the disk
+    /// master off-thread. Only the tracks currently on screen need this, so it
+    /// lives in a tiny slot rather than the byte budget.
+    pub fn request_full(&mut self, id: SongId, path: PathBuf, has_art: bool, cx: &mut Context<Self>) {
+        if self.full(id).is_some() || self.full_in_flight.contains(&id) {
+            return;
+        }
+        if !has_art {
+            self.record_full(id, FullCover::Missing);
+            return;
+        }
+
+        self.record_full(id, FullCover::Loading);
+        self.full_in_flight.insert(id);
+
+        let disk_path = self.cache.disk_path(id);
+        let sizes = self.sizes;
+        cx.spawn(async move |this, cx| {
+            let decoded = cx
+                .background_executor()
+                .spawn(async move { load_full(&path, &disk_path, sizes) })
+                .await;
+
+            this.update(cx, |store, cx| {
+                store.full_in_flight.remove(&id);
+                match decoded {
+                    Some((image, accent)) => {
+                        if let Some(accent) = accent {
+                            store.accents.insert(id, accent);
+                        }
+                        store.record_full(id, FullCover::Ready(image));
+                    }
+                    None => store.record_full(id, FullCover::Missing),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Put a decoded thumbnail in the byte-budgeted cache and mirror the result
+    /// — including any evictions — into the UI map, so the two never diverge.
     fn keep(&mut self, id: SongId, image: Arc<RenderImage>, accent: Option<Rgba>) {
         if let Some(accent) = accent {
             self.accents.insert(id, accent);
@@ -145,6 +266,14 @@ impl CoverStore {
         } else {
             self.images.remove(&id);
         }
+    }
+
+    /// Record a full cover in the recent-tracks slot list, most-recent first,
+    /// evicting beyond [`FULL_SLOTS`].
+    fn record_full(&mut self, id: SongId, cover: FullCover) {
+        self.fulls.retain(|(song, _)| *song != id);
+        self.fulls.insert(0, (id, cover));
+        self.fulls.truncate(FULL_SLOTS);
     }
 }
 
@@ -192,50 +321,89 @@ pub fn dominant_color(image: &DecodedImage) -> Option<Rgba> {
     }
 }
 
-/// Decode a song's cover, preferring the disk tier over the file's tags.
+/// Read the disk-tier master, or decode one from the file's tags and persist it.
 ///
-/// Runs off the UI thread. Returns the GPU-ready image and its dominant colour,
-/// or `None` when there's genuinely no usable art (which the caller records as
-/// `Missing`).
-fn load_cover(path: &Path, disk_path: &Path) -> Option<(Arc<RenderImage>, Option<Rgba>)> {
-    let decoded = match read_disk(disk_path) {
-        Some(cached) => cached,
+/// Runs off the UI thread. `None` only when there's genuinely no usable art.
+fn load_master(path: &Path, disk_path: &Path) -> Option<DynamicImage> {
+    match read_disk(disk_path) {
+        Some(master) => Some(master),
         None => {
-            let decoded = decode_embedded(path)?;
-            write_disk(disk_path, &decoded);
-            decoded
+            let master = decode_embedded(path)?;
+            write_disk(disk_path, &master);
+            Some(master)
         }
-    };
+    }
+}
+
+/// Derive the browse thumbnail — cropped to a centred square — from the master,
+/// with the dominant colour the dynamic theme seeds from.
+fn load_thumb(
+    path: &Path,
+    disk_path: &Path,
+    sizes: Sizes,
+) -> Option<(Arc<RenderImage>, Option<Rgba>)> {
+    let master = load_master(path, disk_path)?;
+    // One pass crops to a centred square and resamples, so the thumbnail's
+    // `ObjectFit::Cover` has nothing left to do.
+    let thumb = master.resize_to_fill(sizes.thumb, sizes.thumb, FilterType::Lanczos3);
+    let decoded = decoded_from(&thumb);
     let accent = dominant_color(&decoded);
-    let image = to_render_image(&decoded)?;
-    Some((image, accent))
+    Some((to_render_image(&decoded)?, accent))
 }
 
-/// Read a previously downscaled thumbnail from the disk tier.
-fn read_disk(disk_path: &Path) -> Option<DecodedImage> {
-    let bytes = std::fs::read(disk_path).ok()?;
-    let image = image::load_from_memory(&bytes).ok()?.to_rgba8();
-    Some(DecodedImage { width: image.width(), height: image.height(), rgba: image.into_raw() })
+/// Derive the full now-playing cover from the master. Aspect-preserved, so
+/// `ObjectFit::Cover` does the final crop; only ever shrinks, so small art stays
+/// as-is for the GPU.
+fn load_full(
+    path: &Path,
+    disk_path: &Path,
+    sizes: Sizes,
+) -> Option<(Arc<RenderImage>, Option<Rgba>)> {
+    let master = load_master(path, disk_path)?;
+    let full = shrink(master, sizes.full);
+    let decoded = decoded_from(&full);
+    let accent = dominant_color(&decoded);
+    Some((to_render_image(&decoded)?, accent))
 }
 
-/// Persist a downscaled thumbnail. Best-effort: a failed write only costs a
-/// re-decode next launch.
-fn write_disk(disk_path: &Path, decoded: &DecodedImage) {
-    let Some(buffer) = rgba_buffer(decoded) else { return };
-    // JPEG has no alpha, and cover art doesn't need one.
-    let _ = image::DynamicImage::ImageRgba8(buffer).to_rgb8().save(disk_path);
+/// Downscale `image` so neither edge exceeds `max`, leaving smaller art alone.
+fn shrink(image: DynamicImage, max: u32) -> DynamicImage {
+    if image.width() <= max && image.height() <= max {
+        image
+    } else {
+        image.resize(max, max, FilterType::Lanczos3)
+    }
 }
 
-/// Decode the first embedded picture in the file and downscale it.
-fn decode_embedded(path: &Path) -> Option<DecodedImage> {
+/// Flatten a decoded image into the framework-agnostic pixel type.
+fn decoded_from(image: &DynamicImage) -> DecodedImage {
+    let rgba = image.to_rgba8();
+    DecodedImage { width: rgba.width(), height: rgba.height(), rgba: rgba.into_raw() }
+}
+
+/// Read the disk-tier master, if a previous launch wrote one.
+fn read_disk(disk_path: &Path) -> Option<DynamicImage> {
+    image::load_from_memory(&std::fs::read(disk_path).ok()?).ok()
+}
+
+/// Persist the disk-tier master. Best-effort: a failed write only costs a
+/// re-decode next launch. Encoded at a high quality, since this copy is what
+/// every later launch derives its variants from.
+fn write_disk(disk_path: &Path, master: &DynamicImage) {
+    let Ok(file) = std::fs::File::create(disk_path) else { return };
+    let rgb = master.to_rgb8();
+    let _ = JpegEncoder::new_with_quality(BufWriter::new(file), MASTER_QUALITY).encode_image(&rgb);
+}
+
+/// Decode the first embedded picture in the file and downscale it to the
+/// disk-tier master size.
+fn decode_embedded(path: &Path) -> Option<DynamicImage> {
     let tagged = Probe::open(path).ok()?.guess_file_type().ok()?.read().ok()?;
     let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
     let picture = tag.pictures().first()?;
 
     let image = image::load_from_memory(picture.data()).ok()?;
-    // `thumbnail` preserves the aspect ratio and only ever shrinks.
-    let image = image.thumbnail(MAX_COVER_PX, MAX_COVER_PX).to_rgba8();
-    Some(DecodedImage { width: image.width(), height: image.height(), rgba: image.into_raw() })
+    Some(shrink(image, MASTER_PX))
 }
 
 fn rgba_buffer(decoded: &DecodedImage) -> Option<image::RgbaImage> {

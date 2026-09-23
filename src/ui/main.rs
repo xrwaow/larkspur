@@ -128,8 +128,11 @@ fn main() {
                 let library_state = cx.new(|cx| LibraryState::new(cache, config_state.clone(), cx));
 
                 // Covers are decoded off-thread and shared by the now-playing
-                // square and the browse/search thumbnails.
-                let cover_store = cx.new(|cx| CoverStore::new(cache_dir().join("covers"), cx));
+                // square and the browse/search thumbnails. Each is derived at
+                // the window's physical pixel sizes, so it draws ~1:1.
+                let cover_store = cx.new(|cx| {
+                    CoverStore::new(cache_dir().join("covers-v2"), window.scale_factor(), cx)
+                });
 
                 // The shared frame clock: animations (selection fades, lyric
                 // scrolling) observe this; the transport's coarse readouts tick

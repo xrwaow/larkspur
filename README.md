@@ -67,7 +67,7 @@ Paths are relative to this crate's root. This is the fastest way in:
 | `src/ui/browse.rs` | `BrowseView` — the library browse container. Every album as a headed group (cover, artist, album, `tracks \| time`, year) with its tracks beneath, drawn through GPUI's virtualized `list`; clicking a track plays the album from there. One instance backs the library tab; “go to {artist}” from a song menu opens another, scoped to that artist's discography (newest first), so it titles the header with the artist instead of “Library”. Selection and navigation come from `RowList`. |
 | `src/ui/lyrics.rs` | `LyricsView` — the right rail's lyrics panel, above the cover. Pins the anchor line to the middle of the panel (50% of its height) whatever the height of the lines around it, and seeks to a line when it's clicked. The header title is a `marquee` cell (fade + slide + spring back). The panel can fade its content into the background at the top and bottom edges (a settings toggle), so lines dissolve rather than being cut off. The slide **leads the song**: the stack starts moving `TRANSITION_SECS` before a line's timestamp so it lands *on* the line, and the colour **crossfades over the second half of that slide** — the next line starts colouring up once the stack is already moving toward it, while the line it replaces fades out over the same window. Both are driven from the playback position, which is why the panel reads it at full resolution (`live_position`) on every frame of the shared clock. Lines wrap on word boundaries (and break an over-long word per character) instead of being clipped. |
 | `src/ui/visualizer.rs` | `VisualizerView` — the spectrum bar band above the lyrics (on/off in settings; off removes the container from the layout live). A true spectrum: 64 log-spaced frequency bands, bass on the left, highs on the right, showing the track's FFT spectrogram at the live playback position (`Spectrogram::at` interpolates between columns so the bars move continuously). Each bar rises instantly and falls exponentially; the view observes the shared clock and re-renders only while a bar is moving. |
-| `src/ui/cover_store.rs` | `CoverStore` — the shared, observable cover store. Decodes embedded art off-thread, downscales once, writes the disk tier, and hands the UI a GPU-ready image. It also derives each cover's dominant colour at decode time (`accent`), which is what the dynamic theme tints from. One owner for both the now-playing square and the album thumbnails. |
+| `src/ui/cover_store.rs` | `CoverStore` — the shared, observable cover store. Decodes embedded art off-thread, keeps a fixed 1024px master, writes the disk tier, and derives the two on-screen variants (now-playing full cover + browse thumbnail) at the window's physical pixel sizes so the GPU draws them ~1:1. Thumbnails live in the byte budget; the full cover lives in a tiny recent-tracks slot. It also derives each cover's dominant colour at decode time (`accent`), which is what the dynamic theme tints from. One owner for both the now-playing square and the album thumbnails. |
 | `src/ui/format.rs` | `format_bitrate`/`format_secs` — the shared bitrate and duration formatting the list views agree on. |
 | `src/ui/cover.rs` | `CoverView` — the 240 px now-playing cover square: the current track's art, always at full brightness. It also feeds the dynamic theme, pushing the cover store's dominant colour into `ConfigState` while that theme is selected. |
 | `src/ui/playback.rs` | `PlaybackView` — the seek bar + waveform (`bars`/`line`, chosen in settings), the time labels, and the transport buttons beneath them. |
@@ -474,23 +474,35 @@ UI stores what it renders from); `ui::cover_store::CoverStore` is the shared
 wrong and nothing breaks, every cover just renders with red and blue
 exchanged.
 
-1. **Decode once, downscale immediately.** Embedded art can be
-   multi-megabyte at 1000px+; nothing in the UI needs that. Decode, resize
-   to 300px, and only then cache.
+1. **Decode once, keep a fixed master.** Embedded art can be multi-megabyte at
+   1000px+; nothing in the UI needs that. Decode, resize to a 1024px master
+   (Lanczos3; never upsizes, so small art is untouched), and only then cache.
+   The master size is **fixed, not scale-derived** — it's written once and
+   shared across launches, so it must not bake in one display's assumptions.
+   From that master the store derives the two on-screen variants at the
+   window's **physical pixel** sizes, so each is drawn at roughly 1:1 instead
+   of being shrunk by the GPU from one oversized image.
 2. **Memory tier:** `lru::LruCache` keyed by `SongId`, evicted by a real
    **byte budget** (64 MiB), not entry count. `insert` returns the ids it
    evicted, and `CoverStore` drops the same entries from its GPU-image map —
-   so there's one budget, not two that drift.
-3. **Disk tier:** downscaled thumbnails persisted to
-   `~/.cache/larkspur/covers/<id>.jpg` on first decode, so subsequent
-   launches skip re-decoding embedded art for the entire library, not just
-   what's currently in memory. A disk hit short-circuits the file entirely.
-4. **State, not `Option`:** `CoverImage::{Loading, Ready(Arc<RenderImage>),
-   Missing}` — distinguishes "in flight" from "genuinely has no art", so the
-   UI doesn't re-attempt decodes every frame or flash a placeholder→real swap.
-   A song whose tags declare no picture is recorded `Missing` without ever
-   opening the file.
-5. **External cover fallback (planned):** `folder.jpg`/`cover.png` next to
+   so there's one budget, not two that drift. The budget holds only the small
+   **thumbnails** (the browse grid's working set, thousands at ~20 KB each).
+3. **The full cover is not budgeted.** The now-playing square's full variant
+   (~1 MB) is kept for the current track and a couple of recent ones in a tiny
+   slot list, so skipping back is instant without spending the byte budget on
+   images browse never draws. `CoverStore::request` derives a thumbnail for the
+   browse rows; `request_full` derives the full cover for the current track.
+4. **Disk tier:** the master is persisted to
+   `~/.cache/larkspur/covers-v2/<id>.jpg` on first decode (JPEG q92), so
+   subsequent launches skip re-decoding embedded art for the entire library,
+   not just what's currently in memory. A disk hit short-circuits the file
+   entirely. (The `-v2` suffix retires the older 300px/q75 files.)
+5. **State, not `Option`:** `CoverImage::{Loading, Ready(Arc<RenderImage>),
+   Missing}` (and the same shape for `FullCover`) — distinguishes "in flight"
+   from "genuinely has no art", so the UI doesn't re-attempt decodes every
+   frame or flash a placeholder→real swap. A song whose tags declare no picture
+   is recorded `Missing` without ever opening the file.
+6. **External cover fallback (planned):** `folder.jpg`/`cover.png` next to
    the audio file, common for FLAC rips without embedded art. `lofty` only
    reads embedded pictures, so this is a separate, album-level lookup path,
    not part of the per-song tag read.
@@ -510,9 +522,9 @@ exchanged.
 - [x] Shared observable playback state (`Entity<PlaybackState>`) — views
       observe it instead of polling
 - [x] Layout introspection + tests (`ui/introspect.rs`, `tests/`)
-- [x] Cover art — `CoverStore` decodes embedded art off-thread, downscales
-      once, writes the `~/.cache/larkspur/covers/` disk tier, and feeds both
-      the now-playing square and the album thumbnails
+- [x] Cover art — `CoverStore` decodes embedded art off-thread, writes the
+      `~/.cache/larkspur/covers-v2/` disk tier, and derives the now-playing
+      square and the album thumbnails at physical pixel size from one master
 - [ ] External cover fallback (`folder.jpg`/`cover.png`)
 - [x] Lyrics — embedded and `.lrc` sidecar lyrics read at scan time and cached
       with the metadata, plus the right-rail lyrics panel. Synced lines keep the
