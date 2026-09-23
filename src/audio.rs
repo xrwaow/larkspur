@@ -4,10 +4,36 @@ use std::time::Duration;
 
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source};
 
-use crate::model::{SongMetadata, SongStatus};
+use crate::model::SongMetadata;
 use crate::opus::OpusSource;
 
 type TrackSource = Box<dyn Source<Item = f32> + Send>;
+
+/// Build the decode source for a track: rodio's `Decoder` covers
+/// FLAC/MP3/WAV/Vorbis; Opus falls through to our symphonia+libopus source
+/// (symphonia 0.5 ships no Opus decoder). Shared by the playback controller
+/// and the dev `probe` binary's seek diagnostics.
+pub fn build_source(path: &Path) -> anyhow::Result<TrackSource> {
+    Ok(match Decoder::try_from(File::open(path)?) {
+        Ok(decoder) => Box::new(decoder),
+        Err(_) => Box::new(OpusSource::new(path)?),
+    })
+}
+
+/// Coarse playback status for display and state projection.
+///
+/// Distinct from the live playback state the UI owns: this is the small,
+/// display-oriented slice (`playing` / `paused` / `ended` / nothing selected)
+/// that views match on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SongStatus {
+    /// Nothing has been selected yet.
+    NoSelection,
+    Playing,
+    Paused,
+    /// The queue has played out — play/next are inert.
+    Ended,
+}
 
 /// Owns the rodio player and device sink, the play queue, and the current
 /// track's static metadata.
@@ -61,15 +87,10 @@ impl PlaybackController {
         Ok(())
     }
 
-    /// Decode + tag-read one track. rodio's Decoder covers FLAC/MP3/WAV/
-    /// Vorbis; Opus falls through to our symphonia+libopus source because
-    /// symphonia 0.5 has no Opus decoder.
+    /// Decode + tag-read one track.
     fn track_parts(path: &Path) -> anyhow::Result<(TrackSource, SongMetadata, Duration)> {
         let metadata = SongMetadata::load(path)?;
-        let source: TrackSource = match Decoder::try_from(File::open(path)?) {
-            Ok(decoder) => Box::new(decoder),
-            Err(_) => Box::new(OpusSource::new(path)?),
-        };
+        let source = build_source(path)?;
         // Prefer the decoder's real stream duration over the tag value —
         // tags can drift from the actual audio, and seek clamping should
         // match what's actually seekable.
@@ -201,7 +222,18 @@ impl PlaybackController {
         }
     }
 
-    pub fn seek(&self, pos: Duration) {
+    pub fn seek(&mut self, pos: Duration) {
+        // A drained queue has no source left to seek into — try_seek would just
+        // fail and the click would do nothing. Reload the current track at the
+        // requested position instead, so clicking the bar after the song ends
+        // plays from there without going through prev first.
+        if self.player.empty() {
+            let Some(current) = self.current else { return };
+            if let Err(e) = self.load_track(current) {
+                eprintln!("failed to reload {:?} for seek: {e}", self.queue[current]);
+                return;
+            }
+        }
         // Don't swallow seek failures — a silent failure looks exactly
         // like "the arrow keys / seek bar do nothing".
         if let Err(e) = self.player.try_seek(pos.min(self.duration)) {
@@ -209,7 +241,7 @@ impl PlaybackController {
         }
     }
 
-    pub fn seek_relative(&self, delta_secs: i64) {
+    pub fn seek_relative(&mut self, delta_secs: i64) {
         let current = self.position().as_secs_f64();
         self.seek(Duration::from_secs_f64((current + delta_secs as f64).max(0.0)));
     }

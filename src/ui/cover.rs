@@ -1,18 +1,18 @@
 use gpui::{
-    div, img, prelude::*, px, rgb, AnyElement, Context, Entity, ObjectFit, Render, Rgba,
+    div, img, prelude::*, px, AnyElement, Context, Entity, ObjectFit, Render, Rgba,
     Subscription, Window,
 };
 
-use crate::model::{CoverState, SongId, SongStatus, ThemeKind};
+use crate::model::{SongId, ThemeKind};
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::cover_store::{CoverImage, CoverStore};
-use crate::ui::state::PlaybackState;
+use crate::ui::playback_state::PlaybackState;
 
 /// The now-playing cover square.
 ///
-/// Shows the cover of whatever track the shared playback state is on — playing
-/// or paused — dimmed while paused. Reads both the playback state (which track)
+/// Shows the cover of whatever track the shared playback state is on —
+/// playing or paused, at full brightness. Reads both the playback state (which track)
 /// and the cover store (its decoded art), observing each so it re-renders when
 /// the track changes or a decode lands.
 ///
@@ -82,7 +82,7 @@ impl CoverView {
         let (id, path, has_art) = {
             let state = state.read(cx);
             let song = state.metadata();
-            (song.id, song.path.clone(), !matches!(song.cover, CoverState::Missing))
+            (song.id, song.path.clone(), song.has_art)
         };
         // `SongMetadata::placeholder` is id 0 with an empty path — nothing to
         // decode until a track is actually chosen.
@@ -123,7 +123,6 @@ impl Render for CoverView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.themed.theme();
         let id = self.state.read(cx).metadata().id;
-        let paused = self.state.read(cx).status() == SongStatus::Paused;
         let cover = self.covers.read(cx).cover(id);
 
         let art: AnyElement = match cover {
@@ -138,9 +137,8 @@ impl Render for CoverView {
 
         div()
             .size(px(Self::SIZE))
-            .bg(rgb(0x202020))
+            .bg(theme.row_odd)
             .overflow_hidden()
-            .when(paused, |d| d.opacity(0.45))
             .child(art)
     }
 }
@@ -153,7 +151,7 @@ fn placeholder(theme: crate::ui::theme::Theme, label: &str) -> AnyElement {
         .items_center()
         .justify_center()
         .font_family(theme.font)
-        .text_color(rgb(0x555555))
+        .text_color(theme.text_faint)
         .child(label.to_string())
         .into_any_element()
 }

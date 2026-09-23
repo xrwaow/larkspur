@@ -18,14 +18,15 @@
 //! selected belongs to the playlist tab showing it, since each tab keeps its
 //! own.
 
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use gpui::{Context, Entity, Subscription};
 
 use crate::model::{Library, LibraryCache, PlaylistId, SongId};
 use crate::ui::config_state::ConfigState;
 use crate::ui::menu::SongMenuRequest;
-use crate::ui::state::PlaybackState;
+use crate::ui::playback_state::PlaybackState;
 
 pub struct LibraryState {
     library: Library,
@@ -49,6 +50,9 @@ pub struct LibraryState {
     /// A song whose context menu a row asked to open. The tab container owns
     /// and renders it, so rows anywhere can raise it.
     pending_song_menu: Option<SongMenuRequest>,
+    /// A folder the rail's folder view asked to play. The tab container picks
+    /// it up — it holds the playback handle the rail doesn't.
+    pending_folder_play: Option<PathBuf>,
     scanning: bool,
     /// A rescan was requested while one was already in flight.
     rescan_pending: bool,
@@ -82,6 +86,7 @@ impl LibraryState {
             pending_open_playlist: None,
             pending_artist_view: None,
             pending_song_menu: None,
+            pending_folder_play: None,
             scanning: false,
             rescan_pending: false,
             _observe_config: observe_config,
@@ -139,6 +144,18 @@ impl LibraryState {
     /// Take the pending "artist view" request, if any.
     pub fn take_artist_view(&mut self) -> Option<String> {
         self.pending_artist_view.take()
+    }
+
+    /// Ask the tab container to play a folder and open its temporary view.
+    /// Consumed by `TabsView`, which holds the playback handle.
+    pub fn request_folder_play(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
+        self.pending_folder_play = Some(dir);
+        cx.notify();
+    }
+
+    /// Take the pending "play folder" request, if any.
+    pub fn take_folder_play(&mut self) -> Option<PathBuf> {
+        self.pending_folder_play.take()
     }
 
     /// Ask the tab container to open a song's context menu at `request`.
@@ -231,6 +248,81 @@ impl LibraryState {
         id
     }
 
+    /// Play an ad-hoc selection and open it as a temporary playlist — the
+    /// song menu's "Play {N} songs". Nothing is persisted; the playlist lives
+    /// exactly as long as the tab that shows it.
+    pub fn play_selection(
+        &mut self,
+        songs: Vec<SongId>,
+        playback: &Entity<PlaybackState>,
+        cx: &mut Context<Self>,
+    ) {
+        if songs.is_empty() {
+            return;
+        }
+        let count = songs.len();
+        let id = self.library.create_temporary(format!("{count} songs"), songs.clone());
+        self.play(&songs, 0, playback, cx);
+        self.pending_open_playlist = Some(id);
+        self.revision += 1;
+        cx.notify();
+    }
+
+    /// Play everything under `dir` and open it as a temporary view: one
+    /// temporary playlist per directory that has songs of its own — the
+    /// folder's own songs first, then each subdirectory depth-first, so the
+    /// tab shows every folder as a header with its playlist under it.
+    /// Returns the temporary playlist ids, in tab order.
+    pub fn play_folder(
+        &mut self,
+        dir: &Path,
+        playback: &Entity<PlaybackState>,
+        cx: &mut Context<Self>,
+    ) -> Vec<PlaylistId> {
+        // Songs grouped by their directory once — the tree walk below then
+        // only looks up, instead of rescanning the whole library per folder.
+        let mut by_parent: HashMap<PathBuf, Vec<SongId>> = HashMap::new();
+        for song in self.library.songs() {
+            if let Some(parent) = song.path.parent() {
+                by_parent.entry(parent.to_path_buf()).or_default().push(song.id);
+            }
+        }
+        for songs in by_parent.values_mut() {
+            songs.sort_unstable();
+        }
+
+        let mut groups = Vec::new();
+        self.push_folder_groups(&mut groups, dir, &by_parent);
+        if groups.is_empty() {
+            return Vec::new();
+        }
+        let all: Vec<SongId> =
+            groups.iter().flat_map(|(_, songs)| songs.iter().copied()).collect();
+        let ids = self.library.create_temporaries(groups);
+        self.play(&all, 0, playback, cx);
+        self.revision += 1;
+        cx.notify();
+        ids
+    }
+
+    /// The songs under `dir`, grouped per directory, depth-first: the
+    /// directory's own songs as one group (when it has any), then each
+    /// subdirectory the same way. One group per folder — and so one header
+    /// with its playlist under it in the tab — whatever the tree's depth.
+    fn push_folder_groups(
+        &self,
+        groups: &mut Vec<(String, Vec<SongId>)>,
+        dir: &Path,
+        by_parent: &HashMap<PathBuf, Vec<SongId>>,
+    ) {
+        if let Some(songs) = by_parent.get(dir) {
+            groups.push((dir_name(dir), songs.clone()));
+        }
+        for sub in subdirs(dir) {
+            self.push_folder_groups(groups, &sub, by_parent);
+        }
+    }
+
     pub fn rename_playlist(&mut self, playlist: PlaylistId, title: String, cx: &mut Context<Self>) {
         if self.library.rename(playlist, title) {
             self.revision += 1;
@@ -241,6 +333,19 @@ impl LibraryState {
 
     pub fn delete_playlist(&mut self, playlist: PlaylistId, cx: &mut Context<Self>) {
         if self.library.remove_playlist(playlist).is_some() {
+            self.revision += 1;
+            self.ensure_selection();
+            self.persist();
+            cx.notify();
+        }
+    }
+
+    /// Delete several playlists at once — one reindex, one cache write, one
+    /// notification. Closing a folder tab removes every temporary playlist it
+    /// was showing, which can be hundreds; doing that per-playlist froze the
+    /// UI thread on a full-library cache write each.
+    pub fn delete_playlists(&mut self, playlists: Vec<PlaylistId>, cx: &mut Context<Self>) {
+        if self.library.remove_playlists(&playlists) > 0 {
             self.revision += 1;
             self.ensure_selection();
             self.persist();
@@ -383,4 +488,29 @@ impl LibraryState {
             }
         }
     }
+}
+
+/// The immediate subdirectories of `dir`, sorted by name. Empty when the
+/// directory can't be read. Shared by the rail's folder view and the
+/// folder-play grouping.
+pub fn subdirs(dir: &Path) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = std::fs::read_dir(dir)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .collect()
+        })
+        .unwrap_or_default();
+    dirs.sort();
+    dirs
+}
+
+/// A directory's own name — the last path component, or the full path when it
+/// has none (a bare root like `/`).
+fn dir_name(path: &Path) -> String {
+    path.file_name()
+        .map(|name| name.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.display().to_string())
 }

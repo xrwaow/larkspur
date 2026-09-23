@@ -6,7 +6,6 @@ use lofty::probe::Probe;
 use lofty::tag::{Accessor, ItemKey, Tag};
 use serde::{Deserialize, Serialize};
 
-use super::cover::CoverState;
 use super::identity::{generate_song_id, SongId};
 use super::lyrics::{load_sidecar, looks_like_lrc, parse_lrc, Lyrics};
 
@@ -18,9 +17,8 @@ use super::lyrics::{load_sidecar, looks_like_lrc, parse_lrc, Lyrics};
 /// different lifetime and lives in the UI's playback state instead.
 ///
 /// Serialize/Deserialize is derived so the scan cache can round-trip a song
-/// whole rather than mirroring every field. `cover` is skipped — the cache
-/// records only *whether* art exists ([`has_art`](Self::has_art)) and rebuilds
-/// the state on load, since decoded pixels aren't part of the metadata.
+/// whole rather than mirroring every field. Decoded pixels aren't part of the
+/// metadata — the cover cache owns those — only *whether* art exists is.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SongMetadata {
     pub id: SongId,
@@ -37,6 +35,11 @@ pub struct SongMetadata {
     /// Release year, when the tags declare one (`Year`, `RecordingDate`, or
     /// `ReleaseDate`). Drives the browse header's year and date filters.
     pub year: Option<u16>,
+    /// The full release date — year, month, day — when the tag carries one
+    /// (`2003-05-01`). What the library's chronological ordering uses: songs
+    /// of the same year order by month/day rather than alphabetically.
+    #[serde(default)]
+    pub release_date: Option<(u16, u8, u8)>,
     /// Declared/average bitrate from the file's properties, in **bits per
     /// second**.
     ///
@@ -47,8 +50,9 @@ pub struct SongMetadata {
     pub nominal_bitrate: Option<u32>,
     pub lyrics: Lyrics,
     pub duration: Duration,
-    #[serde(skip)]
-    pub cover: CoverState,
+    /// Whether the file declares embedded art, i.e. whether decoding it is
+    /// worth attempting at all.
+    pub has_art: bool,
 }
 
 impl SongMetadata {
@@ -67,10 +71,11 @@ impl SongMetadata {
             album_artist: None,
             track_position: None,
             year: None,
+            release_date: None,
             nominal_bitrate: None,
             lyrics: Lyrics::None,
             duration: Duration::ZERO,
-            cover: CoverState::Missing,
+            has_art: false,
         }
     }
 
@@ -109,10 +114,11 @@ impl SongMetadata {
                 album_artist: None,
                 track_position: None,
                 year: None,
-                nominal_bitrate,
+                release_date: None,
+                nominal_bitrate: None,
                 lyrics: sidecar.unwrap_or(Lyrics::None),
                 duration,
-                cover: CoverState::NotRequested,
+                has_art: false,
             });
         };
 
@@ -124,7 +130,7 @@ impl SongMetadata {
         let album_name = tag.album().map(|s| s.into_owned());
         let album_artist = tag.get_string(&ItemKey::AlbumArtist).map(|s| s.to_string());
         let track_position = tag.track().map(|n| n as u16);
-        let year = read_year(tag);
+        let (year, release_date) = read_date(tag);
 
         let lyrics = sidecar.unwrap_or_else(|| {
             tag.get_string(&ItemKey::Lyrics)
@@ -138,13 +144,9 @@ impl SongMetadata {
                 .unwrap_or(Lyrics::None)
         });
 
-        let cover = if tag.pictures().first().is_some() {
-            // Decoding/downscaling happens off this call — this just
-            // records that art is available and awaiting async load.
-            CoverState::NotRequested
-        } else {
-            CoverState::Missing
-        };
+        // Decoding/downscaling happens off this call — this just records
+        // that art is available and awaiting async load.
+        let has_art = tag.pictures().first().is_some();
 
         Ok(Self {
             id,
@@ -155,10 +157,11 @@ impl SongMetadata {
             album_artist,
             track_position,
             year,
+            release_date,
             nominal_bitrate,
             lyrics,
             duration,
-            cover,
+            has_art,
         })
     }
 
@@ -199,26 +202,71 @@ impl SongMetadata {
         })
     }
 
-    /// Whether the file declares embedded art, i.e. whether decoding it is
-    /// worth attempting at all.
-    pub fn has_art(&self) -> bool {
-        !matches!(self.cover, CoverState::Missing)
-    }
 }
 
-/// The year a tag declares, trying the three keys that carry one.
+/// The date a tag declares — the year, plus the month and day when the value
+/// carries them — trying the three keys that carry one.
 ///
 /// `Year` is the Vorbis-comment key (and ID3v2.3 `TYER`); `RecordingDate`
 /// (`TDRC`) and `ReleaseDate` (`TDRL`) are ISO-ish dates like `2003-05-01`,
-/// which is why [`parse_year`] takes the leading four digits.
-fn read_year(tag: &Tag) -> Option<u16> {
+/// which is why only the leading numbers are read: `2003-05-01 12:00` still
+/// yields May 1st, and a bare `2003` yields the year alone.
+fn read_date(tag: &Tag) -> (Option<u16>, Option<(u16, u8, u8)>) {
     [ItemKey::Year, ItemKey::RecordingDate, ItemKey::ReleaseDate]
         .iter()
-        .find_map(|key| tag.get_string(key).and_then(parse_year))
+        .find_map(|key| tag.get_string(key).map(parse_date))
+        .unwrap_or((None, None))
 }
 
-/// The leading four digits of a date-ish string, as a year.
-fn parse_year(s: &str) -> Option<u16> {
-    let digits: String = s.trim().chars().take_while(char::is_ascii_digit).take(4).collect();
-    (digits.len() == 4).then(|| digits.parse().ok()).flatten()
+/// Parse a date-ish tag value into `(year, (year, month, day))`.
+///
+/// The leading number is the year; a `-`/`/`-separated month and day follow
+/// when present. A compact `20030501` (no separators) is split by position.
+/// Anything that doesn't fit degrades: a value with a month but no day keeps
+/// the year and drops the rest.
+fn parse_date(s: &str) -> (Option<u16>, Option<(u16, u8, u8)>) {
+    let trimmed = s.trim();
+    let mut numbers: Vec<u32> = trimmed
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|part| !part.is_empty())
+        .map(|part| part.parse().ok())
+        .collect::<Option<Vec<_>>>()
+        .unwrap_or_default();
+
+    // `20030501`: one unseparated run of eight digits is year/month/day.
+    if numbers.len() == 1 && trimmed.len() == 8 && trimmed.bytes().all(|b| b.is_ascii_digit()) {
+        let n = numbers[0];
+        numbers = vec![n / 10_000, (n / 100) % 100, n % 100];
+    }
+
+    let year = numbers.first().copied().filter(|y| (1000..=9999).contains(y)).map(|y| y as u16);
+    let month = numbers.get(1).copied().filter(|m| (1..=12).contains(m)).map(|m| m as u8);
+    let day = numbers.get(2).copied().filter(|d| (1..=31).contains(d)).map(|d| d as u8);
+    let date = match (year, month, day) {
+        (Some(y), Some(m), Some(d)) => Some((y, m, d)),
+        _ => None,
+    };
+    (year, date)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::parse_date;
+
+    #[test]
+    fn parse_date_reads_the_year_and_the_month_day_when_present() {
+        assert_eq!(parse_date("2003"), (Some(2003), None));
+        assert_eq!(parse_date("2003-05-01"), (Some(2003), Some((2003, 5, 1))));
+        assert_eq!(parse_date("2003/5/1"), (Some(2003), Some((2003, 5, 1))));
+        // A timestamp after the date is ignored.
+        assert_eq!(parse_date("2003-05-01 12:00"), (Some(2003), Some((2003, 5, 1))));
+        // A compact `YYYYMMDD` has no separators to split on.
+        assert_eq!(parse_date("20030501"), (Some(2003), Some((2003, 5, 1))));
+        // A month without a day keeps the year only.
+        assert_eq!(parse_date("2003-05"), (Some(2003), None));
+        // Out-of-range or non-date values degrade to nothing.
+        assert_eq!(parse_date("13"), (None, None));
+        assert_eq!(parse_date("2003-13-01"), (Some(2003), None));
+        assert_eq!(parse_date(""), (None, None));
+    }
 }

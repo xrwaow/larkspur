@@ -18,6 +18,7 @@ use symphonia::core::formats::{FormatOptions, FormatReader, Packet};
 use symphonia::core::io::{MediaSource, MediaSourceStream};
 use symphonia::core::meta::MetadataOptions;
 use symphonia::core::probe::Hint;
+use symphonia::core::units::TimeBase;
 
 /// A `MediaSource` over a plain file that reports its real length —
 /// Symphonia's Ogg seek needs it for the page binary search.
@@ -53,6 +54,23 @@ pub struct OpenedTrack {
     pub format: Box<dyn FormatReader>,
     pub track_id: u32,
     pub codec_params: CodecParameters,
+}
+
+impl OpenedTrack {
+    /// The media time base, if the container declares one.
+    pub fn time_base(&self) -> Option<TimeBase> {
+        self.codec_params.time_base
+    }
+
+    /// The declared sample rate, if the container declares one.
+    pub fn sample_rate(&self) -> Option<u32> {
+        self.codec_params.sample_rate
+    }
+
+    /// Channel count, defaulting to stereo when the container omits it.
+    pub fn channels(&self) -> usize {
+        self.codec_params.channels.map(|c| c.count()).unwrap_or(2)
+    }
 }
 
 /// Open `path` and select the first track with a real (non-null) codec.

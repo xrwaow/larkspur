@@ -27,16 +27,17 @@
 use std::time::Duration;
 
 use gpui::{
-    div, prelude::*, px, relative, AnyElement, ClickEvent, Context, Entity, Render, Rgba,
-    Subscription, Window,
+    div, prelude::*, px, relative, AnyElement, ClickEvent, Context, Entity, Render, Subscription,
+    Window,
 };
 
 use crate::model::{LyricLine, Lyrics, SongId};
 use crate::ui::animation::{Animator, Tween};
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
-use crate::ui::state::PlaybackState;
+use crate::ui::playback_state::PlaybackState;
 use crate::ui::theme::Theme;
+use crate::ui::widgets::{blend, empty_hint, panel_header};
 
 /// How long the lyric stack takes to slide to a new line — and therefore how
 /// far *before* a line's timestamp the slide starts, so it lands on time.
@@ -174,7 +175,7 @@ impl Render for LyricsView {
         let title = metadata.display_title();
 
         let body: AnyElement = match &metadata.lyrics {
-            Lyrics::None => hint(theme, "No lyrics for this track."),
+            Lyrics::None => empty_hint(theme, "No lyrics for this track.", false),
             Lyrics::Plain(text) => div()
                 .id("lyrics-scroll")
                 .size_full()
@@ -192,7 +193,8 @@ impl Render for LyricsView {
                     div().w_full().flex_none().whitespace_normal().child(line.to_string())
                 }))
                 .into_any_element(),
-            Lyrics::Synced(lines) if lines.is_empty() => hint(theme, "No lyrics for this track."),
+            Lyrics::Synced(lines) if lines.is_empty() =>
+                empty_hint(theme, "No lyrics for this track.", false),
             Lyrics::Synced(lines) => {
                 let line = |index: usize, cx: &Context<Self>| -> AnyElement {
                     let timestamp = lines[index].timestamp;
@@ -269,30 +271,14 @@ impl Render for LyricsView {
             .flex_col()
             .bg(theme.rail_bg)
             .font_family(theme.font)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_between()
-                    .gap_2()
-                    .px_3()
-                    .py_2()
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(theme.cell_px()))
-                            .text_color(theme.text)
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(theme.small_px()))
-                            .text_color(theme.text_faint)
-                            .child("Lyrics"),
-                    ),
-            )
+            .child(panel_header(
+                theme,
+                &title,
+                theme.cell_px(),
+                None,
+                None,
+                Some(("Lyrics", theme.text_faint)),
+            ))
             .child(div().flex_1().min_h_0().child(body))
     }
 }
@@ -354,17 +340,6 @@ fn ramp(position: Duration, from: Duration, to: Duration) -> f32 {
     position.saturating_sub(from).as_secs_f32() / (to - from).as_secs_f32()
 }
 
-/// Linear blend between two colours, for a highlight crossing over.
-fn blend(from: Rgba, to: Rgba, t: f32) -> Rgba {
-    let t = t.clamp(0.0, 1.0);
-    Rgba {
-        r: from.r + (to.r - from.r) * t,
-        g: from.g + (to.g - from.g) * t,
-        b: from.b + (to.b - from.b) * t,
-        a: from.a + (to.a - from.a) * t,
-    }
-}
-
 fn synced_line(
     theme: Theme,
     index: usize,
@@ -391,16 +366,6 @@ fn synced_line(
         .hover(|d| d.bg(theme.row_hover).text_color(theme.text_muted))
         .on_click(on_click)
         .child(text.to_string())
-        .into_any_element()
-}
-
-fn hint(theme: Theme, label: &str) -> AnyElement {
-    div()
-        .px_3()
-        .py_2()
-        .text_size(px(theme.small_px()))
-        .text_color(theme.text_faint)
-        .child(label.to_string())
         .into_any_element()
 }
 

@@ -1,4 +1,4 @@
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 /// Decoded, already-downscaled RGBA pixel buffer ready for GPU upload.
@@ -16,20 +16,6 @@ impl DecodedImage {
     pub fn byte_len(&self) -> usize {
         self.rgba.len()
     }
-}
-
-/// Cover art for one song/album, as a state rather than an `Option`.
-///
-/// Distinguishes "haven't tried yet", "in flight", and "genuinely has no
-/// art" so the UI doesn't re-attempt decodes every frame or flash a
-/// placeholder→real swap mid-load.
-#[derive(Debug, Clone, Default)]
-pub enum CoverState {
-    #[default]
-    NotRequested,
-    Loading,
-    Ready(Arc<DecodedImage>),
-    Missing,
 }
 
 /// Two-tier cover cache: bounded in-memory LRU plus a persistent on-disk
@@ -106,17 +92,6 @@ impl<T> CoverCache<T> {
 
     pub fn disk_path(&self, id: u64) -> PathBuf {
         self.disk_dir.join(format!("{id:016x}.jpg"))
-    }
-
-    /// Placeholder for the `folder.jpg`/`cover.png` fallback lookup —
-    /// `lofty` only reads embedded pictures, so external cover files need
-    /// this separate, album-level path.
-    pub fn find_external_cover(album_dir: &Path) -> Option<PathBuf> {
-        const CANDIDATES: &[&str] = &["cover.jpg", "cover.png", "folder.jpg", "folder.png"];
-        CANDIDATES
-            .iter()
-            .map(|name| album_dir.join(name))
-            .find(|p| p.exists())
     }
 }
 

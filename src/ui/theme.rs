@@ -10,8 +10,12 @@
 
 use gpui::{hsla, rgb, Hsla, Rgba};
 
+use crate::model::config::{DynamicBase, FontKind, DEFAULT_FONT_SIZE};
 use crate::model::config::ThemeKind;
-use crate::model::config::{FontKind, DEFAULT_FONT_SIZE};
+
+/// Below this saturation an accent reads as black & white — the palette drops
+/// the hue entirely instead of tinting with whatever the noise suggests.
+const GREYSCALE_SATURATION: f32 = 0.08;
 
 #[derive(Clone, Copy)]
 pub struct Theme {
@@ -61,8 +65,8 @@ impl Theme {
     pub fn for_kind(kind: ThemeKind, font: &'static str, font_size: f32) -> Self {
         let mut theme = match kind {
             ThemeKind::Light => Self::light_palette(),
-            // The dynamic palette is built by [`Theme::dynamic`]; without an
-            // accent to derive from it reads as the default dark palette.
+            // The dynamic palette is built by [`Theme::dynamic`]; callers
+            // without an accent fall back to the base palette instead.
             ThemeKind::Dark | ThemeKind::Dynamic => Self::dark_palette(),
         };
         theme.font = font;
@@ -79,14 +83,36 @@ impl Theme {
     }
 
     /// A palette derived from `accent` — the dominant colour of the current
-    /// cover. Backgrounds are a dark wash of the accent's hue, text a light tint
-    /// of the same hue, and the accent itself is brightened so it stays readable
-    /// on the dark surfaces. The hue is what carries the cover's character; the
-    /// saturation is clamped so a near-grey cover still yields a usable palette.
-    pub fn dynamic(accent: Rgba, font: &'static str, font_size: f32) -> Self {
-        let base: Hsla = accent.into();
-        let hue = base.h;
-        let sat = base.s.clamp(0.25, 0.65);
+    /// cover — built on `base`: black gives dark surfaces with light text, white
+    /// the inverse, both washed in the accent's hue.
+    ///
+    /// A near-grey accent (a black & white cover) carries no hue worth keeping —
+    /// whatever colour it has is compression noise — so the saturation drops to
+    /// zero and the palette renders as a neutral monochrome theme on the base,
+    /// rather than tinting with an arbitrary hue. For a coloured cover the
+    /// saturation is clamped so a washed-out cover still yields a usable palette.
+    pub fn dynamic(accent: Rgba, base: DynamicBase, font: &'static str, font_size: f32) -> Self {
+        let source: Hsla = accent.into();
+        let hue = source.h;
+        let sat = if source.s < GREYSCALE_SATURATION {
+            0.0
+        } else {
+            source.s.clamp(0.25, 0.65)
+        };
+        match base {
+            DynamicBase::Black => Self::dynamic_dark(hue, sat, font, font_size),
+            DynamicBase::White => Self::dynamic_light(hue, sat, font, font_size),
+        }
+    }
+
+    /// The dark-structured dynamic palette: a dark wash of the hue for surfaces,
+    /// a light tint for text, and a brightened accent that stays readable on
+    /// the dark surfaces.
+    fn dynamic_dark(hue: f32, sat: f32, font: &'static str, font_size: f32) -> Self {
+        // A greyscale accent (sat == 0) renders as pure monochrome: the fixed
+        // tints on text, selection, and the waveform drop out with it.
+        let tinted = |s: f32| if sat == 0.0 { 0.0 } else { s };
+        let accent_sat = if sat == 0.0 { 0.0 } else { sat.clamp(0.45, 0.85) };
         let surface = |lightness: f32| Rgba::from(hsla(hue, sat * 0.5, lightness, 1.0));
         Self {
             font,
@@ -100,14 +126,46 @@ impl Theme {
             row_hover: surface(0.16),
             row_active: surface(0.21),
             row_playing: Rgba::from(hsla(hue, sat * 0.7, 0.17, 1.0)),
-            text: Rgba::from(hsla(hue, 0.15, 0.93, 1.0)),
-            text_muted: Rgba::from(hsla(hue, 0.12, 0.62, 1.0)),
-            text_faint: Rgba::from(hsla(hue, 0.10, 0.46, 1.0)),
-            accent: Rgba::from(hsla(hue, sat.clamp(0.45, 0.85), 0.66, 1.0)),
-            selection: Rgba::from(hsla(hue, 0.45, 0.34, 1.0)),
+            text: Rgba::from(hsla(hue, tinted(0.15), 0.93, 1.0)),
+            text_muted: Rgba::from(hsla(hue, tinted(0.12), 0.62, 1.0)),
+            text_faint: Rgba::from(hsla(hue, tinted(0.10), 0.46, 1.0)),
+            accent: Rgba::from(hsla(hue, accent_sat, 0.66, 1.0)),
+            selection: Rgba::from(hsla(hue, tinted(0.45), 0.34, 1.0)),
             border: surface(0.17),
-            waveform: Rgba::from(hsla(hue, 0.15, 0.30, 1.0)),
-            waveform_played: Rgba::from(hsla(hue, 0.20, 0.95, 1.0)),
+            waveform: Rgba::from(hsla(hue, tinted(0.15), 0.30, 1.0)),
+            waveform_played: Rgba::from(hsla(hue, tinted(0.20), 0.95, 1.0)),
+        }
+    }
+
+    /// The white-structured dynamic palette: [`dynamic_dark`](Self::dynamic_dark)
+    /// inverted — light washes of the hue for surfaces, dark text, and a deepened
+    /// accent so it stays readable on the light surfaces.
+    fn dynamic_light(hue: f32, sat: f32, font: &'static str, font_size: f32) -> Self {
+        // Mirrors [`dynamic_dark`](Self::dynamic_dark): a greyscale accent goes
+        // fully monochrome.
+        let tinted = |s: f32| if sat == 0.0 { 0.0 } else { s };
+        let accent_sat = if sat == 0.0 { 0.0 } else { sat.clamp(0.45, 0.85) };
+        let surface = |lightness: f32| Rgba::from(hsla(hue, sat * 0.35, lightness, 1.0));
+        Self {
+            font,
+            font_size,
+            window_bg: surface(0.94),
+            panel_bg: surface(0.97),
+            rail_bg: surface(0.92),
+            header_bg: surface(0.88),
+            row_even: surface(0.97),
+            row_odd: surface(0.93),
+            row_hover: surface(0.87),
+            row_active: surface(0.81),
+            row_playing: Rgba::from(hsla(hue, sat * 0.5, 0.86, 1.0)),
+            text: Rgba::from(hsla(hue, tinted(0.15), 0.10, 1.0)),
+            text_muted: Rgba::from(hsla(hue, tinted(0.12), 0.38, 1.0)),
+            text_faint: Rgba::from(hsla(hue, tinted(0.10), 0.54, 1.0)),
+            accent: Rgba::from(hsla(hue, accent_sat, 0.34, 1.0)),
+            selection: Rgba::from(hsla(hue, tinted(0.45), 0.78, 1.0)),
+            border: surface(0.82),
+            waveform: Rgba::from(hsla(hue, tinted(0.15), 0.72, 1.0)),
+            waveform_played: Rgba::from(hsla(hue, tinted(0.20), 0.19, 1.0)),
         }
     }
 
@@ -190,19 +248,38 @@ impl Theme {
         self.font_size * 2.9
     }
 
-    /// The duration column.
+    /// The duration column — sized to `12:34` with a little slack, so the
+    /// right-aligned time doesn't drift away from the bitrate next to it.
     pub fn length_col(&self) -> f32 {
-        self.font_size * 4.6
+        self.font_size * 3.4
     }
 
-    /// The bitrate column — wide enough for `999 kb/s`.
+    /// The bitrate column — wide enough for `999 kb/s`, with as little slack
+    /// as the fixed column can carry.
     pub fn bitrate_col(&self) -> f32 {
-        self.font_size * 5.4
+        self.font_size * 5.0
+    }
+
+    /// The release-year column — `1997` with a little slack.
+    pub fn year_col(&self) -> f32 {
+        self.font_size * 2.7
     }
 
     /// The trailing action column (the `×` on a playlist row).
     pub fn action_col(&self) -> f32 {
         self.font_size * 2.0
+    }
+
+    /// The `{label}:` column of a setting row — fixed, so the controls line
+    /// up down the panel.
+    pub fn label_col(&self) -> f32 {
+        self.font_size * 8.0
+    }
+
+    /// A value readout, right-aligned with a little slack — `13 px` in the
+    /// settings font table.
+    pub fn value_col(&self) -> f32 {
+        self.font_size * 3.4
     }
 
     /// One lyric slot's height, so blank padding lines up with real ones.
@@ -224,7 +301,7 @@ mod tests {
     #[test]
     fn dynamic_palette_takes_the_accent_hue_and_stays_readable() {
         let source = rgb(0x3a7bd5);
-        let theme = Theme::dynamic(source, "TX-02", 14.0);
+        let theme = Theme::dynamic(source, DynamicBase::Black, "TX-02", 14.0);
         let accent: Hsla = theme.accent.into();
         let from: Hsla = source.into();
         assert!((accent.h - from.h).abs() < 0.02, "accent hue follows the cover");
@@ -237,12 +314,42 @@ mod tests {
     }
 
     #[test]
-    fn a_grey_cover_still_yields_a_usable_palette() {
-        // A near-grey accent has almost no saturation; the palette clamps it up
-        // rather than collapsing to flat greys.
-        let theme = Theme::dynamic(rgb(0x808080), "TX-02", 14.0);
-        let panel: Hsla = theme.panel_bg.into();
+    fn a_white_base_inverts_the_structure_but_keeps_the_hue() {
+        let source = rgb(0x3a7bd5);
+        let theme = Theme::dynamic(source, DynamicBase::White, "TX-02", 14.0);
+        let accent: Hsla = theme.accent.into();
+        let from: Hsla = source.into();
+        assert!((accent.h - from.h).abs() < 0.02, "accent hue follows the cover");
         let text: Hsla = theme.text.into();
-        assert!(text.l > panel.l + 0.5, "enough contrast to read");
+        let panel: Hsla = theme.panel_bg.into();
+        assert!(text.l < 0.2, "text goes dark on a white base");
+        assert!(panel.l > 0.8, "backgrounds stay light");
+    }
+
+    #[test]
+    fn a_grey_cover_yields_a_monochrome_theme_on_either_base() {
+        // A near-grey accent has almost no saturation; tinting it would pick a
+        // hue out of compression noise, so the palette drops the hue entirely.
+        for base in DynamicBase::ALL {
+            let theme = Theme::dynamic(rgb(0x808080), base, "TX-02", 14.0);
+            let panel: Hsla = theme.panel_bg.into();
+            let text: Hsla = theme.text.into();
+            let accent: Hsla = theme.accent.into();
+            assert!(accent.s < 0.01, "monochrome accent, no invented hue");
+            assert!((text.l - panel.l).abs() > 0.5, "enough contrast to read");
+            match base {
+                DynamicBase::Black => assert!(panel.l < 0.2, "black base stays dark"),
+                DynamicBase::White => assert!(panel.l > 0.8, "white base stays light"),
+            }
+        }
+    }
+
+    #[test]
+    fn a_faintly_tinted_cover_still_reads_as_black_and_white() {
+        // Real b&w art carries a little chroma from JPEG artifacts; it must not
+        // be enough to tint the palette.
+        let theme = Theme::dynamic(rgb(0x827e7a), DynamicBase::Black, "TX-02", 14.0);
+        let accent: Hsla = theme.accent.into();
+        assert!(accent.s < 0.01, "faint chroma is treated as greyscale");
     }
 }

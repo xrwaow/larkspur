@@ -2,7 +2,9 @@
 //!
 //! Kept as data rather than a pure UI concern because a saved "view" (which
 //! tabs are open, which is active, where they sit) is fundamentally a list of
-//! these. [`TabId::kind`] is the stable, persisted form.
+//! these.
+
+use std::path::PathBuf;
 
 use super::playlist::PlaylistId;
 
@@ -17,16 +19,8 @@ pub enum TabId {
     /// "Go to {artist}" menu item. Its own tab rather than a filtered library,
     /// so it sits beside the library instead of replacing it.
     Artist(String),
-}
-
-impl TabId {
-    /// The kind of tab, as a stable string — what a persisted view would store
-    /// alongside the playlist id (or artist name).
-    pub fn kind(&self) -> &'static str {
-        match self {
-            TabId::Browse => "browse",
-            TabId::Playlist(_) => "playlist",
-            TabId::Artist(_) => "artist",
-        }
-    }
+    /// A folder played from the rail's folder view: the temporary playlists
+    /// "Play folder" created, shown as one grouped view. Identified by path,
+    /// so re-playing the same folder focuses the existing tab.
+    Folder(PathBuf),
 }

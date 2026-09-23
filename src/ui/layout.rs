@@ -1,34 +1,38 @@
 //! The app's workspace layout, defined once.
 //!
 //! Both the real UI (`ui/main.rs`) and the layout-introspection tooling
-//! (`layout_dump`, `tests/layout.rs`) build from [`app_layout`], so the
-//! text diagram can never drift from what the app actually renders.
+//! (`tests/layout.rs`) build from [`app_layout`], so the text diagram can
+//! never drift from what the app actually renders.
 
 use super::container::{col, module, Dock, LayoutPlan};
 use super::cover::CoverView;
 use super::introspect::{self, ModuleSizes};
+use super::visualizer::BAND_HEIGHT;
 
 /// The window's dock/center arrangement.
 ///
 /// Playback bar across the bottom, the playlist list docked left, and the
-/// right rail carrying the lyrics panel above the cover square. The center is
-/// the tab container, which holds one active container per tab — browse,
-/// search, or an opened playlist. The rails carry z(2), so they hug their
-/// window edges at full height and the bottom bar (z=1) fits *between* them —
-/// keeping it centered in the window instead of shifted left by the cover.
-pub fn app_layout() -> LayoutPlan {
+/// right rail carrying the visualizer band (when enabled), the lyrics panel,
+/// and the cover square. The center is the tab container, which holds one
+/// active container per tab — browse, search, or an opened playlist. The
+/// rails carry z(2), so they hug their window edges at full height and the
+/// bottom bar (z=1) fits *between* them — keeping it centered in the window
+/// instead of shifted left by the cover.
+///
+/// `show_visualizer` is the config's on/off switch: the band is only in the
+/// layout when it's on, and the workspace re-plans live when the setting
+/// flips (see `ui/main.rs`).
+pub fn app_layout(show_visualizer: bool) -> LayoutPlan {
+    let mut rail = Vec::new();
+    if show_visualizer {
+        rail.push(module("visualizer").px(BAND_HEIGHT));
+    }
+    rail.push(module("lyrics").fill());
+    rail.push(module("cover"));
+
     let mut plan = LayoutPlan::new(module("tabs"));
     plan.dock(Dock::bottom(module("playback")));
-    plan.dock(
-        Dock::right(
-            col(vec![
-                module("lyrics").fill(),
-                module("cover"),
-            ])
-            .px(240.0),
-        )
-        .z(2),
-    );
+    plan.dock(Dock::right(col(rail).px(240.0)).z(2));
     plan.dock(Dock::left(module("playlists").px(240.0)).z(2));
     plan
 }
@@ -49,5 +53,5 @@ const PLAYBACK_BAR_PX: f32 = 180.0;
 /// The current app layout rendered as text — the one call a test (or an
 /// LLM) needs to "see" the UI. See `tests/README.md`.
 pub fn describe_app() -> String {
-    introspect::describe(&app_layout(), &module_sizes())
+    introspect::describe(&app_layout(true), &module_sizes())
 }

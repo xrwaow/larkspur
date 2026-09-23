@@ -30,6 +30,16 @@ pub struct Library {
     index: Index,
 }
 
+/// A playlist's release stamp: the year, and the full date (year, month,
+/// day) — each taken from the first song that declares one, so the two may
+/// come from different songs. The month/day is what breaks year ties in a
+/// discography.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct Release {
+    pub year: Option<u16>,
+    pub date: Option<(u16, u8, u8)>,
+}
+
 /// The derived lookups a [`Library`] answers from instead of rescanning.
 #[derive(Default)]
 struct Index {
@@ -40,8 +50,8 @@ struct Index {
     song_album: HashMap<SongId, PlaylistId>,
     /// The playlists each artist is credited on.
     artist_playlists: BTreeMap<String, Vec<PlaylistId>>,
-    /// Each playlist's release year, taken from its first dated song.
-    playlist_year: HashMap<PlaylistId, Option<u16>>,
+    /// Each playlist's release stamp, taken from its first dated songs.
+    playlist_release: HashMap<PlaylistId, Release>,
 }
 
 impl Library {
@@ -113,11 +123,20 @@ impl Library {
 
     /// All playlists in a stable order: autogen albums by title, then custom
     /// playlists by creation order.
+    ///
+    /// Temporary playlists are deliberately left out — they must not surface
+    /// in the library browse, the rail, or the persisted cache. They're
+    /// reached through [`playlist`](Self::playlist) by whatever holds their id
+    /// (an open tab).
     pub fn playlists(&self) -> Vec<&Playlist> {
-        let mut all: Vec<&Playlist> = self.playlists.values().collect();
+        let mut all: Vec<&Playlist> = self
+            .playlists
+            .values()
+            .filter(|p| p.kind != PlaylistKind::Temporary)
+            .collect();
         all.sort_by(|a, b| {
-            (a.kind == PlaylistKind::Custom, &a.meta.title, a.id.0)
-                .cmp(&(b.kind == PlaylistKind::Custom, &b.meta.title, b.id.0))
+            (a.kind == PlaylistKind::Custom, a.meta().title, a.id.0)
+                .cmp(&(b.kind == PlaylistKind::Custom, b.meta().title, b.id.0))
         });
         all
     }
@@ -137,10 +156,23 @@ impl Library {
         self.index.song_album.get(&song).copied()
     }
 
+    /// A playlist's release stamp: the first year and the first full date
+    /// any of its songs declare. An index lookup.
+    pub fn release(&self, id: PlaylistId) -> Release {
+        self.index.playlist_release.get(&id).copied().unwrap_or_default()
+    }
+
     /// A playlist's release year: the first year any of its songs declares.
     /// `None` when no song carries one. An index lookup.
     pub fn playlist_year(&self, id: PlaylistId) -> Option<u16> {
-        self.index.playlist_year.get(&id).copied().flatten()
+        self.release(id).year
+    }
+
+    /// A playlist's full release date, by the same rule as
+    /// [`playlist_year`](Self::playlist_year). The month/day breaks year ties
+    /// in a discography. An index lookup.
+    pub fn playlist_date(&self, id: PlaylistId) -> Option<(u16, u8, u8)> {
+        self.release(id).date
     }
 
     // --- custom playlist mutation -------------------------------------
@@ -158,7 +190,7 @@ impl Library {
             id,
             Playlist {
                 id,
-                meta: PlaylistMeta::new(title),
+                meta: Some(PlaylistMeta::new(title)),
                 kind: PlaylistKind::Custom,
                 song_ids: Vec::new(),
                 origin: None,
@@ -166,6 +198,39 @@ impl Library {
         );
         self.reindex();
         id
+    }
+
+    /// Create a temporary playlist pre-filled with `songs` — the backing for
+    /// an ad-hoc view ("Play folder", a selection played as one). Temporary
+    /// playlists are immutable snapshots: never persisted, dropped by a
+    /// rescan, and deleted when their tab closes.
+    pub fn create_temporary(&mut self, title: impl Into<String>, songs: Vec<SongId>) -> PlaylistId {
+        self.create_temporaries(vec![(title.into(), songs)]).remove(0)
+    }
+
+    /// Create several temporary playlists at once, re-indexing once — a
+    /// folder view can need hundreds, and a reindex walks the whole library.
+    pub fn create_temporaries(
+        &mut self,
+        groups: Vec<(String, Vec<SongId>)>,
+    ) -> Vec<PlaylistId> {
+        let mut ids = Vec::with_capacity(groups.len());
+        for (title, songs) in groups {
+            let id = self.alloc_playlist_id();
+            self.playlists.insert(
+                id,
+                Playlist {
+                    id,
+                    meta: Some(PlaylistMeta::new(title)),
+                    kind: PlaylistKind::Temporary,
+                    song_ids: songs,
+                    origin: None,
+                },
+            );
+            ids.push(id);
+        }
+        self.reindex();
+        ids
     }
 
     /// Add a song to a custom playlist.
@@ -222,20 +287,38 @@ impl Library {
         if p.kind != PlaylistKind::Custom {
             return false;
         }
-        p.meta.title = title.into();
+        if let Some(meta) = p.meta.as_mut() {
+            meta.title = title.into();
+        }
         // A title isn't indexed, so no reindex is needed here.
         true
     }
 
-    /// Delete a playlist. Only custom playlists can be removed; autogen ones
-    /// are rebuilt from tags.
+    /// Delete a playlist. Custom playlists are removed from the rail; temporary
+    /// ones are deleted when their tab closes. Autogen ones can't be removed —
+    /// they're rebuilt from tags.
     pub fn remove_playlist(&mut self, playlist: PlaylistId) -> Option<Playlist> {
-        let removed = if self.playlists.get(&playlist).is_some_and(Playlist::is_custom) {
-            self.playlists.remove(&playlist)
+        if self.playlists.get(&playlist).is_some_and(|p| p.kind != PlaylistKind::Auto) {
+            let removed = self.playlists.remove(&playlist);
+            self.reindex();
+            removed
         } else {
             None
-        };
-        if removed.is_some() {
+        }
+    }
+
+    /// Delete several playlists at once, re-indexing once — closing a folder
+    /// tab can remove hundreds of temporary playlists. Autogen playlists are
+    /// skipped. Returns how many were removed.
+    pub fn remove_playlists(&mut self, ids: &[PlaylistId]) -> usize {
+        let mut removed = 0;
+        for id in ids {
+            if self.playlists.get(id).is_some_and(|p| p.kind != PlaylistKind::Auto) {
+                self.playlists.remove(id);
+                removed += 1;
+            }
+        }
+        if removed > 0 {
             self.reindex();
         }
         removed
@@ -292,20 +375,22 @@ impl Library {
             .unwrap_or_default()
     }
 
-    fn title_of(&self, id: PlaylistId) -> String {
-        self.playlists.get(&id).map(|p| p.meta.title.clone()).unwrap_or_default()
+    pub(crate) fn title_of(&self, id: PlaylistId) -> String {
+        self.playlists.get(&id).map(|p| p.meta().title).unwrap_or_default()
     }
 
-    /// Newest release first; albums with no year sort below the dated ones, and
-    /// ties break on title so the order is stable.
-    fn sort_by_year(&self, ids: &mut [PlaylistId]) {
+    /// Newest release first: by year, then — within a year — by the release
+    /// date's month/day, then by title so the order is stable. Albums with no
+    /// year sort below the dated ones.
+    pub(crate) fn sort_by_year(&self, ids: &mut [PlaylistId]) {
         ids.sort_by(|a, b| {
             let title_a = self.title_of(*a);
             let title_b = self.title_of(*b);
             match (self.playlist_year(*a), self.playlist_year(*b)) {
-                (Some(year_a), Some(year_b)) => {
-                    year_b.cmp(&year_a).then_with(|| title_a.cmp(&title_b))
-                }
+                (Some(year_a), Some(year_b)) => year_b
+                    .cmp(&year_a)
+                    .then_with(|| self.playlist_date(*b).cmp(&self.playlist_date(*a)))
+                    .then_with(|| title_a.cmp(&title_b)),
                 (Some(_), None) => std::cmp::Ordering::Less,
                 (None, Some(_)) => std::cmp::Ordering::Greater,
                 (None, None) => title_a.cmp(&title_b),
@@ -394,18 +479,12 @@ impl Library {
             .collect();
 
         for ((album, artist, dir), ids) in groups {
-            let origin = PlaylistOrigin::Album { name: album.clone(), artist: artist.clone(), dir };
-            let meta = PlaylistMeta {
-                title: album,
-                artist: Some(artist),
-                cover: ids.first().copied(),
-            };
+            let origin = PlaylistOrigin::Album { name: album, artist, dir };
 
             match existing.remove(&origin) {
                 Some(id) => {
                     if let Some(p) = self.playlists.get_mut(&id) {
                         p.song_ids = ids;
-                        p.meta = meta;
                     }
                 }
                 None => {
@@ -414,7 +493,9 @@ impl Library {
                         id,
                         Playlist {
                             id,
-                            meta,
+                            // An autogen playlist's meta is derived from its
+                            // origin and first song — see `Playlist::meta`.
+                            meta: None,
                             kind: PlaylistKind::Auto,
                             song_ids: ids,
                             origin: Some(origin),
@@ -443,24 +524,31 @@ impl Library {
             }
         }
         for playlist in self.playlists.values() {
-            let mut year = None;
+            let mut release = Release::default();
             for song_id in &playlist.song_ids {
                 let Some(song) = self.songs.get(song_id) else { continue };
-                if year.is_none() {
-                    year = song.year;
+                if release.year.is_none() {
+                    release.year = song.year;
+                }
+                if release.date.is_none() {
+                    release.date = song.release_date;
                 }
                 if playlist.kind == PlaylistKind::Auto {
                     index.song_album.insert(*song_id, playlist.id);
                 }
-                for artist in &song.artists {
-                    index
-                        .artist_playlists
-                        .entry(artist.clone())
-                        .or_default()
-                        .push(playlist.id);
+                // Temporary playlists are ad-hoc views, not credits — an
+                // artist's "appears in" grouping must not list them.
+                if playlist.kind != PlaylistKind::Temporary {
+                    for artist in &song.artists {
+                        index
+                            .artist_playlists
+                            .entry(artist.clone())
+                            .or_default()
+                            .push(playlist.id);
+                    }
                 }
             }
-            index.playlist_year.insert(playlist.id, year);
+            index.playlist_release.insert(playlist.id, release);
         }
         for ids in index.artist_playlists.values_mut() {
             ids.sort();
@@ -479,7 +567,7 @@ fn artist_set(library: &Library) -> std::collections::BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CoverState, Lyrics};
+    use crate::model::Lyrics;
     use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::time::Duration;
@@ -494,10 +582,11 @@ mod tests {
             album_artist: None,
             track_position: None,
             year: None,
+            release_date: None,
             nominal_bitrate: None,
             lyrics: Lyrics::None,
             duration: Duration::ZERO,
-            cover: CoverState::Missing,
+            has_art: false,
         }
     }
 
@@ -531,6 +620,12 @@ mod tests {
         song
     }
 
+    fn dated(id: SongId, name: &str, artist: &str, album: &str, date: (u16, u8, u8)) -> SongMetadata {
+        let mut song = with_year(tagged(id, name, artist, album, 1), date.0);
+        song.release_date = Some(date);
+        song
+    }
+
     #[test]
     fn insert_and_get_roundtrip() {
         let mut lib = Library::default();
@@ -553,7 +648,7 @@ mod tests {
         lib.playlists()
             .into_iter()
             .filter(|p| !p.is_custom())
-            .map(|p| p.meta.title.clone())
+            .map(|p| p.meta().title)
             .collect()
     }
 
@@ -569,7 +664,7 @@ mod tests {
         let album = lib
             .playlists()
             .into_iter()
-            .find(|p| p.meta.title == "Album")
+            .find(|p| p.meta().title == "Album")
             .unwrap();
         let order: Vec<&str> =
             lib.songs_of(album.id).iter().map(|s| s.song_name.as_deref().unwrap()).collect();
@@ -615,7 +710,7 @@ mod tests {
         lib.insert_song(song(1, "mystery"));
         lib.rebuild_auto();
         assert_eq!(lib.playlists().len(), 1);
-        assert_eq!(lib.playlists()[0].meta.title, "Unknown Album");
+        assert_eq!(lib.playlists()[0].meta().title, "Unknown Album");
     }
 
     #[test]
@@ -659,7 +754,7 @@ mod tests {
         let album = lib
             .playlists()
             .into_iter()
-            .find(|p| p.meta.title == "Album")
+            .find(|p| p.meta().title == "Album")
             .unwrap();
         assert_eq!(lib.album_playlist_of(1), Some(album.id));
         assert_eq!(lib.album_playlist_of(999), None);
@@ -683,6 +778,33 @@ mod tests {
         let b = lib.create_custom("Same");
         assert_ne!(a, b);
         assert_eq!(lib.custom_playlists().len(), 2);
+    }
+
+    #[test]
+    fn temporary_playlists_are_ephemeral() {
+        let mut lib = Library::default();
+        lib.insert_song(tagged(1, "A", "X", "Album", 1));
+        lib.rebuild_auto();
+
+        let temp = lib.create_temporary("Folder", vec![1]);
+        assert!(lib.playlist(temp).is_some_and(|p| p.is_temporary()));
+        // Not listed with the real playlists — the rail, the browse, and the
+        // persisted cache all read that list.
+        assert!(!lib.playlists().iter().any(|p| p.id == temp));
+        assert!(lib.custom_playlists().is_empty());
+        // Reachable by id, and deletable (unlike an autogen playlist).
+        assert_eq!(lib.playlist(temp).map(|p| p.song_ids.clone()), Some(vec![1]));
+        assert!(lib.remove_playlist(temp).is_some());
+        assert!(lib.playlist(temp).is_none());
+    }
+
+    #[test]
+    fn temporary_playlists_stay_out_of_the_artist_index() {
+        let mut lib = Library::default();
+        lib.insert_song(tagged(1, "A", "Grimes", "Visions", 1));
+        lib.rebuild_auto();
+        lib.create_temporary("Mix", vec![1]);
+        assert_eq!(lib.artist_appears_in("Grimes").len(), 1, "the album only");
     }
 
     #[test]
@@ -725,6 +847,22 @@ mod tests {
             lib.discography("Grimes").iter().map(|id| lib.title_of(*id)).collect();
         assert_eq!(titles, vec!["New", "Middle", "Old", "Undated"]);
         assert_eq!(lib.playlist_year(lib.discography("Grimes")[0]), Some(2020));
+    }
+
+    #[test]
+    fn discography_breaks_year_ties_on_month_and_day() {
+        let mut lib = Library::default();
+        lib.insert_song(dated(1, "A", "Grimes", "June", (2010, 6, 1)));
+        lib.insert_song(dated(2, "B", "Grimes", "September", (2010, 9, 1)));
+        lib.insert_song(dated(3, "C", "Grimes", "DayOnly", (2010, 6, 2)));
+        lib.insert_song(with_year(tagged(4, "D", "Grimes", "NoDate", 1), 2010));
+        lib.rebuild_auto();
+
+        let titles: Vec<String> =
+            lib.discography("Grimes").iter().map(|id| lib.title_of(*id)).collect();
+        // Newest month/day first; an album with no full date falls under ones
+        // that have it, all within the same year.
+        assert_eq!(titles, vec!["September", "DayOnly", "June", "NoDate"]);
     }
 
     #[test]

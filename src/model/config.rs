@@ -39,6 +39,39 @@ impl ThemeKind {
     }
 }
 
+/// The surface the dynamic theme builds on: a black (dark) or white (light)
+/// base. Only consulted while [`ThemeKind::Dynamic`] is selected — it decides
+/// both the palette structure and what a black & white cover renders as.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum DynamicBase {
+    /// Dark surfaces with light text — the original dynamic look.
+    #[default]
+    Black,
+    /// Light surfaces with dark text, tinted by the same cover hue.
+    White,
+}
+
+impl DynamicBase {
+    /// Every selectable base, in the order the settings panel lists them.
+    pub const ALL: [DynamicBase; 2] = [DynamicBase::Black, DynamicBase::White];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            DynamicBase::Black => "Black",
+            DynamicBase::White => "White",
+        }
+    }
+}
+
+impl From<DynamicBase> for ThemeKind {
+    fn from(base: DynamicBase) -> Self {
+        match base {
+            DynamicBase::Black => ThemeKind::Dark,
+            DynamicBase::White => ThemeKind::Light,
+        }
+    }
+}
+
 /// How the transport bar draws the waveform.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum WaveformStyle {
@@ -121,11 +154,33 @@ impl FontKind {
 pub const MIN_FONT_SIZE: f32 = 8.0;
 pub const MAX_FONT_SIZE: f32 = 32.0;
 
+/// The window's last on-screen placement, persisted so the next launch reopens
+/// exactly where the user left it. `None` until the first save — a fresh
+/// install opens at half the monitor's size, centered.
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct WindowPlacement {
+    pub x: f32,
+    pub y: f32,
+    pub width: f32,
+    pub height: f32,
+}
+
+/// The serde default for [`Config::visualizer`] — the field postdates the
+/// first configs, and an older file should gain the visualizer rather than
+/// silently lose it.
+fn default_visualizer() -> bool {
+    true
+}
+
 /// Runtime configuration, loaded from and saved to disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
     /// Which palette to draw with.
     pub theme: ThemeKind,
+    /// What the dynamic theme builds on — only read while `theme` is
+    /// [`ThemeKind::Dynamic`].
+    #[serde(default)]
+    pub dynamic_base: DynamicBase,
     /// Per-container typeface overrides, keyed by
     /// [`Container::container_id`](crate::ui::container::Container::container_id).
     /// A container absent here draws with [`FontKind::default`].
@@ -141,16 +196,26 @@ pub struct Config {
     /// How the transport bar draws the waveform.
     #[serde(default)]
     pub waveform: WaveformStyle,
+    /// Whether the spectrum-bar band above the lyrics is shown.
+    #[serde(default = "default_visualizer")]
+    pub visualizer: bool,
+    /// Where the window was when the app last ran, so it reopens the same
+    /// size and position.
+    #[serde(default)]
+    pub window: Option<WindowPlacement>,
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
             theme: ThemeKind::Dark,
+            dynamic_base: DynamicBase::default(),
             fonts: HashMap::new(),
             font_sizes: HashMap::new(),
             roots: Vec::new(),
             waveform: WaveformStyle::default(),
+            visualizer: default_visualizer(),
+            window: None,
         }
     }
 }
@@ -235,6 +300,16 @@ impl Config {
         }
     }
 
+    /// Record where the window was. Returns whether anything changed, so a
+    /// caller can skip redundant work.
+    pub fn set_window(&mut self, placement: WindowPlacement) -> bool {
+        if self.window == Some(placement) {
+            return false;
+        }
+        self.window = Some(placement);
+        true
+    }
+
     /// Add a scan root, canonicalized so the same directory can't be listed
     /// twice under different spellings. Returns whether it was added.
     pub fn add_root(&mut self, path: PathBuf) -> bool {
@@ -304,6 +379,7 @@ mod tests {
     fn round_trips_through_json() {
         let mut config = Config::default();
         config.theme = ThemeKind::Light;
+        config.dynamic_base = DynamicBase::White;
         config.set_font("browse", Some(FontKind::Inter));
         config.set_font_size("lyrics", Some(16.0));
         config.add_root(PathBuf::from("/music"));
@@ -311,6 +387,7 @@ mod tests {
         let bytes = serde_json::to_vec(&config).unwrap();
         let back: Config = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(back.theme, ThemeKind::Light);
+        assert_eq!(back.dynamic_base, DynamicBase::White);
         assert_eq!(back.font_for("browse", FontKind::Tx02), FontKind::Inter);
         assert_eq!(back.font_size_for("lyrics", 14.0), 16.0);
         assert_eq!(back.roots, vec![PathBuf::from("/music")]);
@@ -338,6 +415,14 @@ mod tests {
     }
 
     #[test]
+    fn a_config_without_a_dynamic_base_defaults_to_black() {
+        // An older config predates the `dynamic_base` field.
+        let json = r#"{"theme":"Dynamic","font_sizes":{},"roots":[]}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.dynamic_base, DynamicBase::Black);
+    }
+
+    #[test]
     fn waveform_defaults_to_bars_and_round_trips() {
         assert_eq!(Config::default().waveform, WaveformStyle::Bars);
         let mut config = Config::default();
@@ -353,5 +438,38 @@ mod tests {
         let json = r#"{"theme":"Dark","font_sizes":{},"roots":[]}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert_eq!(config.waveform, WaveformStyle::Bars);
+    }
+
+    #[test]
+    fn visualizer_defaults_on_and_round_trips() {
+        assert!(Config::default().visualizer);
+        let mut config = Config::default();
+        config.visualizer = false;
+        let bytes = serde_json::to_vec(&config).unwrap();
+        let back: Config = serde_json::from_slice(&bytes).unwrap();
+        assert!(!back.visualizer);
+    }
+
+    #[test]
+    fn a_config_without_a_visualizer_field_defaults_to_on() {
+        // An older config predates the `visualizer` field.
+        let json = r#"{"theme":"Dark","font_sizes":{},"roots":[]}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert!(config.visualizer);
+    }
+
+    #[test]
+    fn window_placement_round_trips_and_defaults_to_none() {
+        let json = r#"{"theme":"Dark","font_sizes":{},"roots":[]}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.window, None, "an older config predates `window`");
+
+        let mut config = Config::default();
+        let placement = WindowPlacement { x: 10.0, y: 20.0, width: 800.0, height: 600.0 };
+        assert!(config.set_window(placement), "first set changes");
+        assert!(!config.set_window(placement), "same placement is a no-op");
+        let bytes = serde_json::to_vec(&config).unwrap();
+        let back: Config = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.window, Some(placement));
     }
 }

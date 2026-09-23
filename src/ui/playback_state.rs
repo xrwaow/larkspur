@@ -17,9 +17,9 @@ use std::time::{Duration, Instant};
 
 use gpui::Context;
 
-use crate::analysis::{analyze_track, TrackAnalysis};
-use crate::audio::PlaybackController;
-use crate::model::{InputAction, SongMetadata, SongStatus};
+use crate::analysis::{analyze_track, Spectrogram, TrackAnalysis};
+use crate::audio::{PlaybackController, SongStatus};
+use crate::model::{InputAction, SongMetadata};
 use crate::ui::animation::SLOW_FPS;
 
 /// How many bars a waveform is reduced to.
@@ -52,6 +52,15 @@ impl TrackAnalysisState {
     pub fn peaks(&self) -> Option<Arc<Vec<f32>>> {
         match self {
             TrackAnalysisState::Ready(analysis) => Some(analysis.peaks.clone()),
+            TrackAnalysisState::Loading | TrackAnalysisState::Unavailable => None,
+        }
+    }
+
+    /// The fine-grained peaks the visualizer draws from, if ready. Cheap:
+    /// clones an `Arc`.
+    pub fn spectrogram(&self) -> Option<Arc<Spectrogram>> {
+        match self {
+            TrackAnalysisState::Ready(analysis) => Some(analysis.spectrogram.clone()),
             TrackAnalysisState::Loading | TrackAnalysisState::Unavailable => None,
         }
     }
@@ -147,6 +156,12 @@ impl PlaybackState {
     /// The current track's waveform peaks, if the analysis is ready.
     pub fn peaks(&self) -> Option<Arc<Vec<f32>>> {
         self.analysis.peaks()
+    }
+
+    /// The current track's spectrogram (the visualizer's data), if the
+    /// analysis is ready.
+    pub fn spectrogram(&self) -> Option<Arc<Spectrogram>> {
+        self.analysis.spectrogram()
     }
 
     /// The current track's live bitrate in bits per second, refreshed every

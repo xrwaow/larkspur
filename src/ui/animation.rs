@@ -154,15 +154,15 @@ fn ease_out_cubic(t: f32) -> f32 {
 
 /// Stiffness of the highlight springs, in force per unit displacement. Higher
 /// is snappier.
-pub const SPRING_STIFFNESS: f32 = 1300.0;
+pub const SPRING_STIFFNESS: f32 = 260.0;
 
 /// Damping of the highlight springs. `2 * sqrt(stiffness)` is critically damped;
 /// a little under that gives the faintest overshoot — alive, not bouncy.
-pub const SPRING_DAMPING: f32 = 50.0;
+pub const SPRING_DAMPING: f32 = 30.0;
 
 /// Below this displacement and velocity a spring counts as settled.
-const SPRING_SETTLE_VALUE: f32 = 0.05;
-const SPRING_SETTLE_VELOCITY: f32 = 0.5;
+const SPRING_SETTLE_VALUE: f32 = 0.001;
+const SPRING_SETTLE_VELOCITY: f32 = 0.02;
 
 /// Longest integration step before the spring substeps, so a long frame can't
 /// make the explicit integration blow up.

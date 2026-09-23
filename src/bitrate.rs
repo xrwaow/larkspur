@@ -13,12 +13,9 @@
 //!
 //! [`SongMetadata::nominal_bitrate`]: crate::model::SongMetadata::nominal_bitrate
 
-use std::path::Path;
 use std::time::Duration;
 
 use symphonia::core::units::TimeBase;
-
-use crate::decode::open_track;
 
 /// A track's compressed-bitrate curve over media time.
 ///
@@ -34,51 +31,9 @@ pub struct BitrateProfile {
 }
 
 impl BitrateProfile {
-    /// Demux `path` and bucket each packet's bytes into `bucket`-sized slices
-    /// of media time. Used by `bitrate_probe`; the app goes through
-    /// `analysis::analyze_track` so the demux is shared with the waveform.
-    pub fn compute(path: &Path, bucket: Duration) -> anyhow::Result<Self> {
-        let bucket_secs = bucket.as_secs_f64();
-        anyhow::ensure!(bucket_secs > 0.0, "bucket must be positive");
-
-        let mut opened = open_track(path, false)?;
-        let track_id = opened.track_id;
-        let (time_base, sample_rate) = {
-            let track = opened
-                .format
-                .tracks()
-                .iter()
-                .find(|t| t.id == track_id)
-                .ok_or_else(|| anyhow::anyhow!("no track {track_id}"))?;
-            (track.codec_params.time_base, track.codec_params.sample_rate)
-        };
-
-        let mut byte_counts: Vec<u64> = Vec::new();
-        loop {
-            let packet = match opened.format.next_packet() {
-                Ok(packet) => packet,
-                // End of stream (or a corrupt packet): stop; the buckets we
-                // have cover everything readable.
-                Err(_) => break,
-            };
-            if packet.track_id() != track_id {
-                continue;
-            }
-
-            let start = units_to_duration(packet.ts(), time_base, sample_rate);
-            let index = (start.as_secs_f64() / bucket_secs).floor() as usize;
-            if byte_counts.len() <= index {
-                byte_counts.resize(index + 1, 0);
-            }
-            byte_counts[index] += packet.data.len() as u64;
-        }
-
-        Ok(Self::from_byte_counts(bucket, byte_counts))
-    }
-
-    /// Build a profile from per-bucket byte counts. Shared with the one-pass
-    /// track analysis, which collects the counts while decoding for the
-    /// waveform instead of demuxing a second time.
+    /// Build a profile from per-bucket byte counts. The one-pass track
+    /// analysis collects the counts while decoding for the waveform, instead
+    /// of demuxing a second time.
     pub(crate) fn from_byte_counts(bucket: Duration, byte_counts: Vec<u64>) -> Self {
         let bucket_secs = bucket.as_secs_f64().max(1e-6);
         let buckets = byte_counts

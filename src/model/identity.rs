@@ -10,9 +10,9 @@ use twox_hash::XxHash64;
 /// silently invalidate a persisted library/cover cache on toolchain
 /// upgrades. XxHash64 is fast and has a fixed, documented algorithm.
 ///
-/// Every cross-reference in the app (`Library`, `Album`, `StreamingInfo`,
-/// cover cache keys) goes through this id rather than passing owned
-/// `SongMetadata` copies around, so a tag edit only has to happen once.
+/// Every cross-reference in the app (`Library`, `Playlist` song lists and
+/// cover picks, cover cache keys) goes through this id rather than passing
+/// owned `SongMetadata` copies around, so a tag edit only has to happen once.
 pub type SongId = u64;
 
 /// Derive the [`SongId`] for a path.

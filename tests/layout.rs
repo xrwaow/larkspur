@@ -12,7 +12,11 @@ use larkspur::ui::introspect::{self, LayoutReport};
 use larkspur::ui::layout;
 
 fn report() -> LayoutReport {
-    introspect::report(&layout::app_layout(), &layout::module_sizes())
+    introspect::report(&layout::app_layout(true), &layout::module_sizes())
+}
+
+fn report_without_visualizer() -> LayoutReport {
+    introspect::report(&layout::app_layout(false), &layout::module_sizes())
 }
 
 fn names(report: &LayoutReport) -> Vec<String> {
@@ -31,7 +35,7 @@ fn touches(report: &LayoutReport, a: &str, b: &str) -> bool {
 fn every_module_in_the_layout_gets_a_region() {
     let report = report();
     let names = names(&report);
-    for id in ["tabs", "playlists", "lyrics", "cover", "playback"] {
+    for id in ["tabs", "playlists", "visualizer", "lyrics", "cover", "playback"] {
         assert!(names.iter().any(|n| n == id), "no region for {id}: {names:?}");
     }
 }
@@ -44,11 +48,23 @@ fn left_rail_spans_the_full_window_height() {
 }
 
 #[test]
-fn right_rail_is_split_into_lyrics_and_cover() {
+fn right_rail_is_split_into_visualizer_lyrics_and_cover() {
     let report = report();
-    // The lyrics panel occupies the top of the rail, the cover the bottom.
-    assert!(touches(&report, "lyrics", "window.top"));
+    // The visualizer band hugs the top of the rail, the cover the bottom,
+    // and the lyrics panel sits between them.
+    assert!(touches(&report, "visualizer", "window.top"));
+    assert!(touches(&report, "visualizer", "lyrics"));
+    assert!(touches(&report, "lyrics", "cover"));
     assert!(touches(&report, "cover", "window.bottom"));
+}
+
+#[test]
+fn turning_the_visualizer_off_removes_its_band() {
+    let report = report_without_visualizer();
+    let names = names(&report);
+    assert!(!names.iter().any(|n| n == "visualizer"), "no region for the visualizer: {names:?}");
+    // With the band gone, the lyrics panel is the top of the rail again.
+    assert!(touches(&report, "lyrics", "window.top"));
     assert!(touches(&report, "lyrics", "cover"));
 }
 
@@ -96,7 +112,7 @@ fn docks_resolve_outermost_first() {
 #[test]
 fn describe_app_produces_a_readable_diagram() {
     let text = layout::describe_app();
-    for id in ["playlists", "lyrics", "cover", "playback", "tabs"] {
+    for id in ["playlists", "visualizer", "lyrics", "cover", "playback", "tabs"] {
         assert!(text.contains(id), "diagram should mention {id}:\n{text}");
     }
     assert!(text.contains('┌') && text.contains('─') && text.contains('│'), "diagram should be box-drawn:\n{text}");

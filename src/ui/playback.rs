@@ -3,8 +3,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    canvas, div, fill, point, prelude::*, px, size, AnyElement, Bounds, Context, Entity,
-    MouseButton, MouseDownEvent, PathBuilder, Pixels, Render, Rgba, Subscription, Window,
+    canvas, div, point, prelude::*, px, AnyElement, Bounds, Context, Entity, MouseButton,
+    MouseDownEvent, PathBuilder, Pixels, Render, Rgba, Subscription, Window,
 };
 
 use crate::model::config::WaveformStyle;
@@ -12,8 +12,9 @@ use crate::model::InputAction;
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::format::format_duration;
-use crate::ui::state::PlaybackState;
+use crate::ui::playback_state::PlaybackState;
 use crate::ui::theme::Theme;
+use crate::ui::widgets;
 
 pub struct PlaybackView {
     /// Shared playback state. This view reads it and dispatches actions
@@ -73,7 +74,6 @@ impl Container for PlaybackView {
 
 const BAR_WIDTH: f32 = 480.0;
 const BAR_HEIGHT: f32 = 40.0;
-const BAR_GAP: f32 = 1.0;
 
 impl Render for PlaybackView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -148,8 +148,8 @@ impl Render for PlaybackView {
                 }),
             );
 
-        // The waveform sits on top, the time labels under it, and the transport
-        // controls beneath both.
+        // The waveform sits on top; below it a single row with the current
+        // time, the transport controls, and the end time.
         div()
             .flex()
             .flex_col()
@@ -163,71 +163,72 @@ impl Render for PlaybackView {
             .child(
                 div()
                     .flex()
-                    .justify_between()
                     .items_center()
+                    .justify_between()
                     .w(px(BAR_WIDTH))
-                    .text_size(px(theme.small_px()))
-                    .text_color(theme.text_muted)
-                    .child(format_duration(position))
-                    // The live bitrate now rides on the playing track's row in
-                    // the list views, next to its duration.
+                    .child(
+                        div()
+                            .text_size(px(theme.small_px()))
+                            .text_color(theme.text_muted)
+                            .child(format_duration(position)),
+                    )
+                    .child(
+                        div()
+                            .flex()
+                            .gap_4()
+                            .items_center()
+                            .child(transport_button(
+                                "prev",
+                                can_prev,
+                                PREV_POLYGONS,
+                                theme,
+                                cx.listener(|this, _event, _window, cx| {
+                                    this.dispatch(InputAction::PrevTrack, cx);
+                                }),
+                            ))
+                            .child(
+                                div()
+                                    .id("play-pause")
+                                    .when(!ended, |d| d.cursor_pointer())
+                                    .when(ended, |d| d.opacity(0.4))
+                                    .rounded_full()
+                                    .size(px(48.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .bg(theme.text)
+                                    .when(!ended, |d| d.hover(|d| d.bg(theme.text_muted)))
+                                    .on_click(cx.listener(|this, _event, _window, cx| {
+                                        this.dispatch(InputAction::TogglePause, cx);
+                                    }))
+                                    .child(div().flex().items_center().child(if playing {
+                                        icon(13.0, 16.0, PAUSE_POLYGONS, theme.panel_bg)
+                                            .into_any_element()
+                                    } else {
+                                        // Nudge the triangle right so it reads as
+                                        // optically centered in the circle.
+                                        div()
+                                            .pl(px(2.0))
+                                            .child(icon(14.0, 16.0, PLAY_POLYGONS, theme.panel_bg))
+                                            .into_any_element()
+                                    })),
+                            )
+                            .child(transport_button(
+                                "next",
+                                can_next,
+                                NEXT_POLYGONS,
+                                theme,
+                                cx.listener(|this, _event, _window, cx| {
+                                    this.dispatch(InputAction::NextTrack, cx);
+                                }),
+                            )),
+                    )
                     .child(
                         div()
                             .text_size(px(theme.small_px()))
                             .text_color(theme.text_muted)
                             .child(format_duration(duration)),
                     ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .gap_4()
-                    .items_center()
-                    .justify_center()
-                    .child(transport_button(
-                        "prev",
-                        can_prev,
-                        PREV_POLYGONS,
-                        theme,
-                        cx.listener(|this, _event, _window, cx| {
-                            this.dispatch(InputAction::PrevTrack, cx);
-                        }),
-                    ))
-                    .child(
-                        div()
-                            .id("play-pause")
-                            .when(!ended, |d| d.cursor_pointer())
-                            .when(ended, |d| d.opacity(0.4))
-                            .rounded_full()
-                            .size(px(48.0))
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(theme.text)
-                            .when(!ended, |d| d.hover(|d| d.bg(theme.text_muted)))
-                            .on_click(cx.listener(|this, _event, _window, cx| {
-                                this.dispatch(InputAction::TogglePause, cx);
-                            }))
-                            .child(div().flex().items_center().child(if playing {
-                                icon(13.0, 16.0, PAUSE_POLYGONS, theme.panel_bg).into_any_element()
-                            } else {
-                                // Nudge the triangle right so it reads as
-                                // optically centered in the circle.
-                                div()
-                                    .pl(px(2.0))
-                                    .child(icon(14.0, 16.0, PLAY_POLYGONS, theme.panel_bg))
-                                    .into_any_element()
-                            })),
-                    )
-                    .child(transport_button(
-                        "next",
-                        can_next,
-                        NEXT_POLYGONS,
-                        theme,
-                        cx.listener(|this, _event, _window, cx| {
-                            this.dispatch(InputAction::NextTrack, cx);
-                        }),
-                    )),
             )
     }
 }
@@ -351,35 +352,20 @@ fn render_waveform(
     }
 }
 
-/// Paint the bars in a single canvas pass.
-///
-/// One element with one paint callback, instead of one `div` per bar — the
-/// element-tree cost is constant no matter how many buckets we use, so the
-/// bucket count can grow toward per-pixel resolution without a frame cost.
+/// Paint the bars through the shared bar-strip pass — only the per-bar color
+/// (played/unplayed) and the baseline floor are this view's own.
 fn waveform_bars(peaks: Arc<Vec<f32>>, progress: f32, theme: Theme) -> AnyElement {
     canvas(
         |_bounds, _window, _cx| (),
         move |bounds, _prepaint, window, _cx| {
             let count = peaks.len();
-            if count == 0 {
-                return;
-            }
-            let width = f32::from(bounds.size.width);
-            let height = f32::from(bounds.size.height);
-            let slot = width / count as f32;
-            let bar_width = (slot - BAR_GAP).max(1.0);
-            let origin_x = f32::from(bounds.origin.x);
-            let origin_y = f32::from(bounds.origin.y);
-
-            for (i, &peak) in peaks.iter().enumerate() {
-                let bar_height = (peak.max(0.04) * height).max(1.0);
-                let x = origin_x + i as f32 * slot + (slot - bar_width) / 2.0;
-                let y = origin_y + (height - bar_height);
-                let bar = Bounds::new(point(px(x), px(y)), size(px(bar_width), px(bar_height)));
-                let played = (i as f32 / count as f32) < progress;
-                let color = if played { theme.waveform_played } else { theme.waveform };
-                window.paint_quad(fill(bar, color));
-            }
+            widgets::paint_bars(window, bounds, &peaks, 0.04, |i| {
+                if (i as f32 / count.max(1) as f32) < progress {
+                    theme.waveform_played
+                } else {
+                    theme.waveform
+                }
+            });
         },
     )
     .size_full()

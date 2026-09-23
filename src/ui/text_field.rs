@@ -53,6 +53,17 @@ impl TextField {
         })
     }
 
+    /// Handle an editing key, reading the clipboard for paste itself.
+    ///
+    /// The normal entry point for a surrounding view's key listener: only the
+    /// view can reach the clipboard, so this wrapper does it once rather than
+    /// each caller. Returns whether the key was consumed; the caller decides
+    /// what a consumed key means (propagation, re-render, side effects).
+    pub fn handle_routed(&mut self, event: &KeyDownEvent, cx: &mut gpui::App) -> bool {
+        let clipboard = cx.read_from_clipboard().and_then(|item| item.text());
+        self.handle_key_with_clipboard(event, clipboard.as_deref())
+    }
+
     /// Handle an editing key, with clipboard text available for paste.
     ///
     /// Only the surrounding view has `App` access to read the clipboard, so it

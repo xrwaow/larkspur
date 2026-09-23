@@ -23,9 +23,10 @@ use gpui::{
 use crate::model::search::AlbumGroup;
 use crate::model::{Library, PlaylistId, SongId, SongMetadata};
 use crate::ui::cover_store::{CoverImage, CoverStore};
-use crate::ui::format::{format_bitrate, format_duration, format_secs};
+use crate::ui::format::{format_bitrate, format_duration};
 use crate::ui::library_state::LibraryState;
 use crate::ui::theme::Theme;
+use crate::ui::widgets::blend;
 
 /// Cover thumbnail size in an album header.
 pub const THUMB_PX: f32 = 64.0;
@@ -56,6 +57,9 @@ pub struct AlbumSection {
     /// The `format | bitrate | tracks | time` line.
     pub meta: String,
     pub year: String,
+    /// The section's full release date, when its songs declare one — what the
+    /// library's chronological ordering sorts by (year, then month/day).
+    pub date: Option<(u16, u8, u8)>,
     /// The song whose cover represents the album.
     pub cover_song: Option<SongId>,
     pub tracks: Vec<TrackRow>,
@@ -98,7 +102,7 @@ fn section(library: &Library, group: AlbumGroup) -> Option<AlbumSection> {
     // taken from the playlist's own metadata, since there's no first song to
     // borrow artist/year/cover from.
     let custom = playlist.is_custom();
-    let (artist, meta, year, cover_song) = match songs.first() {
+    let (artist, meta, year, date, cover_song) = match songs.first() {
         Some(first) => {
             let total_secs: u64 = songs.iter().map(|song| song.duration.as_secs()).sum();
             (
@@ -110,9 +114,8 @@ fn section(library: &Library, group: AlbumGroup) -> Option<AlbumSection> {
                     custom_artist(&songs)
                 } else {
                     playlist
-                        .meta
+                        .meta()
                         .artist
-                        .clone()
                         .unwrap_or_else(|| first.album_artist().to_string())
                 },
                 album_meta(songs.len(), total_secs),
@@ -127,26 +130,29 @@ fn section(library: &Library, group: AlbumGroup) -> Option<AlbumSection> {
                         .map(|year| year.to_string())
                         .unwrap_or_default()
                 },
+                if custom { None } else { songs.iter().find_map(|song| song.release_date) },
                 // An explicit cover wins; otherwise the first song's — so a
                 // custom playlist borrows its first track's art until custom
                 // covers land.
-                playlist.meta.cover.or(Some(first.id)),
+                playlist.meta().cover.or(Some(first.id)),
             )
         }
         None => (
-            playlist.meta.artist.clone().unwrap_or_default(),
+            playlist.meta().artist.unwrap_or_default(),
             "0 Tracks".to_string(),
             String::new(),
-            playlist.meta.cover,
+            None,
+            playlist.meta().cover,
         ),
     };
 
     Some(AlbumSection {
         playlist: group.playlist,
         artist,
-        album: playlist.meta.title.clone(),
+        album: playlist.meta().title,
         meta,
         year,
+        date,
         cover_song,
         tracks,
     })
@@ -164,13 +170,14 @@ fn custom_artist(songs: &[&SongMetadata]) -> String {
     }
 }
 
-/// The `N Tracks | Time:…` line under an album title.
+/// The `N Tracks | …min` line under an album title.
 ///
 /// The file format and the album-level bitrate are deliberately left out: the
 /// bitrate that matters is per *song* (and live while it plays), and it's shown
 /// on each row in the same format either way.
 fn album_meta(tracks: usize, total_secs: u64) -> String {
-    format!("{tracks} Tracks | Time:{}", format_secs(total_secs))
+    // Total minutes only: an hour-plus album reads `61min`, not `1:01:02min`.
+    format!("{tracks} Tracks | {}min", total_secs / 60)
 }
 
 /// One drawable row of an album list.
@@ -380,43 +387,76 @@ pub trait RowActions<V: Render>: 'static {
     fn hover(&self, view: &mut V, item_ix: usize, hovered: bool, cx: &mut Context<V>);
 }
 
+/// The read-only backdrop every row renderer shares: where a row's looks
+/// come from (theme, covers, playback status) and what state it wears
+/// (selection, hover, highlight fade).
+pub struct RowContext<'a> {
+    pub theme: Theme,
+    pub covers: &'a Entity<CoverStore>,
+    pub library: &'a Entity<LibraryState>,
+    /// The currently-playing song, if it is one.
+    pub current: SongId,
+    /// The playing song's live bitrate — shown on its row instead of the
+    /// declared one.
+    pub live_bitrate: Option<u32>,
+    /// The playlist the row's menu offers as a destination (the open one).
+    pub context: Option<PlaylistId>,
+    pub highlight: &'a crate::ui::row_list::Highlight,
+}
+
+/// How one row paints: the colours that make up its background and the
+/// bitrate cell's contents.
+struct RowPaint {
+    theme: Theme,
+    playing: bool,
+    selection: Option<f32>,
+    hover: Option<f32>,
+    bitrate: Option<u32>,
+}
+
 /// Render one row — what `gpui::list` calls for each visible (and overdraw)
 /// item, so a huge library only ever draws the rows near the viewport.
-#[allow(clippy::too_many_arguments)]
+/// `actions` is absent for a header-only render (e.g. an empty playlist),
+/// which no one can interact with anyway.
 pub fn render_item<V: Render + 'static>(
-    theme: Theme,
+    context: &RowContext,
     ix: usize,
     sections: &[AlbumSection],
     items: &[ListItem],
     title_cols: &[f32],
-    covers: &Entity<CoverStore>,
-    library: &Entity<LibraryState>,
-    current: SongId,
-    live_bitrate: Option<u32>,
-    context: Option<PlaylistId>,
-    highlight: &crate::ui::row_list::Highlight,
-    actions: &Rc<dyn RowActions<V>>,
+    actions: Option<&Rc<dyn RowActions<V>>>,
     cx: &mut Context<V>,
 ) -> AnyElement {
     let item = items[ix];
     let section = &sections[item.section()];
     let playlist = section.playlist;
-    let selection = highlight.selection(ix);
-    let hover = highlight.hover(ix);
+    let playlist_context = context.context;
+    let paint = RowPaint {
+        theme: context.theme,
+        playing: false,
+        selection: context.highlight.selection(ix),
+        hover: context.highlight.hover(ix),
+        bitrate: None,
+    };
 
     match item {
         ListItem::Header(_) => {
-            request_cover(covers, library, section.cover_song, cx);
-            let cover = covers.read(cx).cover_of(section.cover_song);
-            album_header(theme, section, cover)
+            request_cover(context.covers, context.library, section.cover_song, cx);
+            let cover = context.covers.read(cx).cover_of(section.cover_song);
+            album_header(context.theme, section, cover)
         }
         ListItem::Compact(_) => {
-            request_cover(covers, library, section.cover_song, cx);
-            let cover = covers.read(cx).cover_of(section.cover_song);
+            request_cover(context.covers, context.library, section.cover_song, cx);
+            let cover = context.covers.read(cx).cover_of(section.cover_song);
             let track = &section.tracks[0];
             let song = track.song;
-            let playing = current == song;
-            let bitrate = row_bitrate(playing, track.nominal_bitrate, live_bitrate);
+            let playing = context.current == song;
+            let paint = RowPaint {
+                playing,
+                bitrate: row_bitrate(playing, track.nominal_bitrate, context.live_bitrate),
+                ..paint
+            };
+            let actions = actions.expect("a compact row is interactive");
             let on_click = {
                 let actions = actions.clone();
                 cx.listener(move |view, event: &ClickEvent, window, cx| {
@@ -426,7 +466,7 @@ pub fn render_item<V: Render + 'static>(
             let on_right_click = {
                 let actions = actions.clone();
                 cx.listener(move |view, event: &MouseDownEvent, window, cx| {
-                    actions.context(view, ix, song, context, event, window, cx)
+                    actions.context(view, ix, song, playlist_context, event, window, cx)
                 })
             };
             let on_hover = {
@@ -435,26 +475,19 @@ pub fn render_item<V: Render + 'static>(
                     actions.hover(view, ix, *hovered, cx)
                 })
             };
-            compact_row(
-                theme,
-                track,
-                &section.year,
-                cover,
-                playing,
-                selection,
-                hover,
-                bitrate,
-                on_click,
-                on_right_click,
-                on_hover,
-            )
+            compact_row(&paint, track, &section.year, cover, on_click, on_right_click, on_hover)
         }
         ListItem::Track { index, .. } => {
             let track = &section.tracks[index];
             let song = track.song;
-            let playing = current == song;
-            let bitrate = row_bitrate(playing, track.nominal_bitrate, live_bitrate);
+            let playing = context.current == song;
+            let paint = RowPaint {
+                playing,
+                bitrate: row_bitrate(playing, track.nominal_bitrate, context.live_bitrate),
+                ..paint
+            };
             let title_col = title_cols.get(item.section()).copied().unwrap_or(0.0);
+            let actions = actions.expect("a track row is interactive");
             let on_click = {
                 let actions = actions.clone();
                 cx.listener(move |view, event: &ClickEvent, window, cx| {
@@ -464,7 +497,7 @@ pub fn render_item<V: Render + 'static>(
             let on_right_click = {
                 let actions = actions.clone();
                 cx.listener(move |view, event: &MouseDownEvent, window, cx| {
-                    actions.context(view, ix, song, context, event, window, cx)
+                    actions.context(view, ix, song, playlist_context, event, window, cx)
                 })
             };
             let on_hover = {
@@ -473,19 +506,7 @@ pub fn render_item<V: Render + 'static>(
                     actions.hover(view, ix, *hovered, cx)
                 })
             };
-            track_row(
-                theme,
-                track,
-                index,
-                playing,
-                selection,
-                hover,
-                title_col,
-                bitrate,
-                on_click,
-                on_right_click,
-                on_hover,
-            )
+            track_row(&paint, track, index, title_col, on_click, on_right_click, on_hover)
         }
     }
 }
@@ -502,7 +523,7 @@ fn request_cover<V: Render + 'static>(
     if covers.read(cx).cover(song).is_some() {
         return;
     }
-    let found = library.read(cx).library().get(song).map(|song| (song.path.clone(), song.has_art()));
+    let found = library.read(cx).library().get(song).map(|song| (song.path.clone(), song.has_art));
     if let Some((path, has_art)) = found {
         covers.update(cx, |store, cx| store.request(song, path, has_art, cx));
     }
@@ -512,8 +533,7 @@ fn request_cover<V: Render + 'static>(
 ///
 /// The font is monospace, so measuring one character's advance and multiplying
 /// by the character count gives the column width without shaping every title.
-/// This is what keeps the `•` and the artist name starting at the same x on
-/// every row.
+/// This is what keeps the artist name starting at the same x on every row.
 pub fn title_column_width(window: &Window, theme: Theme, tracks: &[TrackRow]) -> f32 {
     let text_system = window.text_system();
     let font_id = text_system.resolve_font(&gpui::font(theme.font));
@@ -532,7 +552,8 @@ pub fn title_column_width(window: &Window, theme: Theme, tracks: &[TrackRow]) ->
     chars as f32 * advance
 }
 
-/// An album's header: thumbnail, artist, title, meta line, year.
+/// An album's header: thumbnail, artist, title with the year right-aligned on
+/// the same line (same size and colour as the title), meta line.
 pub fn album_header(theme: Theme, section: &AlbumSection, cover: Option<CoverImage>) -> AnyElement {
     div()
         .w_full()
@@ -558,10 +579,25 @@ pub fn album_header(theme: Theme, section: &AlbumSection, cover: Option<CoverIma
                 )
                 .child(
                     div()
-                        .truncate()
-                        .text_size(px(theme.cell_px() + 2.0))
-                        .text_color(theme.text)
-                        .child(section.album.clone()),
+                        .flex()
+                        .items_baseline()
+                        .min_w_0()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .truncate()
+                                .text_size(px(theme.cell_px() + 2.0))
+                                .text_color(theme.text)
+                                .child(section.album.clone()),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_size(px(theme.cell_px() + 2.0))
+                                .text_color(theme.text)
+                                .child(section.year.clone()),
+                        ),
                 )
                 .child(
                     div()
@@ -571,32 +607,21 @@ pub fn album_header(theme: Theme, section: &AlbumSection, cover: Option<CoverIma
                         .child(section.meta.clone()),
                 ),
         )
-        .child(
-            div()
-                .flex_none()
-                .text_size(px(theme.small_px()))
-                .text_color(theme.text_faint)
-                .child(section.year.clone()),
-        )
         .into_any_element()
 }
 
 /// A one-track section, compressed into a single row with its cover on the
 /// left instead of a header plus one line.
-#[allow(clippy::too_many_arguments)]
-pub fn compact_row(
-    theme: Theme,
+fn compact_row(
+    paint: &RowPaint,
     track: &TrackRow,
     year: &str,
     cover: Option<CoverImage>,
-    playing: bool,
-    selection: Option<f32>,
-    hover: Option<f32>,
-    bitrate: Option<u32>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_right_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
+    let theme = paint.theme;
     div()
         .id(("album-single", track.song))
         .w_full()
@@ -606,36 +631,35 @@ pub fn compact_row(
         .px_4()
         .py_2()
         .cursor_pointer()
-        .bg(row_background(theme, playing, selection, hover, 0))
+        .bg(row_background(theme, paint.playing, paint.selection, paint.hover, 0))
         .on_hover(on_hover)
         .on_click(on_click)
         .on_mouse_down(MouseButton::Right, on_right_click)
         .child(thumbnail(theme, cover, THUMB_SMALL_PX))
-        .child(title_and_artist(theme, track, playing, true))
+        .child(title_and_artist(theme, track, paint.playing, true))
         .child(year_cell(theme, year))
-        .child(bitrate_cell(theme, bitrate))
+        .child(bitrate_cell(theme, paint.bitrate))
         .child(duration_cell(theme, track))
         .into_any_element()
 }
 
-/// One track row: number, `Title • Artist`, bitrate, duration. The playing row
+/// One track row: number, title, artist, bitrate, duration. The playing row
 /// is drawn in the accent colour.
-#[allow(clippy::too_many_arguments)]
-pub fn track_row(
-    theme: Theme,
+fn track_row(
+    paint: &RowPaint,
     track: &TrackRow,
     index: usize,
-    playing: bool,
-    selection: Option<f32>,
-    hover: Option<f32>,
     title_col: f32,
-    bitrate: Option<u32>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_right_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     let id: ElementId = ("album-track", track.song).into();
+    let theme = paint.theme;
+    let playing = paint.playing;
 
+    // A fixed title column, so the artist starts at the same x on every row
+    // of this album.
     div()
         .id(id)
         .w_full()
@@ -645,7 +669,7 @@ pub fn track_row(
         .px_4()
         .py_1()
         .cursor_pointer()
-        .bg(row_background(theme, playing, selection, hover, index))
+        .bg(row_background(theme, playing, paint.selection, paint.hover, index))
         .on_hover(on_hover)
         .hover(|d| d.bg(theme.row_hover))
         .on_click(on_click)
@@ -659,8 +683,6 @@ pub fn track_row(
                 .text_color(theme.text_faint)
                 .child(format!("{:02}.", track.number)),
         )
-        // A fixed title column, so the `•` and the artist start at the same x
-        // on every row of this album.
         .child(
             div()
                 .w(px(title_col))
@@ -670,18 +692,11 @@ pub fn track_row(
                 .text_color(if playing { theme.accent } else { theme.text })
                 .child(track.title.clone()),
         )
-        .child(
-            div()
-                .flex_none()
-                .text_size(px(theme.cell_px()))
-                .text_color(theme.text_faint)
-                .child("•"),
-        )
         .child(title_and_artist(theme, track, playing, false))
         // Always reserve the action column, so rows keep identical children and
         // the numeric columns stay put.
         .child(div().w(px(theme.action_col())).flex_none())
-        .child(bitrate_cell(theme, bitrate))
+        .child(bitrate_cell(theme, paint.bitrate))
         .child(duration_cell(theme, track))
         .into_any_element()
 }
@@ -702,13 +717,6 @@ fn title_and_artist(
                 .text_size(px(theme.cell_px()))
                 .text_color(if playing { theme.accent } else { theme.text })
                 .child(track.title.clone()),
-        );
-        cell = cell.child(
-            div()
-                .flex_none()
-                .text_size(px(theme.cell_px()))
-                .text_color(theme.text_faint)
-                .child("•"),
         );
     }
     cell.child(
@@ -743,17 +751,6 @@ fn row_background(
     background
 }
 
-/// Linear blend from `from` to `to`, for a selection highlight fading in.
-fn blend(from: gpui::Rgba, to: gpui::Rgba, t: f32) -> gpui::Rgba {
-    let t = t.clamp(0.0, 1.0);
-    gpui::Rgba {
-        r: from.r + (to.r - from.r) * t,
-        g: from.g + (to.g - from.g) * t,
-        b: from.b + (to.b - from.b) * t,
-        a: from.a + (to.a - from.a) * t,
-    }
-}
-
 /// The declared/current bitrate, right-aligned just left of the duration.
 /// Empty when nothing is known.
 fn bitrate_cell(theme: Theme, bitrate: Option<u32>) -> AnyElement {
@@ -782,7 +779,7 @@ fn duration_cell(theme: Theme, track: &TrackRow) -> AnyElement {
 /// tags declare none.
 fn year_cell(theme: Theme, year: &str) -> AnyElement {
     div()
-        .w(px(theme.font_size * 3.0))
+        .w(px(theme.year_col()))
         .flex_none()
         .text_right()
         .text_size(px(theme.small_px()))
@@ -824,7 +821,7 @@ fn thumbnail(theme: Theme, cover: Option<CoverImage>, size: f32) -> AnyElement {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CoverState, Lyrics, PlaylistId};
+    use crate::model::{Lyrics, PlaylistId};
     use std::path::PathBuf;
     use std::time::Duration;
 
@@ -838,10 +835,11 @@ mod tests {
             album_artist: None,
             track_position: None,
             year: None,
+            release_date: None,
             nominal_bitrate: None,
             lyrics: Lyrics::None,
             duration: Duration::ZERO,
-            cover: CoverState::Missing,
+            has_art: false,
         }
     }
 
@@ -918,6 +916,7 @@ mod tests {
             album: String::new(),
             meta: String::new(),
             year: String::new(),
+            date: None,
             cover_song: None,
             tracks: (0..count)
                 .map(|i| TrackRow {

@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 
-use gpui::{div, prelude::*, px, relative, rgb, AnyElement, AnyView, Context, Entity, Render, Window};
+use gpui::{div, prelude::*, px, relative, AnyElement, AnyView, Context, Entity, Render, Window};
+
+use crate::ui::config_state::{ConfigState, Themed};
 
 /// Base "class" for a UI module/panel. A Container is just a Render
 /// impl with a stable identity, so the workspace can hold a
@@ -223,18 +225,28 @@ impl LayoutPlan {
 pub struct Workspace {
     plan: LayoutPlan,
     modules: HashMap<&'static str, AnyView>,
+    themed: Themed,
 }
 
 impl Workspace {
-    pub fn new(center: impl Into<Layout>) -> Self {
-        Self { plan: LayoutPlan::new(center), modules: HashMap::new() }
+    pub fn new(
+        center: impl Into<Layout>,
+        config: &Entity<ConfigState>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        Self::from_plan(LayoutPlan::new(center), config, cx)
     }
 
     /// Build a workspace from a pre-built [`LayoutPlan`] (see
     /// `ui::layout::app_layout`), so the app and the layout-introspection
     /// tools share one definition of the layout.
-    pub fn from_plan(plan: LayoutPlan) -> Self {
-        Self { plan, modules: HashMap::new() }
+    pub fn from_plan(
+        plan: LayoutPlan,
+        config: &Entity<ConfigState>,
+        cx: &mut Context<Self>,
+    ) -> Self {
+        let themed = Themed::new(config, cx);
+        Self { plan, modules: HashMap::new(), themed }
     }
 
     /// Add an edge-docked band.
@@ -253,13 +265,26 @@ impl Workspace {
     pub fn push<C: Container>(&mut self, entity: Entity<C>) {
         self.modules.insert(C::container_id(), entity.into());
     }
+
+    /// Replace the layout plan, keeping the registered modules. Used when a
+    /// setting changes the arrangement — the visualizer's on/off toggle
+    /// adds/removes its band from the right rail live.
+    pub fn set_plan(&mut self, plan: LayoutPlan) {
+        self.plan = plan;
+    }
+}
+
+impl Container for Workspace {
+    fn container_id() -> &'static str {
+        "workspace"
+    }
 }
 
 impl Render for Workspace {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .size_full()
-            .bg(rgb(0x000000))
+            .bg(self.themed.theme().window_bg)
             .child(render_dock_stack(&self.plan.docks, &self.plan.center, &self.modules))
     }
 }

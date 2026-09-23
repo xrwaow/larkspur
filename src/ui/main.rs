@@ -1,11 +1,14 @@
+use std::cell::Cell;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use gpui::{
-    px, size, App, Application, AppContext, Bounds, TitlebarOptions, WindowBounds, WindowOptions,
+    px, size, App, Application, AppContext, Bounds, Point, TitlebarOptions, WindowBounds,
+    WindowOptions,
 };
 
 use larkspur::audio::PlaybackController;
-use larkspur::model::{Config, LibraryCache};
+use larkspur::model::{Config, LibraryCache, WindowPlacement};
 use larkspur::ui::animation::Animator;
 use larkspur::ui::config_state::ConfigState;
 use larkspur::ui::container::Workspace;
@@ -16,8 +19,9 @@ use larkspur::ui::library_state::LibraryState;
 use larkspur::ui::lyrics::LyricsView;
 use larkspur::ui::playback::PlaybackView;
 use larkspur::ui::playlists::PlaylistsView;
-use larkspur::ui::state::PlaybackState;
+use larkspur::ui::playback_state::PlaybackState;
 use larkspur::ui::tabs::TabsView;
+use larkspur::ui::visualizer::VisualizerView;
 
 fn main() {
     // Command-line arguments seed the library: directories are merged into the
@@ -44,8 +48,8 @@ fn main() {
         }
     }
 
-    // Load the config and fold in any directories from the command line, so the
-    // documented `larkspur_ui <dir>` still works and the path sticks.
+    // Load the config and fold in any directories from the command line, so
+    // the documented `larkspur_ui <dir>` still works and the path sticks.
     let config_path = config_dir().join("config.json");
     let mut config = Config::load(&config_path);
     let mut changed = false;
@@ -57,9 +61,29 @@ fn main() {
             eprintln!("failed to save config: {e}");
         }
     }
+    // Read before `config` moves into the state: the layout is built from it.
+    let visualizer_on = config.visualizer;
 
     Application::new().run(move |cx: &mut App| {
-        let bounds = Bounds::centered(None, size(px(1920.0), px(1080.0)), cx);
+        // Reopen where the window was last closed; a first run opens at half
+        // the monitor's size, centered.
+        let bounds = config.window.map(|placement| {
+            Bounds::<gpui::Pixels>::new(
+                Point::new(px(placement.x), px(placement.y)),
+                size(px(placement.width), px(placement.height)),
+            )
+        });
+        let bounds = bounds.unwrap_or_else(|| {
+            let (width, height) = cx
+                .displays()
+                .first()
+                .map(|display| {
+                    let bounds = display.bounds();
+                    (bounds.size.width, bounds.size.height)
+                })
+                .unwrap_or((px(1920.0), px(1080.0)));
+            Bounds::centered(None, size(width / 2.0, height / 2.0), cx)
+        });
         let controller = PlaybackController::new(files).expect("failed to open the audio device");
 
         cx.open_window(
@@ -75,7 +99,26 @@ fn main() {
                 // The shared, observable state. Views below observe these —
                 // none own the controller, the library, the covers, or the
                 // config, and none poll.
-                let config_state = cx.new(|cx| ConfigState::new(config, config_path, cx));
+                let config_state = cx.new(|cx| {
+                    let state = ConfigState::new(config, config_path, cx);
+                    // Remember the window's placement whenever it moves or
+                    // resizes, so the next launch reopens the same way. Only
+                    // the windowed bounds are kept — a fullscreen/maximized
+                    // session must not clobber the restored geometry.
+                    cx.observe_window_bounds(window, |state: &mut ConfigState, window, cx| {
+                        if let WindowBounds::Windowed(bounds) = window.window_bounds() {
+                            let placement = WindowPlacement {
+                                x: bounds.origin.x.into(),
+                                y: bounds.origin.y.into(),
+                                width: bounds.size.width.into(),
+                                height: bounds.size.height.into(),
+                            };
+                            state.set_window_placement(placement, cx);
+                        }
+                    })
+                    .detach();
+                    state
+                });
                 let playback_state = cx.new(|cx| PlaybackState::new(controller, cx));
 
                 // The library is installed from the cache instantly, then
@@ -113,6 +156,9 @@ fn main() {
                 let lyrics = cx.new(|cx| {
                     LyricsView::new(playback_state.clone(), config_state.clone(), animator.clone(), cx)
                 });
+                let visualizer = cx.new(|cx| {
+                    VisualizerView::new(playback_state.clone(), config_state.clone(), animator.clone(), cx)
+                });
                 let cover = cx.new(|cx| {
                     CoverView::new(playback_state.clone(), cover_store.clone(), config_state.clone(), cx)
                 });
@@ -125,13 +171,34 @@ fn main() {
                 // The dock arrangement lives in `ui::layout::app_layout`, so
                 // it's shared with the text-introspection tooling. Here we
                 // only bind live views to its module ids.
-                let mut workspace = Workspace::from_plan(layout::app_layout());
-                workspace.push(playlists);
-                workspace.push(lyrics);
-                workspace.push(cover);
-                workspace.push(playback);
-                workspace.push(tabs);
-                cx.new(|_| workspace)
+                let workspace = cx.new(|cx| {
+                    let mut workspace = Workspace::from_plan(layout::app_layout(visualizer_on), &config_state, cx);
+                    workspace.push(playlists);
+                    workspace.push(visualizer);
+                    workspace.push(lyrics);
+                    workspace.push(cover);
+                    workspace.push(playback);
+                    workspace.push(tabs);
+
+                    // The visualizer band is added/removed from the rail live
+                    // when its setting flips. The flag guards against re-planning
+                    // (and re-rendering the whole workspace) on unrelated config
+                    // changes.
+                    let shown = Rc::new(Cell::new(visualizer_on));
+                    let shown = shown.clone();
+                    cx.observe(&config_state, move |workspace: &mut Workspace, config, cx| {
+                        let on = config.read(cx).visualizer();
+                        if on != shown.get() {
+                            shown.set(on);
+                            workspace.set_plan(layout::app_layout(on));
+                            cx.notify();
+                        }
+                    })
+                    .detach();
+
+                    workspace
+                });
+                workspace
             },
         )
         .unwrap();

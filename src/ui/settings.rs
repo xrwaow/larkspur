@@ -17,20 +17,20 @@ use gpui::{
     KeyDownEvent, MouseButton, MouseDownEvent, Pixels, Point, Render, Window,
 };
 
-use crate::model::config::{FontKind, ThemeKind, WaveformStyle, MAX_FONT_SIZE, MIN_FONT_SIZE};
+use crate::model::config::{
+    DynamicBase, FontKind, ThemeKind, WaveformStyle, MAX_FONT_SIZE, MIN_FONT_SIZE,
+};
 use crate::ui::browse::BrowseView;
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::lyrics::LyricsView;
 use crate::ui::menu::{context_menu, MenuHandler};
 use crate::ui::playback::PlaybackView;
-use crate::ui::playlist::PlaylistView;
 use crate::ui::playlists::PlaylistsView;
-use crate::ui::search::SearchView;
 use crate::ui::tabs::TabsView;
 use crate::ui::text_field::TextField;
 use crate::ui::theme::Theme;
-use crate::ui::widgets::panel_header;
+use crate::ui::widgets::{empty_hint, panel_header, section_header};
 
 /// An open per-container typeface menu: where it was raised and which container
 /// it edits.
@@ -94,12 +94,14 @@ impl Focusable for SettingsView {
 
 /// Every container the settings panel exposes a typeface and font size for: id,
 /// label, and its built-in default size (from [`Container::default_font_size`]).
+///
+/// The playlist and search tabs are deliberately absent: they draw the
+/// library's rows, so they share the browse list's typography and have no
+/// separate setting to expose.
 fn containers() -> Vec<(&'static str, &'static str, f32)> {
     vec![
         (TabsView::container_id(), "Tabs", TabsView::default_font_size()),
-        (BrowseView::container_id(), "Browse", BrowseView::default_font_size()),
-        (PlaylistView::container_id(), "Playlist", PlaylistView::default_font_size()),
-        (SearchView::container_id(), "Search", SearchView::default_font_size()),
+        (BrowseView::container_id(), "Song lists", BrowseView::default_font_size()),
         (PlaylistsView::container_id(), "Playlists rail", PlaylistsView::default_font_size()),
         (LyricsView::container_id(), "Lyrics", LyricsView::default_font_size()),
         (PlaybackView::container_id(), "Transport", PlaybackView::default_font_size()),
@@ -137,7 +139,6 @@ impl Render for SettingsView {
         let mut items: Vec<AnyElement> = Vec::new();
 
         // --- theme ---
-        items.push(section(theme, "Theme"));
         let theme_buttons = ThemeKind::ALL.iter().map(|kind| {
             let kind = *kind;
             choice_button(
@@ -150,10 +151,36 @@ impl Render for SettingsView {
                 }),
             )
         });
-        items.push(div().flex().gap_2().px_4().pb_2().children(theme_buttons).into_any_element());
+        items.push(setting_row(
+            theme,
+            "Theme",
+            div().flex().gap_2().children(theme_buttons).into_any_element(),
+        ));
+
+        // --- dynamic base (only while Dynamic is selected) ---
+        if theme_kind == ThemeKind::Dynamic {
+            let base = config.dynamic_base();
+            let base_buttons = DynamicBase::ALL.iter().map(|base_kind| {
+                let base_kind = *base_kind;
+                choice_button(
+                    theme,
+                    ("dynamic-base", base_kind as usize),
+                    base_kind.label(),
+                    base == base_kind,
+                    cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                        this.config
+                            .update(cx, |config, cx| config.set_dynamic_base(base_kind, cx));
+                    }),
+                )
+            });
+            items.push(setting_row(
+                theme,
+                "Cover base",
+                div().flex().gap_2().children(base_buttons).into_any_element(),
+            ));
+        }
 
         // --- waveform style ---
-        items.push(section(theme, "Waveform"));
         let waveform_buttons = WaveformStyle::ALL.iter().map(|style| {
             let style = *style;
             choice_button(
@@ -166,35 +193,41 @@ impl Render for SettingsView {
                 }),
             )
         });
-        items.push(div().flex().gap_2().px_4().pb_2().children(waveform_buttons).into_any_element());
+        items.push(setting_row(
+            theme,
+            "Waveform",
+            div().flex().gap_2().children(waveform_buttons).into_any_element(),
+        ));
 
-        // --- typeface + font size, per container ---
-        items.push(section(theme, "Font"));
-        items.push(
-            div()
-                .px_4()
-                .pb_1()
-                .text_size(px(theme.small_px()))
-                .text_color(theme.text_faint)
-                .child("Per container. Pick a family, step the size; Reset restores both defaults.")
-                .into_any_element(),
-        );
+        // --- visualizer band ---
+        let visualizer_on = config.visualizer();
+        let visualizer_buttons = [true, false].iter().map(|&on| {
+            choice_button(
+                theme,
+                ("visualizer", on as usize),
+                if on { "On" } else { "Off" },
+                visualizer_on == on,
+                cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                    this.config.update(cx, |config, cx| config.set_visualizer(on, cx));
+                }),
+            )
+        });
+        items.push(setting_row(
+            theme,
+            "Visualizer",
+            div().flex().gap_2().children(visualizer_buttons).into_any_element(),
+        ));
+
+        // --- typeface + font size, per container, as a table ---
+        items.push(section_header(theme, "Font"));
         for (index, row) in rows.into_iter().enumerate() {
-            items.push(container_row(theme, index, row, cx));
+            items.push(font_table_row(theme, index, row, cx));
         }
 
         // --- synced paths ---
-        items.push(section(theme, "Synced paths"));
+        items.push(section_header(theme, "Synced paths"));
         if roots.is_empty() {
-            items.push(
-                div()
-                    .px_4()
-                    .pb_1()
-                    .text_size(px(theme.small_px()))
-                    .text_color(theme.text_faint)
-                    .child("No paths yet — add a music directory below.")
-                    .into_any_element(),
-            );
+            items.push(empty_hint(theme, "No paths yet — add a music directory below.", false));
         }
         for (index, root) in roots.into_iter().enumerate() {
             items.push(root_row(theme, index, root, cx));
@@ -228,8 +261,7 @@ impl Render for SettingsView {
                     this.add_path(cx);
                     return;
                 }
-                let clipboard = cx.read_from_clipboard().and_then(|item| item.text());
-                if this.path.handle_key_with_clipboard(event, clipboard.as_deref()) {
+                if this.path.handle_routed(event, cx) {
                     cx.notify();
                 }
             }))
@@ -238,7 +270,14 @@ impl Render for SettingsView {
             .flex_col()
             .bg(theme.panel_bg)
             .font_family(theme.font)
-            .child(panel_header(theme, "Settings", "esc", theme.text_faint))
+            .child(panel_header(
+                theme,
+                "Settings",
+                theme.cell_px() + 2.0,
+                None,
+                None,
+                Some(("esc", theme.text_faint)),
+            ))
             .child(
                 div()
                     .id("settings-scroll")
@@ -246,6 +285,7 @@ impl Render for SettingsView {
                     .overflow_y_scroll()
                     .flex()
                     .flex_col()
+                    .pt_2()
                     .pb_4()
                     .children(items),
             );
@@ -259,14 +299,24 @@ impl Render for SettingsView {
     }
 }
 
-fn section(theme: Theme, label: &str) -> AnyElement {
+/// One `{label}: {control}` row — the label sits in a fixed column so the
+/// controls line up down the panel.
+fn setting_row(theme: Theme, label: &str, control: AnyElement) -> AnyElement {
     div()
+        .flex()
+        .items_center()
+        .gap_3()
         .px_4()
-        .pt_4()
-        .pb_2()
-        .text_size(px(theme.small_px()))
-        .text_color(theme.text_faint)
-        .child(label.to_uppercase())
+        .py_1()
+        .child(
+            div()
+                .w(px(theme.label_col()))
+                .flex_none()
+                .text_size(px(theme.cell_px()))
+                .text_color(theme.text_muted)
+                .child(format!("{label}:")),
+        )
+        .child(control)
         .into_any_element()
 }
 
@@ -323,7 +373,10 @@ fn font_menu(
     context_menu(theme, menu.position, items, dismiss)
 }
 
-fn container_row(
+/// One row of the font table: the container's name on the left, its size
+/// stepper and typeface picker right-aligned on the right. Striped like the
+/// album rows — [`Theme::row_bg`] alternates lighter and darker per row.
+fn font_table_row(
     theme: Theme,
     index: usize,
     row: ContainerRow,
@@ -341,6 +394,8 @@ fn container_row(
         .gap_3()
         .px_4()
         .py_1()
+        .bg(theme.row_bg(index))
+        .hover(|d| d.bg(theme.row_hover))
         .child(
             div()
                 .flex_1()
@@ -360,9 +415,12 @@ fn container_row(
                 this.config.update(cx, |config, cx| config.set_font_size(id, current - 1.0, cx));
             }),
         ))
+        // Fixed, right-aligned columns: [`Theme::value_col`] fits `32 px`,
+        // `9em` the longest family label — anything wider opens the gaps
+        // between the cells.
         .child(
             div()
-                .w(px(48.0))
+                .w(px(theme.value_col()))
                 .flex_none()
                 .text_right()
                 .text_size(px(theme.cell_px()))
@@ -382,9 +440,11 @@ fn container_row(
         .child(
             div()
                 .id(("font-picker", index))
+                .w(px(theme.font_size * 9.0))
                 .flex_none()
                 .flex()
                 .items_center()
+                .justify_end()
                 .gap_1()
                 .px_2()
                 .py_1()
@@ -402,8 +462,8 @@ fn container_row(
                         cx.notify();
                     }),
                 )
-                .child(font.label().to_string())
-                .child(div().text_color(theme.text_faint).child("▾")),
+                .child(div().min_w_0().truncate().child(font.label().to_string()))
+                .child(div().flex_none().text_color(theme.text_faint).child("▾")),
         )
         .child(action_button(
             theme,
@@ -429,6 +489,7 @@ fn root_row(theme: Theme, index: usize, root: PathBuf, cx: &mut Context<Settings
         .gap_3()
         .px_4()
         .py_1()
+        .bg(theme.row_bg(index))
         .child(
             div()
                 .flex_1()

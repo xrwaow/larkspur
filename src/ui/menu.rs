@@ -12,7 +12,7 @@ use gpui::{
 
 use crate::model::{PlaylistId, SongId};
 use crate::ui::library_state::LibraryState;
-use crate::ui::state::PlaybackState;
+use crate::ui::playback_state::PlaybackState;
 use crate::ui::theme::Theme;
 
 /// A menu item's click handler.
@@ -111,7 +111,10 @@ pub fn song_menu_items(
         items.push((
             format!("Play {count} songs"),
             Box::new(move |_event, _window, cx| {
-                library.update(cx, |state, cx| state.play(&songs, 0, &playback, cx));
+                // Plays the selection and opens it as a temporary playlist tab.
+                library.update(cx, |state, cx| {
+                    state.play_selection(songs.clone(), &playback, cx)
+                });
             }),
         ));
     }
@@ -121,7 +124,7 @@ pub fn song_menu_items(
         .library()
         .custom_playlists()
         .iter()
-        .map(|playlist| (playlist.id, playlist.meta.title.clone()))
+        .map(|playlist| (playlist.id, playlist.meta().title))
         .collect();
     for (id, title) in custom {
         let library = library.clone();

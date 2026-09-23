@@ -1,3 +1,4 @@
+pub mod album_list;
 pub mod albums;
 pub mod animation;
 pub mod browse;
@@ -13,13 +14,15 @@ pub mod library_state;
 pub mod lyrics;
 pub mod menu;
 pub mod playback;
+pub mod playback_state;
 pub mod playlist;
 pub mod playlists;
 pub mod row_list;
 pub mod search;
 pub mod settings;
-pub mod state;
+
 pub mod tabs;
 pub mod text_field;
 pub mod theme;
+pub mod visualizer;
 pub mod widgets;

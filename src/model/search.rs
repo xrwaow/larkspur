@@ -22,6 +22,16 @@
 //! ext:LIST             flac,mp3,…                         (alias: file:)
 //! ```
 //!
+//! Every keyword also has a bracket spelling, `[keyword]{TEXT}` — one scoped
+//! directive per bracket group, so several fields can be pinned in one query
+//! (`[title]{love} [lyrics]{night}`), and the text may contain spaces without
+//! quotes:
+//!
+//! ```text
+//! [title]{bang bang} [year]{2003}
+//! [lyrics]{the coldest night} [dur]{<5:00}
+//! ```
+//!
 //! Examples:
 //!
 //! ```text
@@ -42,12 +52,12 @@
 //! An unrecognised keyword-shaped prefix (`yeer:2003`) is reported as a
 //! warning and kept as free text, so a typo degrades instead of erroring.
 
-use std::collections::{HashMap, HashSet};
 use std::time::Duration;
 
 use super::identity::SongId;
 use super::library::Library;
-use super::playlist::{PlaylistId, PlaylistKind};
+use super::playlist::PlaylistId;
+use super::select::{Order, Scope, Selection};
 use super::song::SongMetadata;
 
 /// How a single term is compared against a field.
@@ -268,63 +278,25 @@ pub struct AlbumGroup {
     pub songs: Vec<SongId>,
 }
 
-/// Group `matched` song ids by their album playlist.
-///
-/// Groups come out in album order (the same order `Library::playlists` uses)
-/// and each group's songs are in the album's own track order, so a filtered
-/// list still reads like the album. Songs not in any album playlist are
-/// skipped — `Library::rebuild_auto` puts every song in one, so this only
-/// guards against a library that hasn't been rebuilt yet.
-pub fn album_groups(library: &Library, matched: &HashSet<SongId>) -> Vec<AlbumGroup> {
-    // `Library`'s index answers "which album owns this song" directly, so this
-    // no longer walks every playlist building an owner map.
-    let mut by_playlist: HashMap<PlaylistId, HashSet<SongId>> = HashMap::new();
-    for song in matched {
-        if let Some(playlist) = library.album_playlist_of(*song) {
-            by_playlist.entry(playlist).or_default().insert(*song);
-        }
-    }
-
-    let mut groups = Vec::new();
-    for playlist in library.playlists() {
-        let Some(songs) = by_playlist.get(&playlist.id) else { continue };
-        let ordered: Vec<SongId> = playlist
-            .song_ids
-            .iter()
-            .copied()
-            .filter(|song| songs.contains(song))
-            .collect();
-        if !ordered.is_empty() {
-            groups.push(AlbumGroup { playlist: playlist.id, songs: ordered });
-        }
-    }
-    groups
-}
-
 /// Every album playlist with all of its songs — the browse view's list.
 ///
 /// The "easy search" the browse container uses: no query, just the library
 /// grouped the way the UI wants to draw it.
 pub fn all_albums(library: &Library) -> Vec<AlbumGroup> {
-    library
-        .playlists()
-        .into_iter()
-        .filter(|playlist| playlist.kind == PlaylistKind::Auto)
-        .map(|playlist| AlbumGroup { playlist: playlist.id, songs: playlist.song_ids.clone() })
-        .collect()
+    library.select(&Selection {
+        scope: Scope::Library,
+        query: Query::default(),
+        order: Order::AlbumTitle,
+    })
 }
 
 /// Run a query over the library, grouped by album.
 pub fn search(library: &Library, query: &Query) -> Vec<AlbumGroup> {
-    if query.is_empty() {
-        return all_albums(library);
-    }
-    let matched: HashSet<SongId> = library
-        .songs()
-        .filter(|song| query.matches(song))
-        .map(|song| song.id)
-        .collect();
-    album_groups(library, &matched)
+    library.select(&Selection {
+        scope: Scope::Library,
+        query: query.clone(),
+        order: Order::AlbumTitle,
+    })
 }
 
 /// Song ids matching a query, flattened out of their album groups in album and
@@ -333,7 +305,11 @@ pub fn search(library: &Library, query: &Query) -> Vec<AlbumGroup> {
 /// An empty query matches the whole library, which is what makes an empty
 /// search box read as "everything you could add".
 pub fn matching_songs(library: &Library, query: &Query) -> Vec<SongId> {
-    search(library, query).into_iter().flat_map(|group| group.songs).collect()
+    library.select_songs(&Selection {
+        scope: Scope::Library,
+        query: query.clone(),
+        order: Order::AlbumTitle,
+    })
 }
 
 /// Parse a query string into a [`Query`] plus any warnings worth showing.
@@ -345,12 +321,25 @@ pub fn parse(input: &str) -> (Query, Vec<String>) {
     let mut warnings = Vec::new();
 
     for token in tokenize(input) {
-        let Some((key, value)) = split_keyword(&token) else {
+        // `[field]{text}` is the bracket spelling of `field:text` — same
+        // keywords, same handling below.
+        let (key, value, bracket) = if let Some((key, value)) = split_bracket(&token) {
+            (key, value, true)
+        } else if let Some((key, value)) = split_keyword(&token) {
+            (key, value, false)
+        } else {
             query.terms.push(Term::Any(unquote(&token)));
             continue;
         };
         let key = key.to_ascii_lowercase();
         let value = unquote(value);
+        let unknown = |key: &str| {
+            if bracket {
+                format!("unknown keyword `[{key}]{{…}}`")
+            } else {
+                format!("unknown keyword `{key}:`")
+            }
+        };
 
         match key.as_str() {
             "type" => match value.as_str() {
@@ -406,7 +395,7 @@ pub fn parse(input: &str) -> (Query, Vec<String>) {
             // A keyword-shaped prefix we don't know is almost certainly a typo
             // (`yeer:2003`). Say so, but keep searching for it as free text.
             _ => {
-                warnings.push(format!("unknown keyword `{key}:`"));
+                warnings.push(unknown(&key));
                 query.terms.push(Term::Any(unquote(&token)));
             }
         }
@@ -417,17 +406,32 @@ pub fn parse(input: &str) -> (Query, Vec<String>) {
 
 /// Split on whitespace, keeping `"quoted runs"` together. The quote
 /// characters stay in the token so `unquote` can strip them afterwards.
+///
+/// A `[field]{…}` group also holds together across whitespace, so a scoped
+/// text with spaces stays one term until the closing brace.
 fn tokenize(input: &str) -> Vec<String> {
     let mut tokens = Vec::new();
     let mut current = String::new();
     let mut quoted = false;
+    let mut bracketed = false;
     for ch in input.chars() {
         match ch {
             '"' => {
                 quoted = !quoted;
                 current.push(ch);
             }
-            c if c.is_whitespace() && !quoted => {
+            // A `[` only opens a group at the start of a term; elsewhere it's
+            // just a character.
+            '[' if current.is_empty() && !quoted => {
+                bracketed = true;
+                current.push(ch);
+            }
+            '}' if bracketed => {
+                bracketed = false;
+                current.push(ch);
+                tokens.push(std::mem::take(&mut current));
+            }
+            c if c.is_whitespace() && !quoted && !bracketed => {
                 if !current.is_empty() {
                     tokens.push(std::mem::take(&mut current));
                 }
@@ -439,6 +443,19 @@ fn tokenize(input: &str) -> Vec<String> {
         tokens.push(current);
     }
     tokens
+}
+
+/// `[field]{value}` — the bracket spelling of `field:value`.
+///
+/// Returns the raw field and value, so `parse` lowercases and unquotes them
+/// exactly like the colon form. An unclosed group (mid-typing) yields `None`
+/// and the token falls through as free text.
+fn split_bracket(token: &str) -> Option<(&str, &str)> {
+    let inner = token.strip_prefix('[')?;
+    let (field, value) = inner.split_once("]{")?;
+    let value = value.strip_suffix('}')?;
+    let field = field.trim();
+    (!field.is_empty()).then_some((field, value))
 }
 
 /// `key:value` when `key` is a bare word, so `3:00` and `http://…` stay free
@@ -537,7 +554,7 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{CoverState, Lyrics};
+    use crate::model::Lyrics;
 
     fn song(id: SongId, title: &str, artist: &str, album: &str) -> SongMetadata {
         SongMetadata {
@@ -549,10 +566,11 @@ mod tests {
             album_artist: Some(artist.into()),
             track_position: None,
             year: None,
+            release_date: None,
             nominal_bitrate: Some(320_000),
             lyrics: Lyrics::None,
             duration: Duration::from_secs(180),
-            cover: CoverState::Missing,
+            has_art: false,
         }
     }
 
@@ -677,6 +695,55 @@ mod tests {
     }
 
     #[test]
+    fn bracket_groups_scope_one_term_each() {
+        let (query, warnings) = parse("[title]{text1} [lyrics]{text2}");
+        assert!(warnings.is_empty());
+        assert_eq!(
+            query.terms,
+            vec![
+                Term::In(Field::Song, "text1".into()),
+                Term::In(Field::Lyrics, "text2".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn bracket_text_may_contain_spaces_and_quotes() {
+        let (query, warnings) = parse("[title]{bang bang} [year]{>2000}");
+        assert!(warnings.is_empty());
+        assert_eq!(query.terms, vec![Term::In(Field::Song, "bang bang".into())]);
+        assert_eq!(query.filters.len(), 1, "the year filter came through");
+
+        let (query, warnings) = parse("[album]{\"the album\"}");
+        assert!(warnings.is_empty());
+        assert_eq!(query.terms, vec![Term::In(Field::Album, "the album".into())]);
+    }
+
+    #[test]
+    fn bracket_groups_carry_every_keyword() {
+        let (query, warnings) = parse("[type]{fuzzy} [artist]{nancy} [dur]{<5:00} [ext]{flac}");
+        assert!(warnings.is_empty());
+        assert_eq!(query.mode, MatchMode::Fuzzy);
+        assert_eq!(query.terms, vec![Term::In(Field::Artist, "nancy".into())]);
+        assert_eq!(query.filters.len(), 2);
+    }
+
+    #[test]
+    fn unknown_bracket_fields_warn_but_still_search() {
+        let (query, warnings) = parse("[yeer]{2003}");
+        assert_eq!(query.terms, vec![Term::Any("[yeer]{2003}".into())]);
+        assert_eq!(warnings.len(), 1);
+    }
+
+    #[test]
+    fn an_unclosed_bracket_group_is_free_text() {
+        // Mid-typing: `[title]{foo` hasn't closed yet, so it's not a directive.
+        let (query, warnings) = parse("[title]{foo");
+        assert!(warnings.is_empty());
+        assert_eq!(query.terms, vec![Term::Any("[title]{foo".into())]);
+    }
+
+    #[test]
     fn unknown_keywords_warn_but_still_search() {
         let (query, warnings) = parse("yeer:2003");
         assert_eq!(query.terms, vec![Term::Any("yeer:2003".into())]);
@@ -724,7 +791,7 @@ mod tests {
         assert_eq!(groups.len(), 1, "both tracks live in one album");
         let group = &groups[0];
         let album = library.playlist(group.playlist).unwrap();
-        assert_eq!(album.meta.title, "Kill Bill");
+        assert_eq!(album.meta().title, "Kill Bill");
         assert_eq!(group.songs.len(), 2);
         assert_eq!(group.songs, album.song_ids, "album track order is preserved");
     }
@@ -754,7 +821,7 @@ mod tests {
         let groups = all_albums(&library);
         let titles: Vec<String> = groups
             .iter()
-            .map(|g| library.playlist(g.playlist).unwrap().meta.title.clone())
+            .map(|g| library.playlist(g.playlist).unwrap().meta().title)
             .collect();
         assert_eq!(titles, vec!["Kill Bill", "Vide Noir"], "alphabetical");
     }

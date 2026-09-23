@@ -3041,7 +3041,6 @@ dependencies = [
  "serde",
  "serde_json",
  "symphonia",
- "thiserror 1.0.69",
  "twox-hash",
 ]
 

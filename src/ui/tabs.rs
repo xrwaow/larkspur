@@ -17,7 +17,7 @@
 //! bubble up here, which is where tab switching, closing, and the transport
 //! keys live.
 
-use std::collections::HashSet;
+use std::path::PathBuf;
 
 use gpui::{
     div, prelude::*, px, AnyElement, AnyView, App, ClickEvent, Context, Entity, FocusHandle,
@@ -27,7 +27,7 @@ use gpui::{
 use crate::model::{InputAction, PlaylistId, TabId};
 use crate::ui::animation::Animator;
 use crate::ui::browse::BrowseView;
-use crate::ui::config_state::ConfigState;
+use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::cover_store::CoverStore;
 use crate::ui::input::action_for_key;
@@ -36,14 +36,16 @@ use crate::ui::menu::{context_menu, song_menu_items, MenuHandler, SongMenuReques
 use crate::ui::playlist::PlaylistView;
 use crate::ui::search::SearchView;
 use crate::ui::settings::SettingsView;
-use crate::ui::state::PlaybackState;
+use crate::ui::playback_state::PlaybackState;
 use crate::ui::theme::Theme;
 
-/// One playlist tab: what it shows and where its focus goes.
+/// One playlist tab: what it shows, where its focus goes, and — for a folder
+/// view — the temporary playlists it was built from (deleted with the tab).
 struct Tab {
     id: TabId,
     view: AnyView,
     focus: FocusHandle,
+    temp: Vec<PlaylistId>,
 }
 
 pub struct TabsView {
@@ -52,7 +54,7 @@ pub struct TabsView {
     covers: Entity<CoverStore>,
     config: Entity<ConfigState>,
     animator: Entity<Animator>,
-    theme: Theme,
+    themed: Themed,
     browse: Entity<BrowseView>,
     search: Entity<SearchView>,
     settings: Entity<SettingsView>,
@@ -75,7 +77,6 @@ pub struct TabsView {
     focus_handle: FocusHandle,
     _observe: Subscription,
     _observe_playback: Subscription,
-    _observe_config: Subscription,
 }
 
 impl TabsView {
@@ -113,18 +114,14 @@ impl TabsView {
             cx.notify();
         });
         let observe_playback = cx.observe(&playback, |_this, _state, cx| cx.notify());
-        let observe_config = cx.observe(&config, |this, config, cx| {
-            this.theme = config.read(cx).theme_for(Self::container_id(), Self::default_font_size());
-            cx.notify();
-        });
-        let theme = config.read(cx).theme_for(Self::container_id(), Self::default_font_size());
+        let themed = Themed::new(&config, cx);
         Self {
             library,
             playback,
             covers,
             config,
             animator,
-            theme,
+            themed,
             browse,
             search,
             settings,
@@ -138,7 +135,6 @@ impl TabsView {
             focus_handle: cx.focus_handle(),
             _observe: observe,
             _observe_playback: observe_playback,
-            _observe_config: observe_config,
         }
     }
 
@@ -170,7 +166,7 @@ impl TabsView {
                 )
             });
             let focus = view.read(cx).focus_handle_for_window();
-            self.tabs.push(Tab { id: tab_id.clone(), view: view.into(), focus });
+            self.tabs.push(Tab { id: tab_id.clone(), view: view.into(), focus, temp: Vec::new() });
         }
         self.activate(tab_id, window, cx);
     }
@@ -194,15 +190,69 @@ impl TabsView {
                 browse
             });
             let focus = view.read(cx).focus_handle_for_window();
-            self.tabs.push(Tab { id: tab_id.clone(), view: view.into(), focus });
+            self.tabs.push(Tab { id: tab_id.clone(), view: view.into(), focus, temp: Vec::new() });
+        }
+        self.activate(tab_id, window, cx);
+    }
+
+    /// Open (or focus) a folder's tab: the temporary playlists "Play folder"
+    /// created, shown as one grouped view. Identified by path, so re-playing
+    /// the same folder focuses the tab that's already open.
+    pub fn open_folder(
+        &mut self,
+        path: PathBuf,
+        playlists: Vec<PlaylistId>,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let tab_id = TabId::Folder(path.clone());
+        if !self.tabs.iter().any(|tab| tab.id == tab_id) {
+            let title = path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.display().to_string());
+            let view = cx.new(|cx| {
+                let mut browse = BrowseView::new(
+                    self.library.clone(),
+                    self.playback.clone(),
+                    self.covers.clone(),
+                    self.config.clone(),
+                    self.animator.clone(),
+                    cx,
+                );
+                browse.set_playlist_scope(title, playlists.clone(), cx);
+                browse
+            });
+            let focus = view.read(cx).focus_handle_for_window();
+            self.tabs.push(Tab { id: tab_id.clone(), view: view.into(), focus, temp: playlists });
         }
         self.activate(tab_id, window, cx);
     }
 
     /// Close a non-browse tab, activating the neighbour that takes its place.
+    /// A temporary playlist lives exactly as long as its tab: closing one
+    /// deletes the playlist(s) it was showing.
     pub fn close_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else { return };
-        self.tabs.remove(index);
+        let tab = self.tabs.remove(index);
+        let mut temps = tab.temp;
+        if let TabId::Playlist(playlist) = &id {
+            if self
+                .library
+                .read(cx)
+                .library()
+                .playlist(*playlist)
+                .is_some_and(|p| p.is_temporary())
+            {
+                temps.push(*playlist);
+            }
+        }
+        // One batched delete: a folder tab can carry hundreds of temporary
+        // playlists, and deleting per-playlist meant a full-library cache
+        // write each.
+        if !temps.is_empty() {
+            self.library.update(cx, |state, cx| state.delete_playlists(temps, cx));
+        }
         if self.active == id && !self.search_open && !self.settings_open {
             let fallback = self
                 .tabs
@@ -349,18 +399,27 @@ impl TabsView {
         }
     }
 
-    /// Drop tabs whose playlist no longer exists. Artist tabs are scoped by
-    /// name, not by a library entity, so they're always kept.
+    /// Drop tabs whose backing is gone: a playlist tab whose playlist was
+    /// deleted (a rescan also drops temporary playlists, taking their tabs
+    /// with them), or a folder tab whose temporary playlists a rescan removed.
+    /// Artist tabs are scoped by name, not by a library entity, so they're
+    /// always kept.
     fn prune(&mut self, cx: &App) {
-        let valid: HashSet<PlaylistId> = {
-            let state = self.library.read(cx);
-            state.library().playlists().iter().map(|playlist| playlist.id).collect()
-        };
+        let library = self.library.read(cx).library();
+        let alive = |id: PlaylistId| library.playlist(id).is_some();
         self.tabs.retain(|tab| match &tab.id {
-            TabId::Playlist(id) => valid.contains(id),
+            TabId::Playlist(id) => alive(*id),
+            TabId::Folder(_) => tab.temp.iter().all(|id| alive(*id)),
             _ => true,
         });
-        let active_gone = matches!(&self.active, TabId::Playlist(id) if !valid.contains(id));
+        let active_gone = match self.active.clone() {
+            TabId::Playlist(id) => !alive(id),
+            TabId::Folder(path) => {
+                let id = TabId::Folder(path.clone());
+                !self.tabs.iter().any(|tab| tab.id == id)
+            }
+            _ => false,
+        };
         if active_gone {
             self.active = TabId::Browse;
         }
@@ -375,9 +434,13 @@ impl TabsView {
                 .read(cx)
                 .library()
                 .playlist(*playlist)
-                .map(|playlist| playlist.meta.title.clone())
+                .map(|playlist| playlist.meta().title)
                 .unwrap_or_default(),
             TabId::Artist(artist) => artist.clone(),
+            TabId::Folder(path) => path
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| path.display().to_string()),
         }
     }
 }
@@ -390,7 +453,7 @@ impl Container for TabsView {
 
 impl Render for TabsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let theme = self.theme;
+        let theme = self.themed.theme();
 
         // The titlebar names the current track while one is loaded, and falls
         // back to the app name otherwise.
@@ -418,6 +481,14 @@ impl Render for TabsView {
             }
             if let Some(artist) = self.library.update(cx, |state, _cx| state.take_artist_view()) {
                 self.open_artist(artist, window, cx);
+            }
+            if let Some(dir) = self.library.update(cx, |state, _cx| state.take_folder_play()) {
+                let playback = self.playback.clone();
+                let playlists =
+                    self.library.update(cx, |state, cx| state.play_folder(&dir, &playback, cx));
+                if !playlists.is_empty() {
+                    self.open_folder(dir, playlists, window, cx);
+                }
             }
             if let Some(request) = self.library.read(cx).pending_song_menu().cloned() {
                 self.library.update(cx, |state, _cx| state.clear_song_menu());

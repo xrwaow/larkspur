@@ -27,8 +27,9 @@ use crate::ui::theme::Theme;
 /// Extra rows rendered above and below the viewport, so scrolling a little
 /// doesn't pop rows (or their covers) in. This is a direct multiplier on the
 /// per-frame cost: every hover or scroll re-renders the viewport *plus* this
-/// band, so it's kept modest rather than generous.
-const OVERDRAW_PX: f32 = 512.0;
+/// band, so it's kept modest rather than generous. `pub(crate)` so the rail's
+/// list in `ui::playlists` uses the same overdraw instead of a second copy.
+pub(crate) const OVERDRAW_PX: f32 = 512.0;
 
 /// Time constant of the eased scroll. Smaller is snappier.
 const SCROLL_EASE_SECS: f32 = 0.01;

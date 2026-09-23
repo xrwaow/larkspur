@@ -30,7 +30,7 @@ pub struct OpusSource {
 impl OpusSource {
     pub fn new(path: &Path) -> anyhow::Result<Self> {
         let opened = open_track(path, true)?;
-        let channels = opened.codec_params.channels.map(|c| c.count()).unwrap_or(2);
+        let channels = opened.channels();
         let decoder = PacketDecoder::new(&opened.codec_params, channels)?;
         anyhow::ensure!(decoder.is_opus(), "no Opus track in {path:?}");
 
@@ -72,10 +72,7 @@ impl OpusSource {
             let trim_start = packet.trim_start as usize;
             let available = frames_total.saturating_sub(trim_start);
             let frames = (packet.dur() as usize).min(available);
-            let start = trim_start * self.channels;
-            let end = (trim_start + frames) * self.channels;
-            let slice = decoded.get(start..end).unwrap_or(&[]).to_vec();
-            self.buffer = slice;
+            self.buffer = slice_frames(decoded, trim_start, 0, frames, self.channels);
             self.offset = 0;
             return true;
         }
@@ -159,16 +156,17 @@ impl OpusSource {
             }
             let Some(decoded) = self.decoder.decode(&packet) else { continue };
 
-            let ch = self.channels;
             let pkt_start = packet.ts();
             let pkt_dur = packet.dur();
             let skip_frames = required.saturating_sub(pkt_start).min(pkt_dur) as usize;
-            let start = packet.trim_start as usize + skip_frames;
             let frames = pkt_dur as usize - skip_frames;
-            let range_start = start * ch;
-            let range_end = (start + frames) * ch;
-            let slice = decoded.get(range_start..range_end).unwrap_or(&[]).to_vec();
-            self.buffer = slice;
+            self.buffer = slice_frames(
+                decoded,
+                packet.trim_start as usize,
+                skip_frames,
+                frames,
+                self.channels,
+            );
             self.offset = 0;
             if !self.buffer.is_empty() {
                 return Ok(());
@@ -176,6 +174,23 @@ impl OpusSource {
             // Seek landed exactly on a packet boundary; try the next one.
         }
     }
+}
+
+/// Slice `frames`-worth of samples starting at frame `trim_start + skip`,
+/// where each frame is `channels` interleaved samples. Both the gapless
+/// pre-skip/trim in `refill` and the exact-position refinement after a seek
+/// need this same indexed window out of a decoded packet; out-of-range
+/// indices yield an empty slice rather than panicking.
+fn slice_frames(
+    decoded: &[f32],
+    trim_start: usize,
+    skip: usize,
+    frames: usize,
+    channels: usize,
+) -> Vec<f32> {
+    let start = (trim_start + skip) * channels;
+    let end = (trim_start + skip + frames) * channels;
+    decoded.get(start..end).unwrap_or(&[]).to_vec()
 }
 
 #[derive(Debug)]
