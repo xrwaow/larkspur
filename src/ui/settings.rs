@@ -218,25 +218,6 @@ impl Render for SettingsView {
             div().flex().gap_2().children(visualizer_buttons).into_any_element(),
         ));
 
-        // --- lyrics fade mask ---
-        let lyrics_fade = config.lyrics_fade();
-        let fade_buttons = [true, false].iter().map(|&on| {
-            choice_button(
-                theme,
-                ("lyrics-fade", on as usize),
-                if on { "On" } else { "Off" },
-                lyrics_fade == on,
-                cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                    this.config.update(cx, |config, cx| config.set_lyrics_fade(on, cx));
-                }),
-            )
-        });
-        items.push(setting_row(
-            theme,
-            "Lyrics fade",
-            div().flex().gap_2().children(fade_buttons).into_any_element(),
-        ));
-
         // --- typeface + font size, per container, as a table ---
         items.push(section_header(theme, "Font"));
         for (index, row) in rows.into_iter().enumerate() {

@@ -100,12 +100,6 @@ impl ConfigState {
         self.config.visualizer
     }
 
-    /// Whether the lyrics panel fades its content into the background at the
-    /// top and bottom edges.
-    pub fn lyrics_fade(&self) -> bool {
-        self.config.lyrics_fade
-    }
-
     // --- actions -------------------------------------------------------
 
     pub fn set_theme(&mut self, kind: ThemeKind, cx: &mut Context<Self>) {
@@ -131,15 +125,6 @@ impl ConfigState {
     pub fn set_visualizer(&mut self, on: bool, cx: &mut Context<Self>) {
         if self.config.visualizer != on {
             self.config.visualizer = on;
-            self.persist();
-            cx.notify();
-        }
-    }
-
-    /// Turn the lyrics panel's top/bottom fade on or off.
-    pub fn set_lyrics_fade(&mut self, on: bool, cx: &mut Context<Self>) {
-        if self.config.lyrics_fade != on {
-            self.config.lyrics_fade = on;
             self.persist();
             cx.notify();
         }

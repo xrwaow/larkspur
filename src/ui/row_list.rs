@@ -24,7 +24,7 @@ use crate::ui::albums::{
     self, AlbumSection, Columns, ListItem, Selection, MAX_ARTIST_CHARS, MAX_TITLE_CHARS,
 };
 use crate::ui::animation::Spring;
-use crate::ui::marquee::{self, Slide};
+use crate::ui::marquee::{self, Marquee};
 use crate::ui::theme::Theme;
 
 /// Extra rows rendered above and below the viewport, so scrolling a little
@@ -150,24 +150,10 @@ impl SmoothScroll {
 
 /// Which text cell of a row a hover belongs to. Each slides independently, so
 /// hovering one doesn't drag the other along.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum Cell {
     Title,
     Artist,
-}
-
-impl Cell {
-    fn index(self) -> usize {
-        match self {
-            Cell::Title => 0,
-            Cell::Artist => 1,
-        }
-    }
-}
-
-/// The key a row's cell marquee is tracked under — two cells per row.
-fn marquee_key(ix: usize, cell: Cell) -> usize {
-    ix * 2 + cell.index()
 }
 
 /// A snapshot of the list's highlight state, for the renderer.
@@ -181,10 +167,8 @@ pub struct Highlight {
     selection_fade: Fades,
     hovered: Option<usize>,
     hover_fade: Fades,
-    /// The marquee slide per row cell, for the title/artist cells.
-    marquee_slides: HashMap<usize, Slide>,
-    /// The title/artist cell the pointer is over.
-    hovered_cell: Option<(usize, Cell)>,
+    /// The marquee per row cell, for the title/artist cells.
+    marquees: HashMap<(usize, Cell), Marquee>,
 }
 
 impl Highlight {
@@ -202,16 +186,10 @@ impl Highlight {
             .or_else(|| (self.hovered == Some(ix)).then_some(1.0))
     }
 
-    /// The in-flight marquee offset for `ix`'s `cell`, if it's sliding. A
-    /// settled cell is dropped, so the renderer falls back to the hover state
-    /// (see [`cell_hovered`](Self::cell_hovered)).
-    pub fn marquee_offset(&self, ix: usize, cell: Cell) -> Option<f32> {
-        self.marquee_slides.get(&marquee_key(ix, cell)).map(Slide::offset)
-    }
-
-    /// Whether `ix`'s `cell` is the one the pointer is over.
-    pub fn cell_hovered(&self, ix: usize, cell: Cell) -> bool {
-        self.hovered_cell == Some((ix, cell))
+    /// The in-flight marquee offset for `ix`'s `cell`, in px — 0 at rest. A
+    /// settled, unhovered cell isn't tracked, so it reads as 0.
+    pub fn marquee_offset(&self, ix: usize, cell: Cell) -> f32 {
+        self.marquees.get(&(ix, cell)).map_or(0.0, Marquee::offset)
     }
 }
 
@@ -230,13 +208,11 @@ pub struct RowList {
     /// The selection crossfade, and the hover crossfade.
     selection_fade: Fades,
     hover_fade: Fades,
-    /// The marquee slide, per row cell — a constant-speed slide out, a sprung
-    /// snap back.
-    marquee_slides: HashMap<usize, Slide>,
+    /// The marquee, per row cell — a constant-speed slide out, a sprung snap
+    /// back.
+    marquees: HashMap<(usize, Cell), Marquee>,
     /// The row the pointer is over.
     hovered: Option<usize>,
-    /// The title/artist cell the pointer is over.
-    hovered_cell: Option<(usize, Cell)>,
     /// The eased scroll in flight.
     scroll: SmoothScroll,
     /// Set when the sections need rebuilding from the library.
@@ -257,9 +233,8 @@ impl RowList {
             cursor: None,
             selection_fade: Fades::default(),
             hover_fade: Fades::default(),
-            marquee_slides: HashMap::new(),
+            marquees: HashMap::new(),
             hovered: None,
-            hovered_cell: None,
             scroll: SmoothScroll::default(),
             dirty: true,
             measured_at: 0.0,
@@ -291,9 +266,8 @@ impl RowList {
             self.selection_fade = Fades::default();
             // Row indices shift on a rebuild, so drop the per-row marquee state
             // rather than let a stale slide land on the wrong row.
-            self.marquee_slides.clear();
+            self.marquees.clear();
             self.hovered = None;
-            self.hovered_cell = None;
             self.rebuild_rows(theme, window);
             // Land the cursor on the first row so `enter` plays immediately.
             self.cursor = albums::step_selectable(&self.items, None, true);
@@ -345,8 +319,7 @@ impl RowList {
             selection_fade: self.selection_fade.clone(),
             hovered: self.hovered,
             hover_fade: self.hover_fade.clone(),
-            marquee_slides: self.marquee_slides.clone(),
-            hovered_cell: self.hovered_cell,
+            marquees: self.marquees.clone(),
         }
     }
 
@@ -416,34 +389,16 @@ impl RowList {
     /// anything the renderer draws changed. Each cell slides on its own, so
     /// hovering the title doesn't drag the artist along.
     pub fn set_cell_hover(&mut self, item_ix: usize, cell: Cell, hovered: bool) -> bool {
-        let key = marquee_key(item_ix, cell);
-        if hovered {
-            if self.hovered_cell == Some((item_ix, cell)) {
-                return false;
-            }
-            if let Some((prev_ix, prev_cell)) = self.hovered_cell.replace((item_ix, cell)) {
-                self.slide(marquee_key(prev_ix, prev_cell)).aim(0.0);
-            }
-            let travel = self.cell_travel(item_ix, cell);
-            self.slide(key).aim(-travel);
-        } else {
-            let was_hovered = self.hovered_cell == Some((item_ix, cell));
-            if was_hovered {
-                self.hovered_cell = None;
-            }
+        if !hovered {
             // As with the row hover, GPUI reports an exit for cells the pointer
             // never entered; only react to a real one.
-            if !was_hovered && !self.marquee_slides.contains_key(&key) {
+            let Some(marquee) = self.marquees.get_mut(&(item_ix, cell)) else {
                 return false;
-            }
-            self.slide(key).aim(0.0);
+            };
+            return marquee.set_hovered(false, 0.0);
         }
-        true
-    }
-
-    /// The slide for `key`, created at rest if it isn't tracked yet.
-    fn slide(&mut self, key: usize) -> &mut Slide {
-        self.marquee_slides.entry(key).or_default()
+        let travel = self.cell_travel(item_ix, cell);
+        self.marquees.entry((item_ix, cell)).or_default().set_hovered(true, travel)
     }
 
     /// How far the row at `ix`'s `cell` text overflows its column, in px.
@@ -517,18 +472,16 @@ impl RowList {
         selection || hover || marquee || scrolled
     }
 
-    /// Advance every marquee slide, dropping the settled ones. A settled slide
+    /// Advance every marquee, dropping the settled ones. A settled marquee
     /// whose cell is hovered is kept, so the renderer can read its offset
     /// without recomputing the travel.
     fn tick_marquees(&mut self, dt: f32) -> bool {
         let mut moved = false;
-        let hovered = self.hovered_cell;
-        self.marquee_slides.retain(|key, slide| {
-            if slide.tick(dt) {
+        self.marquees.retain(|_, marquee| {
+            if marquee.tick(dt) {
                 moved = true;
             }
-            slide.is_animating()
-                || hovered.is_some_and(|(ix, cell)| marquee_key(ix, cell) == *key)
+            marquee.is_animating() || marquee.is_hovered()
         });
         moved
     }

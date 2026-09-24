@@ -11,21 +11,25 @@
 //! one crawled. Instead the offset moves at a constant [`SLIDE_PX_PER_SEC`], so
 //! every title reads at the same pace. Only the snap back is sprung.
 //!
-//! The state is a [`Slide`] (the offset), driven either by a [`Marquee`] — a
-//! standalone title, like the lyrics panel's — or by a list row, whose hover the
-//! [`RowList`](crate::ui::row_list::RowList) already tracks.
+//! The state is a [`Marquee`] — a [`Slide`] (the offset) plus the hover that
+//! drives it. A standalone title (the lyrics panel's) owns one directly, and a
+//! list row keeps one per title/artist cell, so the two paths share a type.
 
-use gpui::{
-    div, linear_color_stop, linear_gradient, prelude::*, px, AnyElement, App, ElementId, Hsla,
-    Rgba, Window,
-};
+use gpui::{div, prelude::*, px, AnyElement, App, ElementId, Rgba, Window};
 
 use crate::ui::animation::Spring;
 use crate::ui::theme::Theme;
+use crate::ui::widgets::{edge_fade, Side};
 
 /// How fast the text slides on hover, in px per second. Constant, so the pace
 /// doesn't depend on how far the text has to travel.
 pub const SLIDE_PX_PER_SEC: f32 = 150.0;
+
+/// The snap back's spring: stiff and under-damped, so the text *snaps* back past
+/// its start rather than easing home. The slide *out* is not a spring — it runs
+/// at a constant speed ([`SLIDE_PX_PER_SEC`]) so a long title doesn't whip past.
+const SNAP_BACK_STIFFNESS: f32 = 400.0;
+const SNAP_BACK_DAMPING: f32 = 16.0;
 
 /// Below this the slide counts as settled.
 const SLIDE_EPSILON: f32 = 0.01;
@@ -33,7 +37,7 @@ const SLIDE_EPSILON: f32 = 0.01;
 /// A text cell's horizontal offset, animated at a constant speed on the way out
 /// and sprung back on release.
 #[derive(Clone, Copy, Debug)]
-pub struct Slide {
+struct Slide {
     /// The current offset, in px. Negative when slid left.
     offset: f32,
     /// Where the offset is heading: 0 at rest, `-travel` when hovered.
@@ -44,16 +48,21 @@ pub struct Slide {
 }
 
 impl Slide {
-    pub fn new() -> Self {
-        Self { offset: 0.0, target: 0.0, releasing: false, spring: Spring::bouncy(0.0) }
+    fn new() -> Self {
+        Self {
+            offset: 0.0,
+            target: 0.0,
+            releasing: false,
+            spring: Spring::with_params(0.0, SNAP_BACK_STIFFNESS, SNAP_BACK_DAMPING),
+        }
     }
 
     /// The current offset, in px.
-    pub fn offset(&self) -> f32 {
+    fn offset(&self) -> f32 {
         self.offset
     }
 
-    pub fn is_animating(&self) -> bool {
+    fn is_animating(&self) -> bool {
         if self.releasing {
             self.spring.is_animating()
         } else {
@@ -63,7 +72,7 @@ impl Slide {
 
     /// Aim at `target` px. A move to zero (the release) springs back; a move out
     /// slides at a constant speed.
-    pub fn aim(&mut self, target: f32) {
+    fn aim(&mut self, target: f32) {
         self.target = target;
         if target == 0.0 && self.offset != 0.0 {
             // Start the release once. A repeated exit event must not reset the
@@ -79,7 +88,7 @@ impl Slide {
     }
 
     /// Advance the slide. Returns whether it moved.
-    pub fn tick(&mut self, dt: f32) -> bool {
+    fn tick(&mut self, dt: f32) -> bool {
         if self.releasing {
             let moved = self.spring.tick(dt);
             self.offset = self.spring.value();
@@ -111,9 +120,9 @@ impl Default for Slide {
     }
 }
 
-/// A standalone marquee: a [`Slide`] plus the hover state that drives it. A list
-/// row doesn't need this — its hover is already tracked by the list.
-#[derive(Clone, Copy, Debug)]
+/// A [`Slide`] plus the hover state that drives it: a standalone title owns one
+/// directly, and a list row keeps one per title/artist cell.
+#[derive(Clone, Copy, Debug, Default)]
 pub struct Marquee {
     slide: Slide,
     hovered: bool,
@@ -121,7 +130,7 @@ pub struct Marquee {
 
 impl Marquee {
     pub fn new() -> Self {
-        Self { slide: Slide::new(), hovered: false }
+        Self::default()
     }
 
     /// Note whether the pointer is over the text, and how far the current text
@@ -142,15 +151,19 @@ impl Marquee {
         self.slide.tick(dt)
     }
 
+    /// Whether the slide is still in motion.
+    pub fn is_animating(&self) -> bool {
+        self.slide.is_animating()
+    }
+
+    /// Whether the pointer is currently over the text.
+    pub fn is_hovered(&self) -> bool {
+        self.hovered
+    }
+
     /// The current offset, in px.
     pub fn offset(&self) -> f32 {
         self.slide.offset()
-    }
-}
-
-impl Default for Marquee {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -216,42 +229,13 @@ pub fn marquee_text(
 
     if travel > 0.5 {
         // The overflow fades out over one character at the right edge.
-        cell = cell.child(edge_fade(background, advance, Edge::Right));
+        cell = cell.child(edge_fade(background, advance, Side::Right));
     }
     if offset < -0.5 {
         // Once the text has slid, its start fades in at the left edge.
-        cell = cell.child(edge_fade(background, advance, Edge::Left));
+        cell = cell.child(edge_fade(background, advance, Side::Left));
     }
     cell.into_any_element()
-}
-
-/// Which edge of a cell an [`edge_fade`] sits on.
-#[derive(Clone, Copy)]
-enum Edge {
-    Left,
-    Right,
-}
-
-/// A one-character gradient of `background`, transparent at the inner edge and
-/// opaque at the outer one, so the text under it dissolves into the row.
-fn edge_fade(background: Rgba, width: f32, edge: Edge) -> AnyElement {
-    let opaque = Hsla::from(background);
-    let clear = opaque.alpha(0.0);
-    // 90° runs left→right, so the right edge fades from clear to the background
-    // and the left edge the other way round.
-    let (from, to) = match edge {
-        Edge::Right => (clear, opaque),
-        Edge::Left => (opaque, clear),
-    };
-    div()
-        .absolute()
-        .top(px(0.0))
-        .h_full()
-        .w(px(width))
-        .when(matches!(edge, Edge::Right), |d| d.right(px(0.0)))
-        .when(matches!(edge, Edge::Left), |d| d.left(px(0.0)))
-        .bg(linear_gradient(90.0, linear_color_stop(from, 0.0), linear_color_stop(to, 1.0)))
-        .into_any_element()
 }
 
 #[cfg(test)]

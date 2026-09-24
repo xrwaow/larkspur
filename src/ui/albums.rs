@@ -482,163 +482,92 @@ pub fn render_item<V: Render + 'static>(
     let section = &sections[item.section()];
     let playlist = section.playlist;
     let playlist_context = context.context;
+
+    // A header has no title/artist cells or row actions to wire; draw it and go.
+    let Some((track, index)) = (match item {
+        ListItem::Header(_) => None,
+        ListItem::Compact(_) => Some((&section.tracks[0], 0)),
+        ListItem::Track { index, .. } => Some((&section.tracks[index], index)),
+    }) else {
+        request_cover(context.covers, context.library, section.cover_song, cx);
+        let cover = context.covers.read(cx).cover_of(section.cover_song);
+        return album_header(context.theme, section, cover);
+    };
+
+    let song = track.song;
+    let playing = context.current == song;
     let paint = RowPaint {
         theme: context.theme,
-        playing: false,
+        playing,
         audio_playing: context.playing,
         eq_phase: context.eq_phase,
         selection: context.highlight.selection(ix),
         hover: context.highlight.hover(ix),
-        title_offset: 0.0,
-        artist_offset: 0.0,
-        bitrate: None,
+        title_offset: context.highlight.marquee_offset(ix, Cell::Title),
+        artist_offset: context.highlight.marquee_offset(ix, Cell::Artist),
+        bitrate: row_bitrate(playing, track.nominal_bitrate, context.live_bitrate),
     };
 
-    match item {
-        ListItem::Header(_) => {
-            request_cover(context.covers, context.library, section.cover_song, cx);
-            let cover = context.covers.read(cx).cover_of(section.cover_song);
-            album_header(context.theme, section, cover)
-        }
-        ListItem::Compact(_) => {
-            request_cover(context.covers, context.library, section.cover_song, cx);
-            let cover = context.covers.read(cx).cover_of(section.cover_song);
-            let track = &section.tracks[0];
-            let song = track.song;
-            let playing = context.current == song;
-            let paint = RowPaint {
-                playing,
-                bitrate: row_bitrate(playing, track.nominal_bitrate, context.live_bitrate),
-                title_offset: cell_offset(
-                    context.highlight,
-                    ix,
-                    Cell::Title,
-                    &track.title,
-                    columns.title,
-                    MAX_TITLE_CHARS,
-                ),
-                artist_offset: cell_offset(
-                    context.highlight,
-                    ix,
-                    Cell::Artist,
-                    &track.artist,
-                    columns.artist,
-                    MAX_ARTIST_CHARS,
-                ),
-                ..paint
-            };
-            let actions = actions.expect("a compact row is interactive");
-            let on_click = {
-                let actions = actions.clone();
-                cx.listener(move |view, event: &ClickEvent, window, cx| {
-                    actions.activate(view, ix, playlist, 0, event, window, cx)
-                })
-            };
-            let on_right_click = {
-                let actions = actions.clone();
-                cx.listener(move |view, event: &MouseDownEvent, window, cx| {
-                    actions.context(view, ix, song, playlist_context, event, window, cx)
-                })
-            };
-            let on_hover = {
-                let actions = actions.clone();
-                cx.listener(move |view, hovered: &bool, _window, cx| {
-                    actions.hover(view, ix, *hovered, cx)
-                })
-            };
-            let on_title_hover = {
-                let actions = actions.clone();
-                cx.listener(move |view, hovered: &bool, _window, cx| {
-                    actions.cell_hover(view, ix, Cell::Title, *hovered, cx)
-                })
-            };
-            let on_artist_hover = {
-                let actions = actions.clone();
-                cx.listener(move |view, hovered: &bool, _window, cx| {
-                    actions.cell_hover(view, ix, Cell::Artist, *hovered, cx)
-                })
-            };
-            compact_row(
-                &paint,
-                track,
-                &section.year,
-                columns,
-                cover,
-                on_click,
-                on_right_click,
-                on_hover,
-                on_title_hover,
-                on_artist_hover,
-            )
-        }
-        ListItem::Track { index, .. } => {
-            let track = &section.tracks[index];
-            let song = track.song;
-            let playing = context.current == song;
-            let paint = RowPaint {
-                playing,
-                bitrate: row_bitrate(playing, track.nominal_bitrate, context.live_bitrate),
-                title_offset: cell_offset(
-                    context.highlight,
-                    ix,
-                    Cell::Title,
-                    &track.title,
-                    columns.title,
-                    MAX_TITLE_CHARS,
-                ),
-                artist_offset: cell_offset(
-                    context.highlight,
-                    ix,
-                    Cell::Artist,
-                    &track.artist,
-                    columns.artist,
-                    MAX_ARTIST_CHARS,
-                ),
-                ..paint
-            };
-            let actions = actions.expect("a track row is interactive");
-            let on_click = {
-                let actions = actions.clone();
-                cx.listener(move |view, event: &ClickEvent, window, cx| {
-                    actions.activate(view, ix, playlist, index, event, window, cx)
-                })
-            };
-            let on_right_click = {
-                let actions = actions.clone();
-                cx.listener(move |view, event: &MouseDownEvent, window, cx| {
-                    actions.context(view, ix, song, playlist_context, event, window, cx)
-                })
-            };
-            let on_hover = {
-                let actions = actions.clone();
-                cx.listener(move |view, hovered: &bool, _window, cx| {
-                    actions.hover(view, ix, *hovered, cx)
-                })
-            };
-            let on_title_hover = {
-                let actions = actions.clone();
-                cx.listener(move |view, hovered: &bool, _window, cx| {
-                    actions.cell_hover(view, ix, Cell::Title, *hovered, cx)
-                })
-            };
-            let on_artist_hover = {
-                let actions = actions.clone();
-                cx.listener(move |view, hovered: &bool, _window, cx| {
-                    actions.cell_hover(view, ix, Cell::Artist, *hovered, cx)
-                })
-            };
-            track_row(
-                &paint,
-                track,
-                index,
-                columns,
-                on_click,
-                on_right_click,
-                on_hover,
-                on_title_hover,
-                on_artist_hover,
-            )
-        }
+    // The five listeners a track row wires up — the same for a compact row
+    // (`index` is its section's only track) and a multi-track one.
+    let actions = actions.expect("a row is interactive");
+    let on_click = {
+        let actions = actions.clone();
+        cx.listener(move |view, event: &ClickEvent, window, cx| {
+            actions.activate(view, ix, playlist, index, event, window, cx)
+        })
+    };
+    let on_right_click = {
+        let actions = actions.clone();
+        cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+            actions.context(view, ix, song, playlist_context, event, window, cx)
+        })
+    };
+    let on_hover = {
+        let actions = actions.clone();
+        cx.listener(move |view, hovered: &bool, _window, cx| actions.hover(view, ix, *hovered, cx))
+    };
+    let on_title_hover = {
+        let actions = actions.clone();
+        cx.listener(move |view, hovered: &bool, _window, cx| {
+            actions.cell_hover(view, ix, Cell::Title, *hovered, cx)
+        })
+    };
+    let on_artist_hover = {
+        let actions = actions.clone();
+        cx.listener(move |view, hovered: &bool, _window, cx| {
+            actions.cell_hover(view, ix, Cell::Artist, *hovered, cx)
+        })
+    };
+
+    if matches!(item, ListItem::Compact(_)) {
+        // A compact row carries its section's cover on the left.
+        request_cover(context.covers, context.library, section.cover_song, cx);
+        let cover = context.covers.read(cx).cover_of(section.cover_song);
+        compact_row(
+            &paint,
+            track,
+            &section.year,
+            columns,
+            cover,
+            on_click,
+            on_right_click,
+            on_hover,
+            on_title_hover,
+            on_artist_hover,
+        )
+    } else {
+        track_row(
+            &paint,
+            track,
+            index,
+            columns,
+            on_click,
+            on_right_click,
+            on_hover,
+            on_title_hover,
+            on_artist_hover,
+        )
     }
 }
 
@@ -743,7 +672,7 @@ fn compact_row(
         .items_center()
         .gap_3()
         .px_4()
-        .py_2()
+        .py(px(6.0))
         .cursor_pointer()
         .bg(background)
         .on_hover(on_hover)
@@ -793,6 +722,8 @@ fn track_row(
     let theme = paint.theme;
     let playing = paint.playing;
     let background = row_background(theme, playing, paint.selection, paint.hover, index);
+    // One monospace character, to nudge the equalizer left of the column edge.
+    let advance = columns.title / MAX_TITLE_CHARS as f32;
 
     div()
         .id(id)
@@ -808,7 +739,7 @@ fn track_row(
         .on_click(on_click)
         .on_mouse_down(MouseButton::Right, on_right_click)
         .child(if playing {
-            eq_icon(theme, paint.eq_phase, paint.audio_playing)
+            eq_icon(theme, paint.eq_phase, paint.audio_playing, advance)
         } else {
             number_cell(theme, track.number)
         })
@@ -837,23 +768,6 @@ fn track_row(
         .child(bitrate_cell(theme, paint.bitrate))
         .child(duration_cell(theme, track))
         .into_any_element()
-}
-
-/// The marquee offset to draw a cell's text at: the in-flight slide if there is
-/// one, else fully slid when the cell is hovered, else at rest.
-fn cell_offset(
-    highlight: &Highlight,
-    ix: usize,
-    cell: Cell,
-    text: &str,
-    width: f32,
-    max_chars: usize,
-) -> f32 {
-    match highlight.marquee_offset(ix, cell) {
-        Some(offset) => offset,
-        None if highlight.cell_hovered(ix, cell) => -marquee::travel_for(text, width, max_chars),
-        None => 0.0,
-    }
 }
 
 /// The title cell: a fixed column that fades and slides when it overflows.
@@ -924,7 +838,7 @@ const EQ_GAP_PX: f32 = 2.0;
 /// The playing row's equalizer: a few small bars in the accent colour, dancing
 /// while the track plays and resting when it's paused. It takes the number
 /// column's place, so the row still lines up.
-fn eq_icon(theme: Theme, phase: f32, playing: bool) -> AnyElement {
+fn eq_icon(theme: Theme, phase: f32, playing: bool, advance: f32) -> AnyElement {
     let height = theme.font_size * 0.95;
     let levels = eq_levels(phase, playing);
     let width = EQ_BARS as f32 * EQ_BAR_PX + (EQ_BARS - 1) as f32 * EQ_GAP_PX;
@@ -934,6 +848,8 @@ fn eq_icon(theme: Theme, phase: f32, playing: bool) -> AnyElement {
         .h(px(height))
         .flex()
         .justify_end()
+        // Sit one character left of the number column's right edge.
+        .pr(px(advance))
         .child(
             canvas(
                 |_bounds, _window, _cx| (),

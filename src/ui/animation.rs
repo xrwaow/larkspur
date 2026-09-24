@@ -160,13 +160,6 @@ pub const SPRING_STIFFNESS: f32 = 260.0;
 /// a little under that gives the faintest overshoot — alive, not bouncy.
 pub const SPRING_DAMPING: f32 = 30.0;
 
-/// The marquee's release spring: stiff and under-damped, so the text *snaps*
-/// back past its start rather than easing home. The slide *out* is not a
-/// spring — it runs at a constant speed (see `marquee::SLIDE_PX_PER_SEC`) so a
-/// long title doesn't whip past.
-pub const MARQUEE_SMASH_STIFFNESS: f32 = 400.0;
-pub const MARQUEE_SMASH_DAMPING: f32 = 16.0;
-
 /// Below this displacement and velocity a spring counts as settled.
 const SPRING_SETTLE_VALUE: f32 = 0.001;
 const SPRING_SETTLE_VELOCITY: f32 = 0.02;
@@ -203,13 +196,8 @@ impl Spring {
         Self::with_params(value, SPRING_STIFFNESS, SPRING_DAMPING)
     }
 
-    /// A spring at rest on `value`, tuned to overshoot — the marquee's snap
-    /// back.
-    pub fn bouncy(value: f32) -> Self {
-        Self::with_params(value, MARQUEE_SMASH_STIFFNESS, MARQUEE_SMASH_DAMPING)
-    }
-
-    /// A spring at rest on `value` with explicit tuning.
+    /// A spring at rest on `value` with explicit tuning (a stiffer, under-damped
+    /// pair overshoots, which is how the marquee's snap back reads).
     pub fn with_params(value: f32, stiffness: f32, damping: f32) -> Self {
         Self { value, velocity: 0.0, target: value, stiffness, damping }
     }
@@ -351,24 +339,6 @@ mod tests {
         // spring may even overshoot past the target first).
         assert!(after > before / 2.0, "it moves gradually: {before} -> {after}");
         assert!(after > 0.0, "and it hasn't snapped to the new target");
-    }
-
-    #[test]
-    fn a_bouncy_spring_overshoots_its_target() {
-        // The marquee's "smash" depends on this: an under-damped spring passes
-        // its target before settling, so the text visibly overshoots.
-        let mut spring = Spring::bouncy(0.0);
-        spring.target(1.0);
-        let mut peak: f32 = 0.0;
-        for _ in 0..600 {
-            if !spring.is_animating() {
-                break;
-            }
-            spring.tick(1.0 / 60.0);
-            peak = peak.max(spring.value());
-        }
-        assert!(peak > 1.05, "it overshoots, peaking at {peak}");
-        assert!((spring.value() - 1.0).abs() < 0.01, "then settles on the target");
     }
 
     #[test]

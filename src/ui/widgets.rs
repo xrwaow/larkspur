@@ -4,8 +4,8 @@
 //! so a change to a section label or a panel header lands everywhere at once.
 
 use gpui::{
-    div, fill, point, prelude::*, px, size, AnyElement, Bounds, Pixels, Rgba, ScrollWheelEvent,
-    Window,
+    div, fill, linear_color_stop, linear_gradient, point, prelude::*, px, size, AnyElement,
+    Bounds, Hsla, Pixels, Rgba, ScrollWheelEvent, Window,
 };
 
 use crate::ui::text_field::TextField;
@@ -75,6 +75,45 @@ pub fn blend(from: Rgba, to: Rgba, t: f32) -> Rgba {
         b: from.b + (to.b - from.b) * t,
         a: from.a + (to.a - from.a) * t,
     }
+}
+
+/// Which edge of a container an [`edge_fade`] sits against.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Side {
+    Top,
+    Bottom,
+    Left,
+    Right,
+}
+
+/// A gradient of `background` over `length` px at one `side` of a container —
+/// opaque at the outer edge, transparent toward the inside — so content under it
+/// dissolves into the background instead of being cut off.
+///
+/// Absolutely positioned, so drop it in as a child of a `relative` container. A
+/// horizontal fade spans the full height, a vertical one the full width.
+pub fn edge_fade(background: Rgba, length: f32, side: Side) -> AnyElement {
+    let opaque = Hsla::from(background);
+    let clear = opaque.alpha(0.0);
+    // Angles run to top/right/bottom/left, so 90° is left→right and 180°
+    // top→bottom. The outer edge is the opaque end, the inside the clear one.
+    let (from, to, angle) = match side {
+        Side::Left => (opaque, clear, 90.0),
+        Side::Right => (clear, opaque, 90.0),
+        Side::Top => (opaque, clear, 180.0),
+        Side::Bottom => (clear, opaque, 180.0),
+    };
+    let horizontal = matches!(side, Side::Left | Side::Right);
+    div()
+        .absolute()
+        .when(horizontal, |d| d.w(px(length)).h_full().top(px(0.0)))
+        .when(!horizontal, |d| d.h(px(length)).w_full().left(px(0.0)).right(px(0.0)))
+        .when(matches!(side, Side::Left), |d| d.left(px(0.0)))
+        .when(matches!(side, Side::Right), |d| d.right(px(0.0)))
+        .when(matches!(side, Side::Top), |d| d.top(px(0.0)))
+        .when(matches!(side, Side::Bottom), |d| d.bottom(px(0.0)))
+        .bg(linear_gradient(angle, linear_color_stop(from, 0.0), linear_color_stop(to, 1.0)))
+        .into_any_element()
 }
 
 /// A panel's top row: a title on the left (optionally with a leading button

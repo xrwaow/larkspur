@@ -27,8 +27,8 @@
 use std::time::Duration;
 
 use gpui::{
-    div, linear_color_stop, linear_gradient, prelude::*, px, relative, AnyElement, ClickEvent,
-    Context, Entity, Hsla, Render, Subscription, Window,
+    div, prelude::*, px, relative, AnyElement, ClickEvent, Context, Entity, Render, Subscription,
+    Window,
 };
 
 use crate::model::{LyricLine, Lyrics, SongId};
@@ -38,7 +38,7 @@ use crate::ui::container::Container;
 use crate::ui::marquee::{self, Marquee};
 use crate::ui::playback_state::PlaybackState;
 use crate::ui::theme::Theme;
-use crate::ui::widgets::{blend, empty_hint};
+use crate::ui::widgets::{blend, edge_fade, empty_hint, Side};
 
 /// How long the lyric stack takes to slide to a new line — and therefore how
 /// far *before* a line's timestamp the slide starts, so it lands on time.
@@ -54,7 +54,6 @@ const LYRIC_TITLE_CHARS: usize = 16;
 
 pub struct LyricsView {
     state: Entity<PlaybackState>,
-    config: Entity<ConfigState>,
     themed: Themed,
     /// The pixel offset the stack is drawn at while it eases into place.
     offset: Tween,
@@ -96,7 +95,6 @@ impl LyricsView {
         let themed = Themed::new(&config, cx);
         let mut this = Self {
             state,
-            config,
             themed,
             offset: Tween::new(0.0),
             anchor: None,
@@ -181,7 +179,6 @@ impl Render for LyricsView {
         let anchor = self.anchor.unwrap_or(0);
         let position = self.position;
         let transition = Duration::from_secs_f32(TRANSITION_SECS);
-        let lyrics_fade = self.config.read(cx).lyrics_fade();
         let title_advance = marquee::char_advance(window, theme);
         let title_width = title_advance * LYRIC_TITLE_CHARS as f32;
         let title_offset = self.title_marquee.offset();
@@ -194,7 +191,7 @@ impl Render for LyricsView {
         let title_travel = marquee::travel_for(&title, title_width, LYRIC_TITLE_CHARS);
 
         let body: AnyElement = match &metadata.lyrics {
-            Lyrics::None => empty_hint(theme, "No lyrics for this track.", false),
+            Lyrics::None => empty_lyrics_hint(theme),
             Lyrics::Plain(text) => div()
                 .id("lyrics-scroll")
                 .size_full()
@@ -212,8 +209,7 @@ impl Render for LyricsView {
                     div().w_full().flex_none().whitespace_normal().child(line.to_string())
                 }))
                 .into_any_element(),
-            Lyrics::Synced(lines) if lines.is_empty() =>
-                empty_hint(theme, "No lyrics for this track.", false),
+            Lyrics::Synced(lines) if lines.is_empty() => empty_lyrics_hint(theme),
             Lyrics::Synced(lines) => {
                 let line = |index: usize, cx: &Context<Self>| -> AnyElement {
                     let timestamp = lines[index].timestamp;
@@ -332,27 +328,18 @@ impl Render for LyricsView {
                     .flex_1()
                     .min_h_0()
                     .child(body)
-                    .when(lyrics_fade, |d| {
-                        d.child(panel_fade(theme, true)).child(panel_fade(theme, false))
-                    }),
+                    .child(edge_fade(theme.rail_bg, theme.font_size * 2.0, Side::Top))
+                    .child(edge_fade(theme.rail_bg, theme.font_size * 2.0, Side::Bottom)),
             )
     }
 }
 
-/// A gradient that fades the lyrics panel's content into its background at the
-/// top or bottom edge, so lines dissolve rather than being cut off.
-fn panel_fade(theme: Theme, top: bool) -> AnyElement {
-    let opaque = Hsla::from(theme.rail_bg);
-    let clear = opaque.alpha(0.0);
-    let (from, to) = if top { (opaque, clear) } else { (clear, opaque) };
+/// The panel's empty-state hint, nudged down a touch so the top fade doesn't
+/// dim it into the background.
+fn empty_lyrics_hint(theme: Theme) -> AnyElement {
     div()
-        .absolute()
-        .left(px(0.0))
-        .right(px(0.0))
-        .h(px(theme.font_size * 2.0))
-        .when(top, |d| d.top(px(0.0)))
-        .when(!top, |d| d.bottom(px(0.0)))
-        .bg(linear_gradient(180.0, linear_color_stop(from, 0.0), linear_color_stop(to, 1.0)))
+        .pt_2()
+        .child(empty_hint(theme, "No lyrics for this track.", false))
         .into_any_element()
 }
 
