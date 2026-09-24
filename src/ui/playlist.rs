@@ -173,6 +173,7 @@ impl Render for PlaylistView {
                 .collect()
         });
         self.list.rows_mut().sync(theme, window, fresh);
+        self.list.anchor_to_playing(cx);
 
         let sections = self.list.rows().sections();
         let is_custom = self.is_custom;

@@ -137,10 +137,22 @@ impl AlbumListView {
         }
     }
 
+    /// Anchor the rows' no-cursor navigation to the playing song's row — what
+    /// up/down step from when nothing is selected. Views call this after
+    /// [`RowList::sync`], once the row indices are current.
+    pub fn anchor_to_playing(&mut self, cx: &gpui::App) {
+        let song = self.playback.read(cx).metadata().id;
+        let (items, sections) = (self.rows.items(), self.rows.sections());
+        self.rows.set_anchor(albums::row_of_song(&items, &sections, song));
+    }
+
     /// Play `playlist` from `index` the way `play` chose at construction: the
     /// whole playlist (browse/playlist views), or only the section's matched
     /// songs (search).
-    fn play(&self, playlist: PlaylistId, index: usize, cx: &mut gpui::App) {
+    fn play(&mut self, playlist: PlaylistId, index: usize, cx: &mut gpui::App) {
+        // Playing consumes the selection: the played row carries the playing
+        // highlight from here, and up/down re-anchor from it.
+        self.rows.clear_selection();
         let playback = self.playback.clone();
         match self.play {
             Play::Playlist => self
@@ -191,7 +203,7 @@ impl<V: AlbumList> RowActions<V> for Rows {
             cx.notify();
             return;
         }
-        view.list().play(playlist, index, cx);
+        view.list_mut().play(playlist, index, cx);
     }
 
     fn context(

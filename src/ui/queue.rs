@@ -254,6 +254,9 @@ impl RowActions<QueueView> for QueueRows {
             return;
         }
         view.playback.update(cx, |state, cx| state.play_queue_index(index, cx));
+        // Playing consumes the selection; up/down re-anchor from the playing
+        // entry.
+        view.list_mut().rows_mut().clear_selection();
     }
 
     fn press(
@@ -381,6 +384,10 @@ impl Render for QueueView {
             None
         };
         self.list.rows_mut().sync(theme, window, fresh);
+        // Up/down with nothing selected step from the playing entry — the flat
+        // list's row index is the queue index.
+        let loaded = self.playback.read(cx).queue().1;
+        self.list.rows_mut().set_anchor(loaded);
 
         // The header is the tab strip's twin: same band height, same rule,
         // so the two containers' horizontal lines line up across the top.

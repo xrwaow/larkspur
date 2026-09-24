@@ -205,6 +205,10 @@ pub struct RowList {
     selection: Selection,
     /// The keyboard cursor, as an item index.
     cursor: Option<usize>,
+    /// Where up/down step from when the cursor is `None` — the playing song's
+    /// row, so navigation after a play (or an autoplay advance) picks up
+    /// relative to it. Refreshed by the view after each rebuild.
+    anchor: Option<usize>,
     /// The selection crossfade, and the hover crossfade.
     selection_fade: Fades,
     hover_fade: Fades,
@@ -248,6 +252,7 @@ impl RowList {
             item_count: 0,
             selection: Selection::default(),
             cursor: None,
+            anchor: None,
             selection_fade: Fades::default(),
             hover_fade: Fades::default(),
             marquees: HashMap::new(),
@@ -318,12 +323,10 @@ impl RowList {
             // rather than let a stale slide land on the wrong row.
             self.marquees.clear();
             self.hovered = None;
+            // A fresh list opens with nothing selected — the playing row's own
+            // highlight is the only thing lit until the user navigates.
+            self.cursor = None;
             self.rebuild_rows(theme, window);
-            // Land the cursor on the first row so `enter` plays immediately.
-            self.cursor = albums::step_selectable(&self.items, None, true);
-            if let Some(first) = self.cursor {
-                self.selection.set_single(first);
-            }
         } else if self.columns_stale || (self.measured_at - theme.font_size).abs() > 0.01 {
             self.measure_columns(theme, window);
             self.columns_stale = false;
@@ -389,6 +392,25 @@ impl RowList {
     }
 
     // --- interaction ---------------------------------------------------
+
+    /// Point the no-cursor anchor at `ix` — the playing song's row, per the
+    /// view's playback state. Called after [`sync`](Self::sync), once the row
+    /// indices are current.
+    pub fn set_anchor(&mut self, ix: Option<usize>) {
+        self.anchor = ix;
+    }
+
+    /// Drop the selection and the cursor — how a play leaves the list. The
+    /// playing row carries the highlight from here, and up/down re-anchor
+    /// from it, so an autoplay advance needs no bookkeeping of its own.
+    pub fn clear_selection(&mut self) {
+        if self.selection.is_empty() && self.cursor.is_none() {
+            return;
+        }
+        let previous = std::mem::take(&mut self.selection);
+        self.cursor = None;
+        self.restart_selection_fade(&previous);
+    }
 
     /// Apply a row click. Returns `true` when it was a selection gesture
     /// (`shift`/`ctrl`), which the view shouldn't also read as "play this".
@@ -563,7 +585,10 @@ impl RowList {
     }
 
     fn move_cursor(&mut self, forward: bool) {
-        let Some(next) = albums::step_selectable(&self.items, self.cursor, forward) else { return };
+        // With no cursor — a fresh list, or one whose play just cleared it —
+        // step from the anchor (the playing row) instead of the list's ends.
+        let origin = self.cursor.or(self.anchor);
+        let Some(next) = albums::step_selectable(&self.items, origin, forward) else { return };
         let previous = self.selection.clone();
         self.cursor = Some(next);
         self.selection.set_single(next);

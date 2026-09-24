@@ -295,6 +295,12 @@ pub fn row_song(items: &[ListItem], sections: &[AlbumSection], ix: usize) -> Opt
     }
 }
 
+/// The first row holding `song`, if any — what up/down anchor to when nothing
+/// is selected (the playing song's row).
+pub fn row_of_song(items: &[ListItem], sections: &[AlbumSection], song: SongId) -> Option<usize> {
+    (0..items.len()).find(|&ix| row_song(items, sections, ix) == Some(song))
+}
+
 /// The playlist and track index a row plays from, if it's a track row.
 pub fn row_target(
     items: &[ListItem],
@@ -329,9 +335,15 @@ pub fn step_selectable(items: &[ListItem], current: Option<usize>, forward: bool
 /// Rows are identified by their index in the flattened [`ListItem`] list, so a
 /// range is just a span of item indices. Headers aren't selectable;
 /// [`selectable_indices`] is what a range walks.
+///
+/// The selection remembers the order rows were picked in: queueing and playing
+/// a multi-row selection follow that pick order, not the list's order.
 #[derive(Default, Clone)]
 pub struct Selection {
     selected: BTreeSet<usize>,
+    /// The selected rows in the order they were picked. A shift-range has no
+    /// per-row pick order, so it lands here in list order.
+    order: Vec<usize>,
     /// Where a shift-click range extends from — the last row clicked without a
     /// modifier.
     anchor: Option<usize>,
@@ -355,20 +367,23 @@ impl Selection {
         self.selected.iter().next().copied()
     }
 
-    /// Every selected item index, in order.
+    /// Every selected item index, in list order.
     pub fn iter(&self) -> impl Iterator<Item = usize> + '_ {
         self.selected.iter().copied()
     }
 
     pub fn clear(&mut self) {
         self.selected.clear();
+        self.order.clear();
         self.anchor = None;
     }
 
     /// Select exactly `ix` and make it the anchor.
     pub fn set_single(&mut self, ix: usize) {
         self.selected.clear();
+        self.order.clear();
         self.selected.insert(ix);
+        self.order.push(ix);
         self.anchor = Some(ix);
     }
 
@@ -376,6 +391,9 @@ impl Selection {
     pub fn toggle(&mut self, ix: usize) {
         if !self.selected.remove(&ix) {
             self.selected.insert(ix);
+            self.order.push(ix);
+        } else {
+            self.order.retain(|&picked| picked != ix);
         }
         self.anchor = Some(ix);
     }
@@ -394,12 +412,14 @@ impl Selection {
             return self.set_single(ix);
         };
         let (lo, hi) = if from <= to { (from, to) } else { (to, from) };
-        self.selected = selectable[lo..=hi].iter().copied().collect();
+        let range = &selectable[lo..=hi];
+        self.selected = range.iter().copied().collect();
+        self.order = range.to_vec();
     }
 
-    /// The songs the selection covers, in list order.
+    /// The songs the selection covers, in the order the rows were picked.
     pub fn songs(&self, items: &[ListItem], sections: &[AlbumSection]) -> Vec<SongId> {
-        self.selected
+        self.order
             .iter()
             .filter_map(|&ix| row_song(items, sections, ix))
             .collect()
@@ -1213,6 +1233,15 @@ mod tests {
     }
 
     #[test]
+    fn row_of_song_finds_the_playing_row() {
+        let sections = vec![section_with_tracks(2), section_with_tracks(1)];
+        let items = flatten(&sections); // Header, T0, T1, Compact
+        assert_eq!(row_of_song(&items, &sections, 1), Some(2));
+        assert_eq!(row_of_song(&items, &sections, 0), Some(1), "first match wins");
+        assert_eq!(row_of_song(&items, &sections, 9), None);
+    }
+
+    #[test]
     fn selection_ranges_skip_headers() {
         let sections = vec![section_with_tracks(2), section_with_tracks(2)];
         let items = flatten(&sections); // Header, T0, T1, Header, T0, T1
@@ -1233,5 +1262,30 @@ mod tests {
         selection.toggle(3);
         assert!(!selection.contains(3));
         assert!(selection.is_empty());
+    }
+
+    #[test]
+    fn songs_follow_pick_order_not_list_order() {
+        let sections = vec![section_with_tracks(4)];
+        let items = flatten(&sections); // Header, T0, T1, T2, T3
+        let mut selection = Selection::default();
+        selection.toggle(3); // song 2
+        selection.toggle(1); // song 0
+        selection.toggle(4); // song 3
+        assert_eq!(selection.songs(&items, &sections), vec![2, 0, 3]);
+
+        // Deselecting a middle pick keeps the rest in pick order.
+        selection.toggle(1);
+        assert_eq!(selection.songs(&items, &sections), vec![2, 3]);
+    }
+
+    #[test]
+    fn a_shift_range_queues_in_list_order() {
+        let sections = vec![section_with_tracks(4)];
+        let items = flatten(&sections); // Header, T0, T1, T2, T3
+        let mut selection = Selection::default();
+        selection.set_single(4);
+        selection.extend_to(1, &items);
+        assert_eq!(selection.songs(&items, &sections), vec![0, 1, 2, 3]);
     }
 }

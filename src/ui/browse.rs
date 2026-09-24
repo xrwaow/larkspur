@@ -111,6 +111,7 @@ impl Render for BrowseView {
             self.source.sections(self.list.library().read(cx).library())
         });
         self.list.rows_mut().sync(theme, window, fresh);
+        self.list.anchor_to_playing(cx);
 
         let sections = self.list.rows().sections();
         let songs: usize = sections.iter().map(|section| section.tracks.len()).sum();

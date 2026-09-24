@@ -149,6 +149,7 @@ impl Render for SearchView {
 
         let fresh = self.list.rows().is_dirty().then(|| self.build_sections(cx));
         self.list.rows_mut().sync(theme, window, fresh);
+        self.list.anchor_to_playing(cx);
 
         let sections = self.list.rows().sections();
 
