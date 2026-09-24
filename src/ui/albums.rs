@@ -23,6 +23,7 @@ use gpui::{
 use crate::model::search::AlbumGroup;
 use crate::model::{Library, PlaylistId, SongId, SongMetadata};
 use crate::ui::cover_store::{CoverImage, CoverStore};
+use crate::ui::drag::{self, DragInfo};
 use crate::ui::format::{format_bitrate, format_duration};
 use crate::ui::library_state::LibraryState;
 use crate::ui::marquee;
@@ -49,6 +50,10 @@ pub const MAX_ARTIST_CHARS: usize = 48;
 pub struct Columns {
     pub title: f32,
     pub artist: f32,
+    /// The character counts the widths were sized to — the marquee's travel
+    /// math and the equalizer's nudge both derive from them.
+    pub title_chars: usize,
+    pub artist_chars: usize,
 }
 
 impl Columns {
@@ -56,10 +61,19 @@ impl Columns {
     /// character's advance times the max count gives the width without shaping
     /// every title.
     pub fn measure(window: &Window, theme: Theme) -> Self {
+        Self::sized(window, theme, MAX_TITLE_CHARS, MAX_ARTIST_CHARS)
+    }
+
+    /// Columns sized to explicit character counts — a narrow container (the
+    /// queue panel) scales its columns to its own width instead of the
+    /// tables' fixed 48.
+    pub fn sized(window: &Window, theme: Theme, title_chars: usize, artist_chars: usize) -> Self {
         let advance = marquee::char_advance(window, theme);
         Self {
-            title: advance * MAX_TITLE_CHARS as f32,
-            artist: advance * MAX_ARTIST_CHARS as f32,
+            title: advance * title_chars as f32,
+            artist: advance * artist_chars as f32,
+            title_chars,
+            artist_chars,
         }
     }
 }
@@ -246,6 +260,18 @@ pub fn flatten(sections: &[AlbumSection]) -> Vec<ListItem> {
     items
 }
 
+/// Flatten sections into track rows only — no album headers. The queue
+/// panel's flat list, where every entry is a song.
+pub fn flatten_tracks(sections: &[AlbumSection]) -> Vec<ListItem> {
+    let mut items = Vec::new();
+    for (section, data) in sections.iter().enumerate() {
+        for index in 0..data.tracks.len() {
+            items.push(ListItem::Track { section, index });
+        }
+    }
+    items
+}
+
 /// The item indices that hold a track (not an album header), in order.
 pub fn selectable_indices(items: &[ListItem]) -> Vec<usize> {
     items
@@ -417,12 +443,25 @@ pub trait RowActions<V: Render>: 'static {
     /// on its own.
     fn cell_hover(
         &self,
-        view: &mut V,
-        item_ix: usize,
-        cell: Cell,
-        hovered: bool,
-        cx: &mut Context<V>,
-    );
+        _view: &mut V,
+        _item_ix: usize,
+        _cell: Cell,
+        _hovered: bool,
+        _cx: &mut Context<V>,
+    ) {
+    }
+
+    /// A left-button press on a row — the grab that starts a drag-to-reorder.
+    /// Most lists don't reorder; the default ignores it.
+    fn press(
+        &self,
+        _view: &mut V,
+        _item_ix: usize,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        _cx: &mut Context<V>,
+    ) {
+    }
 }
 
 /// The read-only backdrop every row renderer shares: where a row's looks
@@ -445,6 +484,12 @@ pub struct RowContext<'a> {
     /// The playlist the row's menu offers as a destination (the open one).
     pub context: Option<PlaylistId>,
     pub highlight: &'a Highlight,
+    /// The in-flight drag-to-reorder, if any: the grabbed row hides (the view
+    /// draws it following the pointer) and the rows between it and the target
+    /// shift one row to make room.
+    pub drag: Option<DragInfo>,
+    /// Slim rows: no bitrate or duration columns (the queue panel).
+    pub slim: bool,
 }
 
 /// How one row paints: the colours that make up its background and the
@@ -463,6 +508,13 @@ struct RowPaint {
     /// The artist cell's marquee offset, in px — each slides on its own hover.
     artist_offset: f32,
     bitrate: Option<u32>,
+    /// This row's vertical shift for an in-flight drag, in px.
+    translate: f32,
+    /// This row is the dragged one — it hides while the view draws it
+    /// following the pointer.
+    hidden: bool,
+    /// Slim rows: no bitrate or duration columns.
+    slim: bool,
 }
 
 /// Render one row — what `gpui::list` calls for each visible (and overdraw)
@@ -496,6 +548,12 @@ pub fn render_item<V: Render + 'static>(
 
     let song = track.song;
     let playing = context.current == song;
+    // An in-flight drag: the grabbed row hides (the view draws it following
+    // the pointer), the rows between it and the target shift to make room.
+    let (translate, hidden) = match context.drag.and_then(|drag| drag::row_shift(ix, &drag)) {
+        Some(shift) => (shift, false),
+        None => (0.0, context.drag.is_some()),
+    };
     let paint = RowPaint {
         theme: context.theme,
         playing,
@@ -506,6 +564,9 @@ pub fn render_item<V: Render + 'static>(
         title_offset: context.highlight.marquee_offset(ix, Cell::Title),
         artist_offset: context.highlight.marquee_offset(ix, Cell::Artist),
         bitrate: row_bitrate(playing, track.nominal_bitrate, context.live_bitrate),
+        translate,
+        hidden,
+        slim: context.slim,
     };
 
     // The five listeners a track row wires up — the same for a compact row
@@ -539,6 +600,12 @@ pub fn render_item<V: Render + 'static>(
             actions.cell_hover(view, ix, Cell::Artist, *hovered, cx)
         })
     };
+    let on_press = {
+        let actions = actions.clone();
+        cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+            actions.press(view, ix, event, window, cx)
+        })
+    };
 
     if matches!(item, ListItem::Compact(_)) {
         // A compact row carries its section's cover on the left.
@@ -555,6 +622,7 @@ pub fn render_item<V: Render + 'static>(
             on_hover,
             on_title_hover,
             on_artist_hover,
+            on_press,
         )
     } else {
         track_row(
@@ -567,6 +635,7 @@ pub fn render_item<V: Render + 'static>(
             on_hover,
             on_title_hover,
             on_artist_hover,
+            on_press,
         )
     }
 }
@@ -662,9 +731,13 @@ fn compact_row(
     on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
     on_title_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
     on_artist_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
+    on_press: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     let theme = paint.theme;
     let background = row_background(theme, paint.playing, paint.selection, paint.hover, 0);
+    // The song-entry convention: regular rows are square; the selected and
+    // currently-playing ones carry the slight rounding.
+    let rounded = paint.playing || paint.selection.is_some();
     div()
         .id(("album-single", track.song))
         .w_full()
@@ -675,9 +748,13 @@ fn compact_row(
         .py(px(6.0))
         .cursor_pointer()
         .bg(background)
+        .when(rounded, |d| d.rounded_md())
+        .when(paint.hidden, |d| d.opacity(0.0))
+        .when(paint.translate != 0.0, |d| d.relative().top(px(paint.translate)))
         .on_hover(on_hover)
         .on_click(on_click)
         .on_mouse_down(MouseButton::Right, on_right_click)
+        .on_mouse_down(MouseButton::Left, on_press)
         .child(thumbnail(theme, cover, theme.num_col()))
         .child(title_cell(
             theme,
@@ -699,8 +776,8 @@ fn compact_row(
         // Fill the gap so the numeric columns stay right-aligned.
         .child(div().flex_1().min_w_0())
         .child(year_cell(theme, year))
-        .child(bitrate_cell(theme, paint.bitrate))
-        .child(duration_cell(theme, track))
+        .when(!paint.slim, |d| d.child(bitrate_cell(theme, paint.bitrate)))
+        .when(!paint.slim, |d| d.child(duration_cell(theme, track)))
         .into_any_element()
 }
 
@@ -717,13 +794,17 @@ fn track_row(
     on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
     on_title_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
     on_artist_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
+    on_press: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     let id: ElementId = ("album-track", track.song).into();
     let theme = paint.theme;
     let playing = paint.playing;
     let background = row_background(theme, playing, paint.selection, paint.hover, index);
+    // The song-entry convention: regular rows are square; the selected and
+    // currently-playing ones carry the slight rounding.
+    let rounded = playing || paint.selection.is_some();
     // One monospace character, to nudge the equalizer left of the column edge.
-    let advance = columns.title / MAX_TITLE_CHARS as f32;
+    let advance = columns.title / columns.title_chars.max(1) as f32;
 
     div()
         .id(id)
@@ -735,9 +816,13 @@ fn track_row(
         .py_1()
         .cursor_pointer()
         .bg(background)
+        .when(rounded, |d| d.rounded_md())
+        .when(paint.hidden, |d| d.opacity(0.0))
+        .when(paint.translate != 0.0, |d| d.relative().top(px(paint.translate)))
         .on_hover(on_hover)
         .on_click(on_click)
         .on_mouse_down(MouseButton::Right, on_right_click)
+        .on_mouse_down(MouseButton::Left, on_press)
         .child(if playing {
             eq_icon(theme, paint.eq_phase, paint.audio_playing, advance)
         } else {
@@ -763,10 +848,11 @@ fn track_row(
         // Fill the gap so the numeric columns stay right-aligned.
         .child(div().flex_1().min_w_0())
         // Always reserve the action column, so rows keep identical children and
-        // the numeric columns stay put.
-        .child(div().w(px(theme.action_col())).flex_none())
-        .child(bitrate_cell(theme, paint.bitrate))
-        .child(duration_cell(theme, track))
+        // the numeric columns stay put. Slim rows (the queue) end at the gap —
+        // no numeric columns follow, so there's nothing to keep put.
+        .when(!paint.slim, |d| d.child(div().w(px(theme.action_col())).flex_none()))
+        .when(!paint.slim, |d| d.child(bitrate_cell(theme, paint.bitrate)))
+        .when(!paint.slim, |d| d.child(duration_cell(theme, track)))
         .into_any_element()
 }
 
@@ -786,7 +872,7 @@ fn title_cell(
         ("row-title", track.song),
         &track.title,
         columns.title,
-        MAX_TITLE_CHARS,
+        columns.title_chars,
         offset,
         if playing { theme.accent } else { theme.text },
         background,
@@ -808,7 +894,7 @@ fn artist_cell(
         ("row-artist", track.song),
         &track.artist,
         columns.artist,
-        MAX_ARTIST_CHARS,
+        columns.artist_chars,
         offset,
         theme.text_muted,
         background,
@@ -837,8 +923,9 @@ const EQ_GAP_PX: f32 = 2.0;
 
 /// The playing row's equalizer: a few small bars in the accent colour, dancing
 /// while the track plays and resting when it's paused. It takes the number
-/// column's place, so the row still lines up.
-fn eq_icon(theme: Theme, phase: f32, playing: bool, advance: f32) -> AnyElement {
+/// column's place, so the row still lines up. Shared with the queue panel's
+/// rows, which use the same row anatomy.
+pub fn eq_icon(theme: Theme, phase: f32, playing: bool, advance: f32) -> AnyElement {
     let height = theme.font_size * 0.95;
     let levels = eq_levels(phase, playing);
     let width = EQ_BARS as f32 * EQ_BAR_PX + (EQ_BARS - 1) as f32 * EQ_GAP_PX;

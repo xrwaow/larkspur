@@ -27,7 +27,7 @@ use std::time::{Duration, Instant};
 use gpui::Context;
 
 use crate::analysis::{TrackAnalyzer, Waveform};
-use crate::audio::{PlaybackController, SampleTap, SongStatus};
+use crate::audio::{PlaybackController, RepeatMode, SampleTap, SongStatus};
 use crate::bitrate::BitrateProfile;
 use crate::model::{InputAction, SongMetadata};
 use crate::ui::animation::SLOW_FPS;
@@ -104,6 +104,10 @@ pub struct PlaybackState {
     /// Wall-clock anchor for that smoothing: when we last sampled rodio, and
     /// what it reported.
     anchor: Option<(Instant, Duration)>,
+    /// Whether the queue panel is swapped in over the tabs. Lives here (not in
+    /// a view) because both the transport's toggle button and the tab
+    /// container that hosts the panel observe this state.
+    queue_open: bool,
 }
 
 impl PlaybackState {
@@ -121,6 +125,7 @@ impl PlaybackState {
             last_bitrate_at: Duration::ZERO,
             display_position: position,
             anchor: None,
+            queue_open: false,
         };
         this.reload_track();
         this.start_ticker(cx);
@@ -205,6 +210,27 @@ impl PlaybackState {
         self.controller.can_next()
     }
 
+    /// The current repeat mode, for the transport's repeat button.
+    pub fn repeat_mode(&self) -> RepeatMode {
+        self.controller.repeat_mode()
+    }
+
+    /// Cycle off → once → all — the transport's repeat button.
+    pub fn cycle_repeat(&mut self, cx: &mut Context<Self>) {
+        self.controller.cycle_repeat();
+        cx.notify();
+    }
+
+    /// Whether the queue panel is swapped in over the tabs.
+    pub fn queue_open(&self) -> bool {
+        self.queue_open
+    }
+
+    /// The play queue and the index of the loaded entry, for the queue view.
+    pub fn queue(&self) -> (&[PathBuf], Option<usize>) {
+        self.controller.queue()
+    }
+
     // --- actions -------------------------------------------------------
 
     pub fn toggle_play_pause(&mut self) {
@@ -232,6 +258,78 @@ impl PlaybackState {
 
     pub fn seek_relative(&mut self, secs: i64) {
         self.controller.seek_relative(secs);
+    }
+
+    /// Show or hide the queue panel.
+    pub fn set_queue_open(&mut self, open: bool, cx: &mut Context<Self>) {
+        if self.queue_open != open {
+            self.queue_open = open;
+            cx.notify();
+        }
+    }
+
+    /// Toggle the queue panel — the transport's queue button.
+    pub fn toggle_queue(&mut self, cx: &mut Context<Self>) {
+        self.set_queue_open(!self.queue_open, cx);
+    }
+
+    /// Jump to the queue entry at `index` — a click in the queue view.
+    pub fn play_queue_index(&mut self, index: usize, cx: &mut Context<Self>) {
+        match self.controller.play_index(index) {
+            Ok(()) => {
+                self.reload_track();
+                cx.notify();
+            }
+            Err(e) => eprintln!("failed to jump to queue entry {index}: {e}"),
+        }
+    }
+
+    /// Append `paths` to the play queue — the song menu's "Add to Queue".
+    pub fn add_to_queue(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        match self.controller.add_to_queue(paths) {
+            Ok(started) => {
+                // Only a freshly started track needs a waveform reload;
+                // appending behind a playing one leaves it untouched.
+                if started {
+                    self.reload_track();
+                }
+                cx.notify();
+            }
+            Err(e) => eprintln!("failed to add to queue: {e}"),
+        }
+    }
+
+    /// Drop every queue entry matching `paths` — the song menu's "Remove from
+    /// queue". Reloads the waveform when the loaded track changed (a new one
+    /// started, or playback stopped).
+    pub fn remove_from_queue(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
+        if paths.is_empty() {
+            return;
+        }
+        if self.controller.remove_from_queue(&paths) {
+            self.reload_track();
+        }
+        cx.notify();
+    }
+
+    /// Drop every queue entry — the queue panel's clear button. The loaded
+    /// track keeps playing.
+    pub fn clear_queue(&mut self, cx: &mut Context<Self>) {
+        self.controller.clear_queue();
+        cx.notify();
+    }
+
+    /// Move the queue entry at `from` to `to` — the queue panel's
+    /// drag-to-reorder. The loaded track follows its entry, so no waveform
+    /// reload is needed.
+    pub fn move_queue_entry(&mut self, from: usize, to: usize, cx: &mut Context<Self>) {
+        match self.controller.move_entry(from, to) {
+            Ok(()) => cx.notify(),
+            Err(e) => eprintln!("failed to reorder queue: {e}"),
+        }
     }
 
     /// Replace the play queue with `paths`, starting at `start`.

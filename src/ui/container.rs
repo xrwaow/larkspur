@@ -195,7 +195,7 @@ impl From<Child> for Layout {
 }
 
 /// Gap between sections, so flush panels don't visually merge.
-const SECTION_GAP: f32 = 8.0;
+pub(crate) const SECTION_GAP: f32 = 8.0;
 
 /// The pure layout description: docks plus a center, and nothing else.
 ///

@@ -9,6 +9,11 @@ use super::cover::CoverView;
 use super::introspect::{self, ModuleSizes};
 use super::visualizer::BAND_HEIGHT;
 
+/// Width of the side rails — the playlists dock left, the lyrics/cover rail
+/// right — in px. The queue panel's geometry is derived from it (see
+/// `ui::tabs`), so the two can't drift apart.
+pub const RAIL_PX: f32 = 240.0;
+
 /// The window's dock/center arrangement.
 ///
 /// Playback bar across the bottom, the playlist list docked left, and the
@@ -32,8 +37,8 @@ pub fn app_layout(show_visualizer: bool) -> LayoutPlan {
 
     let mut plan = LayoutPlan::new(module("tabs"));
     plan.dock(Dock::bottom(module("playback")));
-    plan.dock(Dock::right(col(rail).px(240.0)).z(2));
-    plan.dock(Dock::left(module("playlists").px(240.0)).z(2));
+    plan.dock(Dock::right(col(rail).px(RAIL_PX)).z(2));
+    plan.dock(Dock::left(module("playlists").px(RAIL_PX)).z(2));
     plan
 }
 

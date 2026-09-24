@@ -20,6 +20,7 @@ use crate::model::{InputAction, Library, PlaylistId};
 use crate::ui::albums::{self, AlbumSection, RowActions};
 use crate::ui::animation::Animator;
 use crate::ui::cover_store::CoverStore;
+use crate::ui::drag::DragInfo;
 use crate::ui::input::action_for_key;
 use crate::ui::library_state::LibraryState;
 use crate::ui::menu::SongMenuRequest;
@@ -204,7 +205,8 @@ impl<V: AlbumList> RowActions<V> for Rows {
         cx: &mut Context<V>,
     ) {
         let songs = view.list_mut().rows.context_songs(item_ix);
-        let request = SongMenuRequest { songs, position: event.position, playlist: context };
+        let request =
+            SongMenuRequest { songs, position: event.position, playlist: context, queue: false };
         let library = view.list().library.clone();
         library.update(cx, |state, cx| state.request_song_menu(request, cx));
     }
@@ -277,6 +279,20 @@ pub fn render_rows<V: AlbumList>(
     context: Option<PlaylistId>,
     cx: &mut Context<V>,
 ) -> gpui::AnyElement {
+    render_rows_with(view, theme, context, None, Rc::new(Rows), cx)
+}
+
+/// [`render_rows`](Self::render_rows) with the view's own row actions and an
+/// optional in-flight drag-to-reorder — the queue panel plays from the queue
+/// and reorders by drag.
+pub fn render_rows_with<V: AlbumList>(
+    view: &mut V,
+    theme: Theme,
+    context: Option<PlaylistId>,
+    drag: Option<DragInfo>,
+    actions: Rc<dyn RowActions<V>>,
+    cx: &mut Context<V>,
+) -> gpui::AnyElement {
     let list = view.list();
     let current = list.playback.read(cx).metadata().id;
     let playing = list.playback.read(cx).is_playing();
@@ -287,10 +303,10 @@ pub fn render_rows<V: AlbumList>(
     let eq_phase = list.animator.read(cx).elapsed();
     let list_state = list.rows.list_state().clone();
     let highlight = list.rows.highlight();
+    let slim = list.rows.slim();
     let covers = list.covers.clone();
     let library = list.library.clone();
 
-    let actions: Rc<dyn RowActions<V>> = Rc::new(Rows);
     let render = cx.processor(move |_this, ix, _window, cx| {
         let row = albums::RowContext {
             theme,
@@ -302,6 +318,8 @@ pub fn render_rows<V: AlbumList>(
             live_bitrate,
             context,
             highlight: &highlight,
+            drag,
+            slim,
         };
         albums::render_item(&row, ix, &sections, &items, &columns, Some(&actions), cx)
     });

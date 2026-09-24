@@ -15,7 +15,7 @@
 //! drives it. A standalone title (the lyrics panel's) owns one directly, and a
 //! list row keeps one per title/artist cell, so the two paths share a type.
 
-use gpui::{div, prelude::*, px, AnyElement, App, ElementId, Rgba, Window};
+use gpui::{div, prelude::*, px, relative, AnyElement, App, ElementId, Rgba, Window};
 
 use crate::ui::animation::Spring;
 use crate::ui::theme::Theme;
@@ -214,7 +214,6 @@ pub fn marquee_text(
         .flex_none()
         .overflow_hidden()
         .relative()
-        .on_hover(on_hover)
         .child(
             // `relative` (not `absolute`) so the text still gives the cell its
             // height; `left` slides it and the cell's `overflow_hidden` clips it.
@@ -235,6 +234,20 @@ pub fn marquee_text(
         // Once the text has slid, its start fades in at the left edge.
         cell = cell.child(edge_fade(background, advance, Side::Left));
     }
+    // The slide is triggered from the cell's right side only — where the text
+    // fades out — rather than anywhere on the cell: hovering the middle of a
+    // long row while moving the pointer across the list shouldn't set every
+    // title sliding.
+    cell = cell.child(
+        div()
+            .id("marquee-hover")
+            .absolute()
+            .top(px(0.0))
+            .bottom(px(0.0))
+            .right(px(0.0))
+            .w(relative(0.4))
+            .on_hover(on_hover),
+    );
     cell.into_any_element()
 }
 

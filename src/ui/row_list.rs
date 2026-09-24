@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::rc::Rc;
 
-use gpui::{px, ListAlignment, ListState, Modifiers, Window};
+use gpui::{px, Bounds, ListAlignment, ListState, Modifiers, Pixels, Window};
 
 use crate::model::{InputAction, PlaylistId, SongId};
 use crate::ui::albums::{
@@ -219,6 +219,18 @@ pub struct RowList {
     dirty: bool,
     /// The font size the columns were measured at, so a font change re-measures.
     measured_at: f32,
+    /// Flat mode: sections flatten to track rows only, no album headers — the
+    /// queue panel's list, where every entry is a song.
+    flat: bool,
+    /// The title/artist column character counts a flat list was asked to size
+    /// to (its panel's width, not the tables' fixed 48).
+    title_chars: usize,
+    artist_chars: usize,
+    /// Set when the character counts moved since the columns were measured.
+    columns_stale: bool,
+    /// Slim mode: rows omit the bitrate and duration columns — the queue
+    /// panel, whose width is better spent on the text columns.
+    slim: bool,
 }
 
 impl RowList {
@@ -226,7 +238,12 @@ impl RowList {
         Self {
             sections: Rc::new(Vec::new()),
             items: Rc::new(Vec::new()),
-            columns: Columns { title: 0.0, artist: 0.0 },
+            columns: Columns {
+                title: 0.0,
+                artist: 0.0,
+                title_chars: MAX_TITLE_CHARS,
+                artist_chars: MAX_ARTIST_CHARS,
+            },
             list_state: ListState::new(0, ListAlignment::Top, px(OVERDRAW_PX)),
             item_count: 0,
             selection: Selection::default(),
@@ -238,6 +255,11 @@ impl RowList {
             scroll: SmoothScroll::default(),
             dirty: true,
             measured_at: 0.0,
+            flat: false,
+            title_chars: MAX_TITLE_CHARS,
+            artist_chars: MAX_ARTIST_CHARS,
+            columns_stale: false,
+            slim: false,
         }
     }
 
@@ -248,6 +270,34 @@ impl RowList {
 
     pub fn is_dirty(&self) -> bool {
         self.dirty
+    }
+
+    /// Flatten to track rows only — no album headers. The queue panel's list.
+    pub fn set_flat(&mut self) {
+        self.flat = true;
+        self.mark_dirty();
+    }
+
+    /// Size a flat list's columns to explicit character counts — its
+    /// container's width rather than the tables' fixed 48. Takes effect on
+    /// the next [`sync`](Self::sync).
+    pub fn set_columns_chars(&mut self, title: usize, artist: usize) {
+        if !self.columns_stale && self.title_chars == title && self.artist_chars == artist {
+            return;
+        }
+        self.title_chars = title;
+        self.artist_chars = artist;
+        self.columns_stale = true;
+    }
+
+    /// Omit the bitrate and duration columns — the queue panel's rows.
+    pub fn set_slim(&mut self) {
+        self.slim = true;
+    }
+
+    /// Whether rows omit the bitrate and duration columns.
+    pub fn slim(&self) -> bool {
+        self.slim
     }
 
     /// Rebuild the rows from `sections` when given, and re-measure the columns
@@ -274,13 +324,18 @@ impl RowList {
             if let Some(first) = self.cursor {
                 self.selection.set_single(first);
             }
-        } else if (self.measured_at - theme.font_size).abs() > 0.01 {
+        } else if self.columns_stale || (self.measured_at - theme.font_size).abs() > 0.01 {
             self.measure_columns(theme, window);
+            self.columns_stale = false;
         }
     }
 
     fn rebuild_rows(&mut self, theme: Theme, window: &Window) {
-        let items = albums::flatten(&self.sections);
+        let items = if self.flat {
+            albums::flatten_tracks(&self.sections)
+        } else {
+            albums::flatten(&self.sections)
+        };
         if self.item_count != items.len() {
             self.list_state.reset(items.len());
             self.item_count = items.len();
@@ -290,7 +345,11 @@ impl RowList {
     }
 
     fn measure_columns(&mut self, theme: Theme, window: &Window) {
-        self.columns = Columns::measure(window, theme);
+        self.columns = if self.flat {
+            Columns::sized(window, theme, self.title_chars, self.artist_chars)
+        } else {
+            Columns::measure(window, theme)
+        };
         self.measured_at = theme.font_size;
     }
 
@@ -310,6 +369,12 @@ impl RowList {
 
     pub fn list_state(&self) -> &ListState {
         &self.list_state
+    }
+
+    /// The window-space bounds of row `ix`, if it's been laid out — the
+    /// drag-to-reorder grab needs the row's resting place and height.
+    pub fn item_bounds(&self, ix: usize) -> Option<Bounds<Pixels>> {
+        self.list_state.bounds_for_item(ix)
     }
 
     /// A snapshot of the highlight state for the renderer.
@@ -412,9 +477,9 @@ impl RowList {
         };
         let Some(track) = track else { return 0.0 };
         match cell {
-            Cell::Title => marquee::travel_for(&track.title, self.columns.title, MAX_TITLE_CHARS),
+            Cell::Title => marquee::travel_for(&track.title, self.columns.title, self.title_chars),
             Cell::Artist => {
-                marquee::travel_for(&track.artist, self.columns.artist, MAX_ARTIST_CHARS)
+                marquee::travel_for(&track.artist, self.columns.artist, self.artist_chars)
             }
         }
     }

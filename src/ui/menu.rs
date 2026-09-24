@@ -5,12 +5,14 @@
 //! [`deferred`], and dismissed with `on_mouse_down_out`. The menu occludes the
 //! mouse so a click on an item can't also land on the row behind it.
 
+use std::path::PathBuf;
+
 use gpui::{
     anchored, deferred, div, prelude::*, px, AnyElement, App, ClickEvent, Corner, Entity,
     MouseDownEvent, Point, Pixels, Window,
 };
 
-use crate::model::{PlaylistId, SongId};
+use crate::model::{generate_song_id, PlaylistId, SongId};
 use crate::ui::library_state::LibraryState;
 use crate::ui::playback_state::PlaybackState;
 use crate::ui::theme::Theme;
@@ -30,6 +32,9 @@ pub struct SongMenuRequest {
     /// The playlist tab the menu was raised from, if any — lets the menu offer
     /// "Remove from playlist" when that playlist is a custom one.
     pub playlist: Option<PlaylistId>,
+    /// Whether the menu was raised from the queue panel — swaps the playlist
+    /// operations for "Remove from queue".
+    pub queue: bool,
 }
 
 /// The items a song's context menu shows.
@@ -49,6 +54,7 @@ pub fn song_menu_items(
     playback: &Entity<PlaybackState>,
     songs: &[SongId],
     context: Option<PlaylistId>,
+    queue: bool,
     cx: &App,
 ) -> Vec<(String, MenuHandler)> {
     let mut items: Vec<(String, MenuHandler)> = Vec::new();
@@ -66,6 +72,37 @@ pub fn song_menu_items(
                 lib.album_playlist_of(song),
             )
         };
+
+        // The playback action leads: queueing is what a right-click is most
+        // often after.
+        {
+            let library = library.clone();
+            let playback = playback.clone();
+            items.push((
+                "Add to Queue".to_string(),
+                Box::new(move |_event, _window, cx| {
+                    let path = library.read(cx).library().get(song).map(|song| song.path.clone());
+                    if let Some(path) = path {
+                        playback.update(cx, |state, cx| state.add_to_queue(vec![path], cx));
+                    }
+                }),
+            ));
+        }
+
+        if queue {
+            // Resolve the paths from the controller's queue rather than the
+            // library: files queued from the command line may not be scanned
+            // yet, so matching the hashed id against the queue is the only
+            // reliable mapping.
+            let playback = playback.clone();
+            let selected = vec![song];
+            items.push((
+                "Remove from queue".to_string(),
+                Box::new(move |_event, _window, cx| {
+                    remove_queued(&playback, &selected, cx);
+                }),
+            ));
+        }
 
         for artist in artists {
             let library = library.clone();
@@ -119,6 +156,34 @@ pub fn song_menu_items(
         ));
     }
 
+    {
+        let library = library.clone();
+        let playback = playback.clone();
+        let songs = songs.to_vec();
+        items.push((
+            format!("Add {count} songs to queue"),
+            Box::new(move |_event, _window, cx| {
+                let paths: Vec<PathBuf> = songs
+                    .iter()
+                    .filter_map(|id| library.read(cx).library().get(*id))
+                    .map(|song| song.path.clone())
+                    .collect();
+                playback.update(cx, |state, cx| state.add_to_queue(paths, cx));
+            }),
+        ));
+    }
+
+    if queue {
+        let playback = playback.clone();
+        let songs = songs.to_vec();
+        items.push((
+            format!("Remove {count} songs from queue"),
+            Box::new(move |_event, _window, cx| {
+                remove_queued(&playback, &songs, cx);
+            }),
+        ));
+    }
+
     let custom: Vec<(PlaylistId, String)> = library
         .read(cx)
         .library()
@@ -160,6 +225,22 @@ pub fn song_menu_items(
     }
 
     items
+}
+
+/// Drop every queue entry whose hashed path id is in `songs` — the queue
+/// menu's "Remove from queue". The paths come from the controller's queue
+/// rather than the library, so command-line-queued files the library hasn't
+/// scanned yet are still matched.
+fn remove_queued(playback: &Entity<PlaybackState>, songs: &[SongId], cx: &mut gpui::App) {
+    playback.update(cx, |state, cx| {
+        let (queue, _) = state.queue();
+        let paths: Vec<PathBuf> = queue
+            .iter()
+            .filter(|path| generate_song_id(path).is_ok_and(|id| songs.contains(&id)))
+            .cloned()
+            .collect();
+        state.remove_from_queue(paths, cx);
+    });
 }
 
 /// Build a context menu at `position` (window coordinates).

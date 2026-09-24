@@ -215,6 +215,8 @@ impl Render for PlaylistView {
                 live_bitrate: self.list.playback().read(cx).live_bitrate(),
                 context: Some(playlist),
                 highlight: &highlight,
+                drag: None,
+                slim: false,
             };
             let header =
                 albums::render_item(&row, 0, &sections, &items, &columns, actions.as_ref(), cx);

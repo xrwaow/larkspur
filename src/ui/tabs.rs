@@ -34,6 +34,7 @@ use crate::ui::input::action_for_key;
 use crate::ui::library_state::LibraryState;
 use crate::ui::menu::{context_menu, song_menu_items, MenuHandler, SongMenuRequest};
 use crate::ui::playlist::PlaylistView;
+use crate::ui::queue::QueueView;
 use crate::ui::search::SearchView;
 use crate::ui::settings::SettingsView;
 use crate::ui::playback_state::PlaybackState;
@@ -58,6 +59,9 @@ pub struct TabsView {
     browse: Entity<BrowseView>,
     search: Entity<SearchView>,
     settings: Entity<SettingsView>,
+    /// The play-queue panel, swapped in over the tabs from the transport's
+    /// queue button (visibility lives in the shared playback state).
+    queue: Entity<QueueView>,
     /// The non-browse tabs (playlists and artist scopes), in the order they
     /// were opened.
     tabs: Vec<Tab>,
@@ -109,6 +113,16 @@ impl TabsView {
             )
         });
         let settings = cx.new(|cx| SettingsView::new(config.clone(), cx));
+        let queue = cx.new(|cx| {
+            QueueView::new(
+                playback.clone(),
+                library.clone(),
+                covers.clone(),
+                config.clone(),
+                animator.clone(),
+                cx,
+            )
+        });
         let observe = cx.observe(&library, |this, _state, cx| {
             this.library_dirty = true;
             cx.notify();
@@ -125,6 +139,7 @@ impl TabsView {
             browse,
             search,
             settings,
+            queue,
             tabs: Vec::new(),
             active: TabId::Browse,
             search_open: false,
@@ -546,6 +561,10 @@ impl Render for TabsView {
             }
         };
 
+        // The queue panel positions and animates itself (an absolute overlay
+        // over this container's right side); it renders nothing while fully
+        // hidden, so it's simply always mounted.
+        //
         // The song menu is raised by a row anywhere and rendered here, on top of
         // every container. Each item's handler is wrapped so choosing one also
         // dismisses the menu — the action (open a tab, remove from a playlist)
@@ -553,7 +572,14 @@ impl Render for TabsView {
         let menu_element = self.menu.clone().map(|menu| {
             let weak = cx.entity().downgrade();
             let items: Vec<(String, MenuHandler)> =
-                song_menu_items(&self.library, &self.playback, &menu.songs, menu.playlist, cx)
+                song_menu_items(
+                    &self.library,
+                    &self.playback,
+                    &menu.songs,
+                    menu.playlist,
+                    menu.queue,
+                    cx,
+                )
                     .into_iter()
                     .map(|(label, handler)| {
                         let weak = weak.clone();
@@ -579,6 +605,8 @@ impl Render for TabsView {
             )
         });
 
+        let browse_font =
+            self.config.read(cx).font_size(BrowseView::container_id(), BrowseView::default_font_size());
         div()
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
@@ -592,6 +620,7 @@ impl Render for TabsView {
                 }
             }))
             .size_full()
+            .relative()
             .flex()
             .flex_col()
             .bg(theme.panel_bg)
@@ -599,17 +628,34 @@ impl Render for TabsView {
             .child(
                 div()
                     .flex()
-                    .items_center()
+                    .items_end()
                     .gap_1()
                     .px_2()
-                    .pt_2()
+                    .h(px(strip_height_px(theme.font_size, browse_font)))
                     .border_b_1()
                     .border_color(theme.border)
                     .children(strip),
             )
             .child(div().flex_1().min_h_0().child(content))
+            .child(self.queue.clone())
             .when_some(menu_element, |d, menu| d.child(menu))
     }
+}
+
+/// Height of the tab strip's band — and of the queue panel's header, which
+/// matches it so the two containers' horizontal rules line up across the top
+/// of the window. Both bands draw the rule with the same construction
+/// (`h` + `border_b_1`), so they align whatever the box model does.
+///
+/// Sized to whichever content is taller: the tabs' text (at the tabs' font),
+/// or the queue header's title (two points above its container's font).
+pub(crate) fn strip_height_px(tabs_font: f32, title_font: f32) -> f32 {
+    // The tabs' band: pt_2 above, py_1 around the tab text, and gpui's
+    // default 1.618 line height.
+    let tabs_band = 16.0 + (tabs_font - 1.0) * 1.618;
+    // The queue header's content: the title's line plus pb_1 of air.
+    let title_band = (title_font + 2.0) * 1.618 + 4.0;
+    tabs_band.max(title_band)
 }
 
 fn overlay_chip(theme: Theme, label: &str) -> AnyElement {

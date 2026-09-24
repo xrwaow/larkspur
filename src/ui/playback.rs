@@ -3,10 +3,11 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    canvas, div, point, prelude::*, px, AnyElement, Bounds, Context, Entity, MouseButton,
-    MouseDownEvent, PathBuilder, Pixels, Render, Rgba, Subscription, Window,
+    canvas, div, point, prelude::*, px, AnyElement, Bounds, ClickEvent, Context, Entity,
+    MouseButton, MouseDownEvent, PathBuilder, Pixels, Render, Rgba, Subscription, Window,
 };
 
+use crate::audio::RepeatMode;
 use crate::model::config::WaveformStyle;
 use crate::model::InputAction;
 use crate::ui::animation::Animator;
@@ -48,6 +49,10 @@ pub struct PlaybackView {
     /// which the style-refinement hover can't do, so it's tracked here.
     prev_hovered: bool,
     next_hovered: bool,
+    /// Hover state for the repeat toggle (same reason as prev/next).
+    repeat_hovered: bool,
+    /// Hover state for the queue toggle (same reason as prev/next).
+    queue_hovered: bool,
     _observe: Subscription,
     _observe_animator: Subscription,
 }
@@ -82,6 +87,8 @@ impl PlaybackView {
             generation: 0,
             prev_hovered: false,
             next_hovered: false,
+            repeat_hovered: false,
+            queue_hovered: false,
             _observe: observe,
             _observe_animator: observe_animator,
         }
@@ -160,7 +167,7 @@ impl Container for PlaybackView {
     }
 }
 
-const BAR_WIDTH: f32 = 480.0;
+pub(crate) const BAR_WIDTH: f32 = 480.0;
 const BAR_HEIGHT: f32 = 40.0;
 
 impl Render for PlaybackView {
@@ -170,7 +177,7 @@ impl Render for PlaybackView {
 
         // Snapshot the shared state once, then drop the borrow before
         // building elements.
-        let (position, duration, can_prev, can_next, ended, playing) = {
+        let (position, duration, can_prev, can_next, ended, playing, repeat) = {
             let state = self.state.read(cx);
             (
                 state.position(),
@@ -179,8 +186,10 @@ impl Render for PlaybackView {
                 state.can_next(),
                 state.ended(),
                 state.is_playing(),
+                state.repeat_mode(),
             )
         };
+        let queue_open = self.state.read(cx).queue_open();
         // Snapshot the animated bars for the paint closure.
         let bars: Arc<Vec<f32>> = Arc::new(self.bars.clone());
 
@@ -266,6 +275,40 @@ impl Render for PlaybackView {
                             .flex()
                             .gap_4()
                             .items_center()
+                            .child(
+                                // The repeat toggle, to the left of "prev":
+                                // clicks cycle off → repeat-one → repeat-all.
+                                // Lit while any repeat mode is active, and the
+                                // glyph gains a "1" in repeat-one.
+                                div()
+                                    .id("repeat-toggle")
+                                    .cursor_pointer()
+                                    .size(px(36.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                                        this.repeat_hovered = *hovered;
+                                        cx.notify();
+                                    }))
+                                    .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                        this.state.update(cx, |state, cx| state.cycle_repeat(cx));
+                                    }))
+                                    .child(icon(
+                                        15.0,
+                                        14.0,
+                                        if repeat == RepeatMode::Once {
+                                            REPEAT_ONCE_POLYGONS
+                                        } else {
+                                            REPEAT_POLYGONS
+                                        },
+                                        if repeat != RepeatMode::Off || self.repeat_hovered {
+                                            theme.accent
+                                        } else {
+                                            theme.text_muted
+                                        },
+                                    )),
+                            )
                             .child(transport_button(
                                 "prev",
                                 can_prev,
@@ -291,7 +334,7 @@ impl Render for PlaybackView {
                                     .items_center()
                                     .justify_center()
                                     .bg(theme.text_muted)
-                                    .when(!ended, |d| d.hover(|d| d.bg(theme.waveform_played)))
+                                    .when(!ended, |d| d.hover(|d| d.bg(theme.accent)))
                                     .on_click(cx.listener(|this, _event, _window, cx| {
                                         this.dispatch(InputAction::TogglePause, cx);
                                     }))
@@ -320,7 +363,36 @@ impl Render for PlaybackView {
                                     this.next_hovered = *hovered;
                                     cx.notify();
                                 }),
-                            )),
+                            ))
+                            .child(
+                                // The queue toggle, to the right of "next": it
+                                // swaps the queue panel in over the tabs, so
+                                // it stays lit while the panel is open.
+                                div()
+                                    .id("queue-toggle")
+                                    .cursor_pointer()
+                                    .size(px(36.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+                                        this.queue_hovered = *hovered;
+                                        cx.notify();
+                                    }))
+                                    .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                        this.state.update(cx, |state, cx| state.toggle_queue(cx));
+                                    }))
+                                    .child(icon(
+                                        15.0,
+                                        14.0,
+                                        QUEUE_POLYGONS,
+                                        if queue_open || self.queue_hovered {
+                                            theme.accent
+                                        } else {
+                                            theme.text_muted
+                                        },
+                                    )),
+                            ),
                     )
                     .child(
                         div()
@@ -350,6 +422,58 @@ const NEXT_POLYGONS: &[&[(f32, f32)]] = &[
 const PREV_POLYGONS: &[&[(f32, f32)]] = &[
     &[(1.0, 0.0), (1.0, 1.0), (0.32, 0.5)],
     &[(0.0, 0.0), (0.2, 0.0), (0.2, 1.0), (0.0, 1.0)],
+];
+
+/// The repeat glyph: two curved arrows chasing each other around a rounded
+/// loop — the top one flows right, the bottom one flows left. Each arrow is a
+/// straight stub, a quarter-arc (outer/inner radius around a shared center),
+/// a straight run, and a triangular head.
+const REPEAT_POLYGONS: &[&[(f32, f32)]] = &[
+    // Top arrow: rises on the left, curves over the top, heads right.
+    &[(0.10, 0.60), (0.26, 0.60), (0.26, 0.36), (0.10, 0.36)],
+    &[
+        (0.10, 0.36), (0.124, 0.238), (0.194, 0.134), (0.297, 0.065), (0.42, 0.04),
+        (0.42, 0.20), (0.359, 0.212), (0.307, 0.247), (0.256, 0.299), (0.26, 0.36),
+    ],
+    &[(0.42, 0.04), (0.70, 0.04), (0.70, 0.20), (0.42, 0.20)],
+    &[(0.66, 0.00), (0.94, 0.12), (0.66, 0.24)],
+    // Bottom arrow: falls on the right, curves under the bottom, heads left.
+    &[(0.74, 0.40), (0.90, 0.40), (0.90, 0.64), (0.74, 0.64)],
+    &[
+        (0.90, 0.64), (0.876, 0.762), (0.806, 0.866), (0.703, 0.935), (0.58, 0.96),
+        (0.58, 0.80), (0.641, 0.788), (0.693, 0.753), (0.744, 0.701), (0.74, 0.64),
+    ],
+    &[(0.30, 0.80), (0.58, 0.80), (0.58, 0.96), (0.30, 0.96)],
+    &[(0.34, 0.76), (0.06, 0.88), (0.34, 1.00)],
+];
+
+/// Repeat-one: the loop mark plus a "1" in the ring's center.
+const REPEAT_ONCE_POLYGONS: &[&[(f32, f32)]] = &[
+    &[(0.10, 0.60), (0.26, 0.60), (0.26, 0.36), (0.10, 0.36)],
+    &[
+        (0.10, 0.36), (0.124, 0.238), (0.194, 0.134), (0.297, 0.065), (0.42, 0.04),
+        (0.42, 0.20), (0.359, 0.212), (0.307, 0.247), (0.256, 0.299), (0.26, 0.36),
+    ],
+    &[(0.42, 0.04), (0.70, 0.04), (0.70, 0.20), (0.42, 0.20)],
+    &[(0.66, 0.00), (0.94, 0.12), (0.66, 0.24)],
+    &[(0.74, 0.40), (0.90, 0.40), (0.90, 0.64), (0.74, 0.64)],
+    &[
+        (0.90, 0.64), (0.876, 0.762), (0.806, 0.866), (0.703, 0.935), (0.58, 0.96),
+        (0.58, 0.80), (0.641, 0.788), (0.693, 0.753), (0.744, 0.701), (0.74, 0.64),
+    ],
+    &[(0.30, 0.80), (0.58, 0.80), (0.58, 0.96), (0.30, 0.96)],
+    &[(0.34, 0.76), (0.06, 0.88), (0.34, 1.00)],
+    // The "1": a stem with a diagonal serif at its top left.
+    &[(0.46, 0.38), (0.54, 0.38), (0.54, 0.66), (0.46, 0.66)],
+    &[(0.38, 0.48), (0.46, 0.38), (0.46, 0.48)],
+];
+
+/// The queue toggle's glyph: three horizontal bars, the last one shorter —
+/// the standard "up next" list mark.
+const QUEUE_POLYGONS: &[&[(f32, f32)]] = &[
+    &[(0.0, 0.0), (1.0, 0.0), (1.0, 0.16), (0.0, 0.16)],
+    &[(0.0, 0.42), (1.0, 0.42), (1.0, 0.58), (0.0, 0.58)],
+    &[(0.0, 0.84), (0.62, 0.84), (0.62, 1.0), (0.0, 1.0)],
 ];
 
 /// A fixed-size canvas painting filled polygons given in unit-square
@@ -418,7 +542,7 @@ fn transport_button(
             if !enabled {
                 theme.text_faint
             } else if hovered {
-                theme.waveform_played
+                theme.accent
             } else {
                 theme.text_muted
             },
@@ -457,7 +581,7 @@ fn render_waveform(
                     .top(px((BAR_HEIGHT - 10.0) / 2.0))
                     .size(px(10.0))
                     .rounded_full()
-                    .bg(theme.waveform_played),
+                    .bg(theme.accent),
             )
             .into_any_element(),
         WaveformStyle::Bars => waveform_bars(bars, progress, theme),
@@ -476,7 +600,7 @@ fn waveform_bars(bars: Arc<Vec<f32>>, progress: f32, theme: Theme) -> AnyElement
             let count = bars.len();
             widgets::paint_bars(window, bounds, &bars, 0.04, |i| {
                 if (i as f32 / count.max(1) as f32) < progress {
-                    theme.waveform_played
+                    theme.accent
                 } else {
                     theme.waveform
                 }

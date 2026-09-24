@@ -9,6 +9,29 @@ use rodio::source::SeekError;
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source};
 
 use crate::model::SongMetadata;
+
+/// How playback behaves when a track finishes.
+#[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
+pub enum RepeatMode {
+    /// Stop when the queue drains.
+    #[default]
+    Off,
+    /// Restart the current track when it ends.
+    Once,
+    /// Wrap around to the first track when the queue drains.
+    All,
+}
+
+impl RepeatMode {
+    /// The next mode in the button's cycle: off → once → all → off.
+    pub fn next(self) -> Self {
+        match self {
+            Self::Off => Self::Once,
+            Self::Once => Self::All,
+            Self::All => Self::Off,
+        }
+    }
+}
 use crate::opus::OpusSource;
 
 type TrackSource = Box<dyn Source<Item = f32> + Send>;
@@ -198,6 +221,7 @@ pub struct PlaybackController {
     /// The live-audio ring the visualizer reads. Shared with every source this
     /// controller appends, so it always reflects whatever is playing.
     tap: Arc<SampleTap>,
+    repeat: RepeatMode,
 }
 
 impl PlaybackController {
@@ -213,6 +237,7 @@ impl PlaybackController {
             metadata: SongMetadata::placeholder(),
             duration: Duration::ZERO,
             tap: Arc::new(SampleTap::new()),
+            repeat: RepeatMode::Off,
         };
 
         // An empty queue is valid: the app may launch with only a directory to
@@ -279,14 +304,44 @@ impl PlaybackController {
     /// Called periodically by the UI: when the queue has drained (track
     /// finished), move to the next one. Returns true if a new track started.
     pub fn tick_advance(&mut self) -> bool {
-        self.player.empty() && self.advance()
+        if !self.player.empty() {
+            return false;
+        }
+        // Repeat-one grants exactly one extra play of the finished track,
+        // then drops back to off — a failed reload falls through to the
+        // normal advance so a broken file can't wedge playback in an
+        // endless restart loop.
+        if self.repeat == RepeatMode::Once {
+            if let Some(i) = self.current {
+                if let Ok(parts) = Self::track_parts(&self.queue[i]) {
+                    self.repeat = RepeatMode::Off;
+                    self.start_track(i, parts);
+                    return true;
+                }
+            }
+        }
+        self.advance()
+    }
+
+    pub fn repeat_mode(&self) -> RepeatMode {
+        self.repeat
+    }
+
+    /// Cycle the repeat mode for the transport's repeat button.
+    pub fn cycle_repeat(&mut self) -> RepeatMode {
+        self.repeat = self.repeat.next();
+        self.repeat
     }
 
     /// Start the next track if there is one. Returns whether a new track
     /// actually started (a failed load returns `false`, not a phantom
     /// success).
     fn advance(&mut self) -> bool {
-        let next = self.current.map_or(0, |i| i + 1);
+        let mut next = self.current.map_or(0, |i| i + 1);
+        // Repeat-all wraps the queue instead of draining it.
+        if next >= self.queue.len() && self.repeat == RepeatMode::All && !self.queue.is_empty() {
+            next = 0;
+        }
         if next >= self.queue.len() {
             return false;
         }
@@ -332,11 +387,132 @@ impl PlaybackController {
 
     pub fn can_next(&self) -> bool {
         self.current.is_some_and(|i| i + 1 < self.queue.len())
+            || (self.repeat == RepeatMode::All && !self.queue.is_empty())
     }
 
     /// True once the whole queue has played out — play/next are inert then.
     pub fn ended(&self) -> bool {
         self.player.empty()
+    }
+
+    /// The play queue and the index of the loaded track, for the UI's queue
+    /// view. Read-only: the queue is replaced wholesale via [`set_queue`].
+    pub fn queue(&self) -> (&[PathBuf], Option<usize>) {
+        (&self.queue, self.current)
+    }
+
+    /// Start playing the queue entry at `index` — how the UI's queue view
+    /// jumps to a row.
+    pub fn play_index(&mut self, index: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(index < self.queue.len(), "queue index {index} out of range");
+        self.load_track(index)
+    }
+
+    /// Append `paths` to the end of the play queue — the song menu's "Add to
+    /// Queue". Returns whether a track was started: with nothing loaded and
+    /// nothing playing (an empty queue) the first appended one begins
+    /// playing; a drained queue picks the appended tracks up on the next
+    /// tick, like any track that finishes.
+    pub fn add_to_queue(&mut self, paths: Vec<PathBuf>) -> anyhow::Result<bool> {
+        anyhow::ensure!(!paths.is_empty(), "no tracks to queue");
+        let first = self.queue.len();
+        self.queue.extend(paths);
+        if self.current.is_none() && self.player.empty() {
+            let parts = Self::track_parts(&self.queue[first])?;
+            self.start_track(first, parts);
+            return Ok(true);
+        }
+        Ok(false)
+    }
+
+    /// Drop every entry matching `paths` from the play queue — the song
+    /// menu's "Remove from queue". Returns whether the loaded track changed
+    /// (a new one started, or the player stopped), so the caller can reload
+    /// the waveform.
+    ///
+    /// Removing the loaded track plays whatever took its slot (the next
+    /// surviving entry); with nothing after it the queue lands in its
+    /// played-out state on the last surviving entry, and an emptied queue
+    /// stops playback.
+    pub fn remove_from_queue(&mut self, paths: &[PathBuf]) -> bool {
+        let before = self.queue.len();
+        let Some(current) = self.current else {
+            self.queue.retain(|path| !paths.contains(path));
+            return false;
+        };
+        let loaded_removed = paths.contains(&self.queue[current]);
+        let removed_before =
+            self.queue[..current].iter().filter(|path| paths.contains(path)).count();
+        self.queue.retain(|path| !paths.contains(path));
+        if self.queue.len() == before {
+            return false;
+        }
+        if loaded_removed {
+            if current < self.queue.len() {
+                // The next surviving entry took the removed slot: play it.
+                match Self::track_parts(&self.queue[current]) {
+                    Ok(parts) => self.start_track(current, parts),
+                    Err(e) => {
+                        eprintln!("failed to load {:?}: {e}", self.queue[current]);
+                        if !self.player.empty() {
+                            self.player.skip_one();
+                        }
+                        self.current = Some(current);
+                    }
+                }
+            } else {
+                // Nothing after it: stop and land in the played-out state on
+                // the last surviving entry — or forget the track entirely
+                // when the queue emptied.
+                if !self.player.empty() {
+                    self.player.skip_one();
+                }
+                self.clear_tap();
+                self.current =
+                    if self.queue.is_empty() { None } else { Some(self.queue.len() - 1) };
+            }
+            true
+        } else {
+            // The loaded track survived: re-point at its shifted slot.
+            self.current = Some(current - removed_before);
+            false
+        }
+    }
+
+    /// Move the queue entry at `from` to `to` — the queue panel's
+    /// drag-to-reorder. The loaded track follows its entry to the new slot.
+    pub fn move_entry(&mut self, from: usize, to: usize) -> anyhow::Result<()> {
+        anyhow::ensure!(
+            from < self.queue.len() && to < self.queue.len(),
+            "queue index out of range"
+        );
+        if from == to {
+            return Ok(());
+        }
+        let entry = self.queue.remove(from);
+        self.queue.insert(to, entry);
+        // Re-point the loaded track at its entry's new slot; entries between
+        // the two slots shift by one to make room.
+        if let Some(current) = self.current {
+            self.current = Some(if current == from {
+                to
+            } else if from < current && to >= current {
+                current - 1
+            } else if from > current && to <= current {
+                current + 1
+            } else {
+                current
+            });
+        }
+        Ok(())
+    }
+
+    /// Drop every queue entry — the queue panel's clear button. The loaded
+    /// track keeps playing; the queue just won't advance past it, and
+    /// anything appended afterwards starts from its first entry.
+    pub fn clear_queue(&mut self) {
+        self.queue.clear();
+        self.current = None;
     }
 
     /// Path of the currently-loaded track, for the UI to load the waveform
