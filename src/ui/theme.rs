@@ -181,11 +181,11 @@ impl Theme {
             row_odd: rgb(0x191919),
             row_hover: rgb(0x232323),
             row_active: rgb(0x2b2b2b),
-            row_playing: rgb(0x1c2a1c),
+            row_playing: rgb(0x262626),
             text: rgb(0xe0e0e0),
             text_muted: rgb(0x808080),
             text_faint: rgb(0x606060),
-            accent: rgb(0x8fe08f),
+            accent: rgb(0xffffff),
             selection: rgb(0x2a4a6a),
             border: rgb(0x242424),
             waveform: rgb(0x404040),
@@ -194,7 +194,7 @@ impl Theme {
     }
 
     /// The same structure as [`dark`](Self::dark), inverted: light surfaces
-    /// with dark text, and a deeper green accent so it stays readable.
+    /// with dark text, and a black accent so it stays readable.
     fn light_palette() -> Self {
         Self {
             font: "TX-02",
@@ -207,11 +207,11 @@ impl Theme {
             row_odd: rgb(0xf1f1f1),
             row_hover: rgb(0xe2e2e2),
             row_active: rgb(0xd6d6d6),
-            row_playing: rgb(0xdcecdc),
+            row_playing: rgb(0xdedede),
             text: rgb(0x1a1a1a),
             text_muted: rgb(0x5a5a5a),
             text_faint: rgb(0x8a8a8a),
-            accent: rgb(0x1f7a1f),
+            accent: rgb(0x000000),
             selection: rgb(0xbfd8ff),
             border: rgb(0xd0d0d0),
             waveform: rgb(0xb8b8b8),

@@ -155,7 +155,14 @@ fn main() {
                     PlaylistsView::new(library_state.clone(), tabs.clone(), config_state.clone(), cx)
                 });
 
-                let playback = cx.new(|cx| PlaybackView::new(playback_state.clone(), config_state.clone(), cx));
+                let playback = cx.new(|cx| {
+                    PlaybackView::new(
+                        playback_state.clone(),
+                        config_state.clone(),
+                        animator.clone(),
+                        cx,
+                    )
+                });
                 let lyrics = cx.new(|cx| {
                     LyricsView::new(playback_state.clone(), config_state.clone(), animator.clone(), cx)
                 });

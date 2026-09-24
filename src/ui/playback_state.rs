@@ -10,15 +10,25 @@
 //! queue when a track drains and notifies on real change. It runs at ~60 Hz
 //! while playing and idles at ~4 Hz otherwise, so a paused or finished
 //! player costs almost nothing.
+//!
+//! The waveform is generated **progressively**, not in one whole-file pass:
+//! a background thread decodes the track from the start in chunks, one after
+//! another, and publishes each partial waveform into a shared slot the ticker
+//! picks up. The transport's bars therefore fill in as the chunks land. The
+//! visualizer is separate and genuinely real-time — it transforms the samples
+//! the audio thread is playing (see [`PlaybackState::sample_tap`]).
 
+use std::collections::VecDeque;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use gpui::Context;
 
-use crate::analysis::{analyze_track, Spectrogram, TrackAnalysis};
-use crate::audio::{PlaybackController, SongStatus};
+use crate::analysis::{TrackAnalyzer, Waveform};
+use crate::audio::{PlaybackController, SampleTap, SongStatus};
+use crate::bitrate::BitrateProfile;
 use crate::model::{InputAction, SongMetadata};
 use crate::ui::animation::SLOW_FPS;
 
@@ -29,58 +39,55 @@ const WAVEFORM_BUCKETS: usize = 240;
 /// value refreshes.
 const BITRATE_BUCKET: Duration = Duration::from_secs(1);
 
+/// Media time decoded per analyzer step — one whole chunk at a time, not a
+/// trickle. The chunks are generated back to back, so the waveform fills in as
+/// fast as the decoder can read it.
+const WAVEFORM_CHUNK: Duration = Duration::from_secs(256);
+
 /// How far the rendered position may run ahead of rodio's last sample while
 /// smoothing between its updates.
-const MAX_EXTRAPOLATION: Duration = Duration::from_millis(200);
+const MAX_EXTRAPOLATION: Duration = Duration::from_millis(256);
 
 /// How often the state samples the player. Fast enough to notice a track
 /// draining promptly; the *notify* rate is separate — the transport re-renders
 /// on the slow clock ([`SLOW_FPS`]), not every sample.
-const TICK: Duration = Duration::from_millis(100);
+const TICK: Duration = Duration::from_millis(128);
 
-/// The current track's waveform peaks + live-bitrate curve, computed off the
-/// UI thread in a single pass when the track changes.
-#[derive(Clone)]
-pub enum TrackAnalysisState {
-    Loading,
-    Ready(Arc<TrackAnalysis>),
-    Unavailable,
+/// The waveform chunks + bitrate the background analyzer publishes, shared
+/// with the UI through an `Arc<Mutex<..>>` rather than a channel.
+///
+/// The analyzer owns a Symphonia format reader, which isn't `Send`, so it runs
+/// on its own thread and can't hand results back through an executor task. It
+/// pushes each decoded chunk onto `chunks` and never waits; the transport view
+/// pops them one at a time and animates each in, so the display is decoupled
+/// from the decode.
+struct AnalysisSlot {
+    /// Chunks produced so far, oldest first.
+    chunks: VecDeque<Waveform>,
+    bitrate: BitrateProfile,
+    /// Bumped on every publish, so a tick only notifies on real change.
+    revision: u64,
 }
 
-impl TrackAnalysisState {
-    /// The waveform peaks, if ready. Cheap: clones an `Arc`.
-    pub fn peaks(&self) -> Option<Arc<Vec<f32>>> {
-        match self {
-            TrackAnalysisState::Ready(analysis) => Some(analysis.peaks.clone()),
-            TrackAnalysisState::Loading | TrackAnalysisState::Unavailable => None,
-        }
-    }
-
-    /// The fine-grained peaks the visualizer draws from, if ready. Cheap:
-    /// clones an `Arc`.
-    pub fn spectrogram(&self) -> Option<Arc<Spectrogram>> {
-        match self {
-            TrackAnalysisState::Ready(analysis) => Some(analysis.spectrogram.clone()),
-            TrackAnalysisState::Loading | TrackAnalysisState::Unavailable => None,
-        }
-    }
-
-    /// The live bitrate at `position`, if the profile is ready.
-    pub fn bitrate_at(&self, position: Duration) -> Option<u32> {
-        match self {
-            TrackAnalysisState::Ready(analysis) => analysis.bitrate.at(position),
-            TrackAnalysisState::Loading | TrackAnalysisState::Unavailable => None,
+impl AnalysisSlot {
+    fn new() -> Self {
+        Self {
+            chunks: VecDeque::new(),
+            bitrate: BitrateProfile::empty(BITRATE_BUCKET),
+            revision: 0,
         }
     }
 }
 
 pub struct PlaybackState {
     controller: PlaybackController,
-    analysis: TrackAnalysisState,
-    /// Bumped on every track change so a late-arriving analysis for a track
-    /// we've already moved past is discarded instead of clobbering the
-    /// current one.
-    generation: u64,
+    /// Shared with the background analyzer thread.
+    analysis: Arc<Mutex<AnalysisSlot>>,
+    /// The revision the UI last rendered, so a tick only notifies on change.
+    analysis_revision: u64,
+    /// Bumped on every track change; the analyzer thread stops once it no
+    /// longer matches the value it started with.
+    generation: Arc<AtomicU64>,
     /// Last values we rendered, so a tick only notifies on real change.
     /// The position is quantized to the slow clock, so the transport re-renders
     /// at [`SLOW_FPS`] rather than every sample.
@@ -105,8 +112,9 @@ impl PlaybackState {
         let position = controller.position();
         let mut this = Self {
             controller,
-            analysis: TrackAnalysisState::Loading,
-            generation: 0,
+            analysis: Arc::new(Mutex::new(AnalysisSlot::new())),
+            analysis_revision: 0,
+            generation: Arc::new(AtomicU64::new(0)),
             last_coarse: -1,
             last_status: status,
             live_bitrate_bps: None,
@@ -114,7 +122,7 @@ impl PlaybackState {
             display_position: position,
             anchor: None,
         };
-        this.reload_track(cx);
+        this.reload_track();
         this.start_ticker(cx);
         this
     }
@@ -153,15 +161,21 @@ impl PlaybackState {
         }
     }
 
-    /// The current track's waveform peaks, if the analysis is ready.
-    pub fn peaks(&self) -> Option<Arc<Vec<f32>>> {
-        self.analysis.peaks()
+    /// The next waveform chunk to animate in, if the analyzer has produced
+    /// one. The transport view pops these in order.
+    pub fn take_chunk(&self) -> Option<Waveform> {
+        self.analysis.lock().unwrap().chunks.pop_front()
     }
 
-    /// The current track's spectrogram (the visualizer's data), if the
-    /// analysis is ready.
-    pub fn spectrogram(&self) -> Option<Arc<Spectrogram>> {
-        self.analysis.spectrogram()
+    /// A counter bumped on every track change, so a view can reset its
+    /// progressive-waveform animation when the track changes.
+    pub fn waveform_generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// The live-audio ring the visualizer transforms. Cheap: clones an `Arc`.
+    pub fn sample_tap(&self) -> Arc<SampleTap> {
+        self.controller.sample_tap()
     }
 
     /// The current track's live bitrate in bits per second, refreshed every
@@ -225,13 +239,13 @@ impl PlaybackState {
     /// Used to turn a playlist into the queue: the caller resolves the
     /// playlist's songs to paths, so this stays playlist-agnostic. Re-loads
     /// the waveform for whatever track ends up current.
-    pub fn play_paths(&mut self, paths: Vec<PathBuf>, start: usize, cx: &mut Context<Self>) -> bool {
+    pub fn play_paths(&mut self, paths: Vec<PathBuf>, start: usize, _cx: &mut Context<Self>) -> bool {
         if paths.is_empty() {
             return false;
         }
         match self.controller.set_queue(paths, start) {
             Ok(()) => {
-                self.reload_track(cx);
+                self.reload_track();
                 true
             }
             Err(e) => {
@@ -283,21 +297,38 @@ impl PlaybackState {
 
     /// Advance the queue if it drained, and report whether anything the UI
     /// renders has changed since the last tick.
-    fn tick(&mut self, cx: &mut Context<Self>) -> bool {
+    fn tick(&mut self, _cx: &mut Context<Self>) -> bool {
         let mut changed = false;
 
         if self.controller.tick_advance() {
-            self.reload_track(cx);
+            self.reload_track();
             changed = true;
         }
 
         let position = self.display_position_now();
         self.display_position = position;
+
+        // The queue has drained: drop the tap so the visualizer doesn't freeze
+        // on the last track's spectrum.
+        if self.controller.ended() {
+            self.controller.clear_tap();
+        }
+
         // Report the position only once per slow tick, so a playing track
         // re-renders the transport at `SLOW_FPS` instead of every sample.
         let coarse = (position.as_secs_f32() * SLOW_FPS) as i64;
         if coarse != self.last_coarse {
             self.last_coarse = coarse;
+            changed = true;
+        }
+
+        // Pick up whatever the analyzer has published since the last tick.
+        let (revision, bitrate_at) = {
+            let slot = self.analysis.lock().unwrap();
+            (slot.revision, slot.bitrate.at(position))
+        };
+        if revision != self.analysis_revision {
+            self.analysis_revision = revision;
             changed = true;
         }
 
@@ -307,9 +338,8 @@ impl PlaybackState {
             && position.abs_diff(self.last_bitrate_at) >= BITRATE_BUCKET
         {
             self.last_bitrate_at = position;
-            let next = self.analysis.bitrate_at(position);
-            if next != self.live_bitrate_bps {
-                self.live_bitrate_bps = next;
+            if bitrate_at != self.live_bitrate_bps {
+                self.live_bitrate_bps = bitrate_at;
                 changed = true;
             }
         }
@@ -370,13 +400,17 @@ impl PlaybackState {
         }
     }
 
-    /// Kick off off-thread analysis for the current track: waveform peaks and
-    /// a live-bitrate profile, from a single demux+decode pass. Reports back
-    /// into this state, guarded by `generation` so a stale result is discarded.
-    fn reload_track(&mut self, cx: &mut Context<Self>) {
-        self.generation += 1;
-        let generation = self.generation;
-        self.analysis = TrackAnalysisState::Loading;
+    /// Start generating the current track's waveform from the start.
+    ///
+    /// A background thread decodes the track in chunks, one after another,
+    /// publishing each partial waveform into the shared slot as it lands. The
+    /// previous track's thread is stopped by bumping the generation counter,
+    /// and the slot is replaced so a late write from the old thread can't
+    /// clobber the new track's bars.
+    fn reload_track(&mut self) {
+        let generation = self.generation.fetch_add(1, Ordering::SeqCst) + 1;
+        self.analysis = Arc::new(Mutex::new(AnalysisSlot::new()));
+        self.analysis_revision = 0;
         self.live_bitrate_bps = None;
         self.last_bitrate_at = Duration::ZERO;
         self.last_coarse = -1;
@@ -384,28 +418,42 @@ impl PlaybackState {
         self.display_position = self.controller.position();
 
         let Some(path) = self.controller.current_path().map(PathBuf::from) else {
-            self.analysis = TrackAnalysisState::Unavailable;
             return;
         };
+        let duration = self.controller.duration;
+        let analysis = self.analysis.clone();
+        let generation_flag = self.generation.clone();
 
-        cx.spawn(async move |this, cx| {
-            let compute = cx.background_executor().spawn(async move {
-                analyze_track(&path, WAVEFORM_BUCKETS, BITRATE_BUCKET)
-            });
-            let analysis = compute.await;
-
-            this.update(cx, |state, cx| {
-                // Discard if the track changed while we were analyzing.
-                if state.generation == generation {
-                    state.analysis = match analysis {
-                        Ok(analysis) => TrackAnalysisState::Ready(Arc::new(analysis)),
-                        Err(_) => TrackAnalysisState::Unavailable,
-                    };
-                    cx.notify();
+        // The analyzer owns a Symphonia format reader, which isn't `Send`, so it
+        // can't be moved onto the executor's pool after construction. It runs on
+        // its own thread instead, created and used entirely inside this closure,
+        // and publishes into the shared slot.
+        std::thread::spawn(move || {
+            let mut analyzer =
+                match TrackAnalyzer::new(&path, WAVEFORM_BUCKETS, BITRATE_BUCKET, Some(duration)) {
+                    Ok(analyzer) => analyzer,
+                    // Nothing readable: leave the slot empty rather than
+                    // flashing a placeholder.
+                    Err(_) => return,
+                };
+            loop {
+                if generation_flag.load(Ordering::SeqCst) != generation {
+                    break;
                 }
-            })
-            .ok();
-        })
-        .detach();
+                // Decode the next chunk and publish it. No waiting on the
+                // playhead: the chunks are generated back to back, so the bars
+                // fill in as fast as the decoder can read them.
+                if analyzer.advance(WAVEFORM_CHUNK.as_secs_f64()).is_err() {
+                    break;
+                }
+                let mut slot = analysis.lock().unwrap();
+                slot.chunks.push_back(analyzer.waveform());
+                slot.bitrate = analyzer.bitrate();
+                slot.revision += 1;
+                if analyzer.finished() {
+                    break;
+                }
+            }
+        });
     }
 }

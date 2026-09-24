@@ -1,13 +1,160 @@
+use std::collections::VecDeque;
 use std::fs::File;
+use std::num::NonZero;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use rodio::source::SeekError;
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source};
 
 use crate::model::SongMetadata;
 use crate::opus::OpusSource;
 
 type TrackSource = Box<dyn Source<Item = f32> + Send>;
+
+/// How many mono samples the tap keeps — comfortably more than one FFT window
+/// (~93 ms at 44.1 kHz), so the visualizer always has a full window to
+/// transform.
+const TAP_CAPACITY: usize = 8192;
+
+/// Interleaved samples buffered before one tap flush, so the audio thread
+/// takes the tap's lock once per ~10 ms rather than once per sample.
+const TAP_FLUSH: usize = 1024;
+
+/// A bounded ring of the most recent mono samples the audio thread has played.
+///
+/// This is what makes the visualizer real-time: instead of a precomputed
+/// spectrogram indexed by playback position, the visualizer transforms the
+/// samples that are actually coming out of the speakers. The audio thread only
+/// ever appends here (in batches, under a short lock); the FFT runs on the UI
+/// side.
+pub struct SampleTap {
+    inner: Mutex<TapRing>,
+}
+
+struct TapRing {
+    /// Mono samples, oldest first, newest last.
+    samples: VecDeque<f32>,
+    sample_rate: u32,
+}
+
+impl SampleTap {
+    fn new() -> Self {
+        Self {
+            inner: Mutex::new(TapRing {
+                samples: VecDeque::with_capacity(TAP_CAPACITY),
+                sample_rate: 44_100,
+            }),
+        }
+    }
+
+    /// The sample rate of the audio currently being tapped.
+    pub fn sample_rate(&self) -> u32 {
+        self.inner.lock().unwrap().sample_rate
+    }
+
+    /// Copy the most recent `n` mono samples (oldest first) into `out`, reusing
+    /// its allocation. Fewer if the tap hasn't filled yet.
+    pub fn copy_recent(&self, out: &mut Vec<f32>, n: usize) {
+        let ring = self.inner.lock().unwrap();
+        let len = ring.samples.len();
+        let take = n.min(len);
+        out.clear();
+        out.extend(ring.samples.iter().skip(len - take).copied());
+    }
+
+    fn configure(&self, sample_rate: u32) {
+        self.inner.lock().unwrap().sample_rate = sample_rate.max(1);
+    }
+
+    fn push_mono(&self, mono: &[f32]) {
+        let mut ring = self.inner.lock().unwrap();
+        for &sample in mono {
+            if ring.samples.len() == TAP_CAPACITY {
+                ring.samples.pop_front();
+            }
+            ring.samples.push_back(sample);
+        }
+    }
+
+    fn clear(&self) {
+        self.inner.lock().unwrap().samples.clear();
+    }
+}
+
+/// Wraps a playback source, copying the samples it hands out into a
+/// [`SampleTap`]. Samples are buffered and downmixed to mono in batches, so the
+/// audio thread pays one short lock per [`TAP_FLUSH`] samples, not per sample.
+struct TapSource<S> {
+    inner: S,
+    tap: Arc<SampleTap>,
+    channels: usize,
+    pending: Vec<f32>,
+}
+
+impl<S: Source<Item = f32>> TapSource<S> {
+    fn new(inner: S, tap: Arc<SampleTap>) -> Self {
+        let channels = inner.channels().get() as usize;
+        tap.configure(inner.sample_rate().get());
+        Self { inner, tap, channels, pending: Vec::with_capacity(TAP_FLUSH + 8) }
+    }
+
+    /// Downmix the buffered interleaved samples to mono and hand them to the
+    /// tap.
+    fn flush(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        let channels = self.channels.max(1);
+        let mono: Vec<f32> = self
+            .pending
+            .chunks(channels)
+            .map(|frame| frame.iter().sum::<f32>() / frame.len() as f32)
+            .collect();
+        self.tap.push_mono(&mono);
+        self.pending.clear();
+    }
+}
+
+impl<S: Source<Item = f32>> Iterator for TapSource<S> {
+    type Item = f32;
+
+    fn next(&mut self) -> Option<f32> {
+        let sample = self.inner.next()?;
+        self.pending.push(sample);
+        if self.pending.len() >= TAP_FLUSH {
+            self.flush();
+        }
+        Some(sample)
+    }
+}
+
+impl<S: Source<Item = f32>> Source for TapSource<S> {
+    fn current_span_len(&self) -> Option<usize> {
+        self.inner.current_span_len()
+    }
+
+    fn channels(&self) -> NonZero<u16> {
+        self.inner.channels()
+    }
+
+    fn sample_rate(&self) -> NonZero<u32> {
+        self.inner.sample_rate()
+    }
+
+    fn total_duration(&self) -> Option<Duration> {
+        self.inner.total_duration()
+    }
+
+    fn try_seek(&mut self, pos: Duration) -> Result<(), SeekError> {
+        // Drop the buffered tail and the tap's history: after a seek the old
+        // samples are from the wrong place in the track.
+        self.pending.clear();
+        self.tap.clear();
+        self.inner.try_seek(pos)
+    }
+}
 
 /// Build the decode source for a track: rodio's `Decoder` covers
 /// FLAC/MP3/WAV/Vorbis; Opus falls through to our symphonia+libopus source
@@ -48,6 +195,9 @@ pub struct PlaybackController {
     current: Option<usize>,
     pub metadata: SongMetadata,
     pub duration: Duration,
+    /// The live-audio ring the visualizer reads. Shared with every source this
+    /// controller appends, so it always reflects whatever is playing.
+    tap: Arc<SampleTap>,
 }
 
 impl PlaybackController {
@@ -62,6 +212,7 @@ impl PlaybackController {
             current: None,
             metadata: SongMetadata::placeholder(),
             duration: Duration::ZERO,
+            tap: Arc::new(SampleTap::new()),
         };
 
         // An empty queue is valid: the app may launch with only a directory to
@@ -115,7 +266,10 @@ impl PlaybackController {
         if !self.player.empty() {
             self.player.skip_one();
         }
-        self.player.append(source);
+        // A fresh track's samples have nothing to do with the last one's, so
+        // start the visualizer's ring clean.
+        self.tap.clear();
+        self.player.append(TapSource::new(source, self.tap.clone()));
         self.player.play();
         self.current = Some(index);
         self.metadata = metadata;
@@ -193,6 +347,17 @@ impl PlaybackController {
             .map(PathBuf::as_path)
     }
 
+    /// The live-audio ring the visualizer transforms. Cheap: clones an `Arc`.
+    pub fn sample_tap(&self) -> Arc<SampleTap> {
+        self.tap.clone()
+    }
+
+    /// Drop the tap's history — used when the queue drains so the visualizer
+    /// doesn't freeze on the last track's spectrum.
+    pub fn clear_tap(&self) {
+        self.tap.clear();
+    }
+
     pub fn position(&self) -> Duration {
         self.player.get_pos()
     }
@@ -234,6 +399,9 @@ impl PlaybackController {
                 return;
             }
         }
+        // The tap's history is from the old position; drop it so the visualizer
+        // doesn't briefly show the pre-seek spectrum.
+        self.tap.clear();
         // Don't swallow seek failures — a silent failure looks exactly
         // like "the arrow keys / seek bar do nothing".
         if let Err(e) = self.player.try_seek(pos.min(self.duration)) {

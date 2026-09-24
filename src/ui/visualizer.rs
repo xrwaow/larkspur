@@ -1,28 +1,26 @@
 //! The visualizer — a spectrum-style band of bars above the lyrics panel.
 //!
 //! The leftmost bar is the bass end, the rightmost the highs: each bar is one
-//! of [`BAND_COUNT`](crate::analysis::BAND_COUNT) log-spaced frequency bands,
-//! showing the track's spectrum at the live playback position. As the song
-//! plays the bars dance with the music; on a seek they jump to the new
-//! position's spectrum.
-//!
-//! The data is [`TrackAnalysis::spectrogram`](crate::analysis::TrackAnalysis) —
-//! FFT magnitudes over media time, computed in the same single decode pass as
-//! the transport's waveform and sampled through
-//! [`Spectrogram::at`](crate::analysis::Spectrogram), which interpolates
-//! between columns so the bars move continuously rather than stepping at the
-//! column rate.
+//! of [`BAND_COUNT`](crate::analysis::BAND_COUNT) log-spaced frequency bands.
+//! Unlike the transport's waveform, this is **real-time**: it transforms the
+//! samples the audio thread is actually playing (through
+//! [`SampleTap`](crate::audio::SampleTap)), so the bars follow the music with
+//! no precomputation and no dependence on playback position.
 //!
 //! Each bar rises to its target instantly and falls back exponentially, which
-//! is what makes the strip bounce the way spectrum displays do. The view
-//! observes the shared frame clock ([`SMOOTH_FPS`]) and re-renders only while
-//! a bar is actually moving — a paused track settles and then costs nothing.
+//! is what makes the strip bounce the way spectrum displays do. A slow
+//! auto-gain keeps the bars using the full height as the music's level moves.
+//! The view observes the shared frame clock ([`SMOOTH_FPS`]) and re-renders
+//! only while a bar is actually moving — a paused track settles and then costs
+//! nothing.
+//!
+//! [`SMOOTH_FPS`]: crate::ui::animation::SMOOTH_FPS
 
 use std::sync::Arc;
 
 use gpui::{canvas, div, prelude::*, px, Context, Entity, Render, Subscription, Window};
 
-use crate::analysis::BAND_COUNT;
+use crate::analysis::{SpectrumAnalyzer, BAND_COUNT, FFT_SIZE};
 use crate::ui::animation::Animator;
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
@@ -46,13 +44,28 @@ const FALL_SECS: f32 = 0.22;
 /// Below this height a bar counts as settled and stops asking for frames.
 const SETTLE: f32 = 0.001;
 
+/// Auto-gain release time constant, in seconds: how slowly the reference peak
+/// decays once the music gets quieter. Long enough that the bars don't pump,
+/// short enough that a quiet passage still uses the height.
+const GAIN_RELEASE_SECS: f32 = 1.5;
+
+/// The smallest reference peak the auto-gain will divide by, so a silent track
+/// doesn't amplify its own noise floor into full-height bars.
+const GAIN_FLOOR: f32 = 4.0;
+
 pub struct VisualizerView {
     state: Entity<PlaybackState>,
     config: Entity<ConfigState>,
     themed: Themed,
-    /// Smoothed bar heights (0.0–1.0). Index 0 is the leftmost (oldest) bar;
-    /// the last one tracks "now".
+    /// Smoothed bar heights (0.0–1.0), bass on the left.
     bars: Vec<f32>,
+    /// The real-time spectrum core, rebuilt if the track's sample rate changes.
+    analyzer: Option<SpectrumAnalyzer>,
+    analyzer_rate: u32,
+    /// Scratch for the tap's most recent samples, reused each frame.
+    samples: Vec<f32>,
+    /// The running reference peak the bars are scaled against.
+    gain_peak: f32,
     _observe_animator: Subscription,
 }
 
@@ -73,30 +86,55 @@ impl VisualizerView {
             config: config.clone(),
             themed: Themed::new(&config, cx),
             bars: vec![0.0; BAR_COUNT],
+            analyzer: None,
+            analyzer_rate: 0,
+            samples: Vec::with_capacity(FFT_SIZE),
+            gain_peak: GAIN_FLOOR,
             _observe_animator: observe_animator,
         }
     }
 
-    /// Advance the bars toward the music at the live position. Returns whether
-    /// anything moved enough to need a render — once the music stops (or the
-    /// analysis is still loading) the bars settle and the view goes quiet.
+    /// Advance the bars toward the live spectrum. Returns whether anything
+    /// moved enough to need a render — once the music stops the bars settle and
+    /// the view goes quiet.
     ///
-    /// The clock observer runs whether or not the band is in the layout, so
-    /// the off state short-circuits here rather than sampling per frame.
+    /// The clock observer runs whether or not the band is in the layout, so the
+    /// off state short-circuits here rather than sampling per frame.
     fn tick(&mut self, dt: f32, cx: &mut Context<Self>) -> bool {
         if !self.config.read(cx).visualizer() {
             return false;
         }
-        let (position, spectrogram) = {
-            let state = self.state.read(cx);
-            (state.live_position().as_secs_f32(), state.spectrogram())
-        };
-        // The spectrum at the live position, interpolated between columns.
-        let column = spectrogram.as_deref().and_then(|s| s.at(position));
+        // Paused (or stopped): freeze the bars exactly where they are. The tap
+        // holds the last samples, so without this the auto-gain would keep
+        // decaying and the bars would drift even though nothing is playing.
+        if !self.state.read(cx).is_playing() {
+            return false;
+        }
+
+        // Transform what the audio thread last played, not a precomputed
+        // spectrogram: this is the whole difference from the old visualizer.
+        let tap = self.state.read(cx).sample_tap();
+        let rate = tap.sample_rate();
+        if self.analyzer.is_none() || self.analyzer_rate != rate {
+            self.analyzer = Some(SpectrumAnalyzer::new(rate));
+            self.analyzer_rate = rate;
+        }
+        tap.copy_recent(&mut self.samples, FFT_SIZE);
+        let column = self
+            .analyzer
+            .as_mut()
+            .map(|analyzer| analyzer.bands(&self.samples));
+
+        // Auto-gain: track the loudest band, decaying slowly, so a quiet
+        // passage still uses the height without the bars pumping.
+        let peak = column.map_or(0.0, |c| c.iter().copied().fold(0f32, f32::max));
+        let decay = (-dt / GAIN_RELEASE_SECS).exp();
+        self.gain_peak = (self.gain_peak * decay).max(peak).max(GAIN_FLOOR);
+        let inv = 1.0 / self.gain_peak;
 
         let mut moved = false;
         for (i, bar) in self.bars.iter_mut().enumerate() {
-            let target = column.map_or(0.0, |column| column[i]);
+            let target = column.map_or(0.0, |c| (c[i] * inv).sqrt().min(1.0));
             let next = fall_toward(*bar, target, dt);
             if (next - *bar).abs() > SETTLE {
                 moved = true;
@@ -116,7 +154,7 @@ impl Container for VisualizerView {
 impl Render for VisualizerView {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.themed.theme();
-        // Snapshot for the paint closure — 64 floats, cloned per frame.
+        // Snapshot for the paint closure — 128 floats, cloned per frame.
         let bars: Arc<Vec<f32>> = Arc::new(self.bars.clone());
 
         div()

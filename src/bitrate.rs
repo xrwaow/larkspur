@@ -23,7 +23,7 @@ use symphonia::core::units::TimeBase;
 /// "live" number is exact — per-bucket VBR movement included — for every
 /// codec, without instrumenting the decode path or sharing state with the
 /// audio thread.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct BitrateProfile {
     bucket: Duration,
     /// Bits per second for each bucket, in media-time order.
@@ -31,6 +31,11 @@ pub struct BitrateProfile {
 }
 
 impl BitrateProfile {
+    /// An empty profile — no buckets yet. The UI starts from this before the
+    /// sequential analyzer has read any packets.
+    pub fn empty(bucket: Duration) -> Self {
+        Self { bucket, buckets: Vec::new() }
+    }
     /// Build a profile from per-bucket byte counts. The one-pass track
     /// analysis collects the counts while decoding for the waveform, instead
     /// of demuxing a second time.
