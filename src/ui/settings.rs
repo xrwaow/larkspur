@@ -43,6 +43,9 @@ pub struct SettingsView {
     config: Entity<ConfigState>,
     themed: Themed,
     path: TextField,
+    /// The path box's focus handle — the box takes keys (and shows its caret)
+    /// only while it's focused, i.e. once clicked.
+    path_focus: FocusHandle,
     /// The open typeface menu, if any.
     font_menu: Option<FontMenu>,
     focus_handle: FocusHandle,
@@ -55,6 +58,7 @@ impl SettingsView {
             config,
             themed,
             path: TextField::default(),
+            path_focus: cx.focus_handle(),
             font_menu: None,
             focus_handle: cx.focus_handle(),
         }
@@ -119,7 +123,7 @@ struct ContainerRow {
 }
 
 impl Render for SettingsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.themed.theme();
         let config = self.config.read(cx);
         let theme_kind = config.theme_kind();
@@ -239,7 +243,9 @@ impl Render for SettingsView {
                 .gap_2()
                 .px_4()
                 .pt_2()
-                .child(div().flex_1().min_w_0().child(self.path.render(theme, "/path/to/music")))
+                .child(div().flex_1().min_w_0().child(
+                    self.path.render(theme, "/path/to/music", &self.path_focus, window),
+                ))
                 .child(action_button(
                     theme,
                     "add-path",
@@ -251,17 +257,20 @@ impl Render for SettingsView {
 
         let mut root = div()
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" && this.font_menu.is_some() {
                     this.font_menu = None;
                     cx.notify();
                     return;
                 }
-                if event.keystroke.key == "enter" {
+                // The path box takes keys only while it's focused; elsewhere
+                // `enter` does nothing and typing bubbles.
+                let path_focused = this.path_focus.is_focused(window);
+                if path_focused && event.keystroke.key == "enter" {
                     this.add_path(cx);
                     return;
                 }
-                if this.path.handle_routed(event, cx) {
+                if path_focused && this.path.handle_routed(event, cx) {
                     cx.notify();
                 }
             }))
@@ -277,6 +286,7 @@ impl Render for SettingsView {
                 None,
                 None,
                 Some(("esc", theme.text_faint)),
+                None,
             ))
             .child(
                 div()

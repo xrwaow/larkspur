@@ -76,9 +76,13 @@ pub struct QueueView {
     open_target: bool,
     /// The shared table shell — rows, selection, marquees, virtualized list.
     list: AlbumListView,
-    /// The queue the rows were last built from, so a queue change rebuilds
-    /// them (row indices shift with it).
+    /// The queue paths the rows were last built from, and the controller
+    /// generation they were built at — the snapshot happens only when the
+    /// generation moves, never per frame.
     queue_paths: Vec<PathBuf>,
+    queue_generation: u64,
+    /// The queue's total time, computed with the snapshot.
+    total_secs: u64,
     /// The row grab in flight — hold a row and move to reorder it.
     drag: Drag,
     _subs: AlbumListSubs,
@@ -136,6 +140,8 @@ impl QueueView {
             open_target: false,
             list,
             queue_paths: Vec::new(),
+            queue_generation: 0,
+            total_secs: 0,
             drag: Drag::default(),
             _subs: subs,
         }
@@ -339,27 +345,33 @@ impl Render for QueueView {
         // rightward while hiding.
         let offset = (1.0 - ease_out_cubic(self.slide.value())) * width;
 
-        // Snapshot the queue, ending the state borrow before self-mutation.
-        let queue: Vec<PathBuf> = self.playback.read(cx).queue().0.to_vec();
-        let queue_changed = self.queue_paths != queue;
+        // The queue's contents can only have changed when the controller
+        // bumped its generation — the cheap per-frame check. The full path
+        // snapshot (and the total time it feeds) happens then, not every
+        // frame, so a huge queue costs nothing while it just sits there.
+        let generation = self.playback.read(cx).queue_generation();
+        let queue_len = self.playback.read(cx).queue().0.len();
+        let queue_changed = generation != self.queue_generation;
+        if queue_changed {
+            self.queue_generation = generation;
+            self.queue_paths = self.playback.read(cx).queue().0.to_vec();
+            let library = self.library.read(cx).library();
+            self.total_secs = self
+                .queue_paths
+                .iter()
+                .filter_map(|path| library.get(generate_song_id(path).unwrap_or(0)))
+                .map(|song| song.duration.as_secs())
+                .sum();
+        }
 
         // A queue change under an active grab (a track finished, an entry was
         // removed) invalidates the row indices — drop the drag rather than
         // reorder into a stale list.
-        if self.drag.is_active() && (queue_changed || self.drag.grabbed().is_some_and(|grabbed| grabbed >= queue.len())) {
+        if self.drag.is_active()
+            && (queue_changed || self.drag.grabbed().is_some_and(|grabbed| grabbed >= queue_len))
+        {
             self.drag.cancel();
         }
-
-        // The queue's total time, for the dimmed readout next to the title.
-        // Paths the library hasn't scanned contribute nothing.
-        let total_secs: u64 = {
-            let library = self.library.read(cx).library();
-            queue
-                .iter()
-                .filter_map(|path| library.get(generate_song_id(path).unwrap_or(0)))
-                .map(|song| song.duration.as_secs())
-                .sum()
-        };
 
         // The columns scale to the panel's width — the tables' fixed
         // 48-character columns assume a window-wide center. One monospace
@@ -373,13 +385,12 @@ impl Render for QueueView {
 
         // The in-flight drag, if the grab became one: rows part to make room
         // and the grabbed row follows the pointer as a ghost.
-        let drag_info = if queue.is_empty() { None } else { self.drag.info(queue.len()) };
+        let drag_info = if queue_len == 0 { None } else { self.drag.info(queue_len) };
 
         // Rebuild when the rows are stale or the queue moved; otherwise keep
         // the selection and marquee state.
         let fresh = if self.list.rows().is_dirty() || queue_changed {
-            self.queue_paths = queue.clone();
-            Some(vec![self.queue_section(&queue, cx)])
+            Some(vec![self.queue_section(&self.queue_paths, cx)])
         } else {
             None
         };
@@ -466,20 +477,20 @@ impl Render for QueueView {
                                     .text_color(theme.text)
                                     .child("Queue"),
                             )
-                            .when(total_secs > 0, |d| {
+                            .when(self.total_secs > 0, |d| {
                                 d.child(
                                     div()
                                         .flex_none()
                                         .text_size(px(theme.small_px()))
                                         .text_color(theme.text_faint)
-                                        .child(format_duration(Duration::from_secs(total_secs))),
+                                        .child(format_duration(Duration::from_secs(self.total_secs))),
                                 )
                             }),
                     )
                     .child(clear),
             );
 
-        if queue.is_empty() {
+        if queue_len == 0 {
             panel = panel.child(
                 div()
                     .flex_1()
@@ -501,7 +512,7 @@ impl Render for QueueView {
         // `top` is in window coordinates; the panel spans the tabs container,
         // whose top is the window's, so they coincide.
         if let Some(info) = drag_info {
-            let path = queue[info.grabbed].clone();
+            let path = self.queue_paths[info.grabbed].clone();
             let (title, artist) = self.entry_labels(&path, cx);
             let columns = self.list.rows().columns();
             panel = panel.child(

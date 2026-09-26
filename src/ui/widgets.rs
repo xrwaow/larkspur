@@ -4,8 +4,9 @@
 //! so a change to a section label or a panel header lands everywhere at once.
 
 use gpui::{
-    div, fill, linear_color_stop, linear_gradient, point, prelude::*, px, size, AnyElement,
-    Bounds, Hsla, Pixels, Rgba, ScrollWheelEvent, Window,
+    div, fill, linear_color_stop, linear_gradient, point, prelude::*, px, size, AnyElement, App,
+    Bounds, FocusHandle, Hsla, MouseDownEvent, MouseButton, Pixels, Rgba, ScrollWheelEvent,
+    Window,
 };
 
 use crate::ui::text_field::TextField;
@@ -117,7 +118,8 @@ pub fn edge_fade(background: Rgba, length: f32, side: Side) -> AnyElement {
 }
 
 /// A panel's top row: a title on the left (optionally with a leading button
-/// and a secondary line beneath it), a faint hint on the right.
+/// and a secondary line beneath it), optional header tools filling the middle
+/// (a filter box, action buttons), and a faint hint on the right.
 ///
 /// `title_px` carries the deliberate center/rail split: the center panels
 /// headline at `cell_px() + 2.0`, the rail bands stay at `cell_px()`.
@@ -129,6 +131,7 @@ pub fn panel_header(
     leading: Option<AnyElement>,
     subtitle: Option<&str>,
     hint: Option<(&str, Rgba)>,
+    tools: Option<AnyElement>,
 ) -> AnyElement {
     div()
         .flex()
@@ -165,7 +168,8 @@ pub fn panel_header(
                                     .child(subtitle.to_string()),
                             )
                         }),
-                ),
+                )
+                .when_some(tools, |d, tools| d.child(tools)),
         )
         .when_some(hint, |d, (hint, color)| {
             d.child(
@@ -179,16 +183,45 @@ pub fn panel_header(
         .into_any_element()
 }
 
-/// A rounded search box: the magnifier, the field's editable text, and an
-/// optional trailing button (a clear or help toggle). `accented` highlights
-/// the border — the search overlay marks its pinned-open cheat sheet with it.
+/// A rounded search box: the magnifier, the field's editable text, a dimmed
+/// `hint` while it's empty and unfocused, and — once there's text — either a
+/// `×` clear button (`on_clear`) or a custom `trailing` element. `accented`
+/// highlights the border — the search overlay marks its pinned-open cheat
+/// sheet with it.
+///
+/// `focus` is the handle that owns the field: it's tracked on the chrome, so
+/// clicking anywhere in the box focuses the field (and typing lands in it),
+/// while clicking anywhere else leaves it blurred.
+#[allow(clippy::too_many_arguments)]
 pub fn search_box(
     theme: Theme,
     field: &TextField,
+    focus: &FocusHandle,
     placeholder: Option<&str>,
     accented: bool,
+    hint: Option<&'static str>,
+    on_clear: Option<Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App) + 'static>>,
     trailing: Option<AnyElement>,
+    window: &Window,
 ) -> AnyElement {
+    let trailing = match on_clear {
+        Some(on_clear) if !field.is_empty() => Some(
+            div()
+                .flex_none()
+                .px_1()
+                .rounded_md()
+                .cursor_pointer()
+                .text_size(px(theme.small_px()))
+                .text_color(theme.text_faint)
+                .hover(|d| d.bg(theme.row_hover).text_color(theme.text))
+                .on_mouse_down(MouseButton::Left, move |event, window, cx| {
+                    on_clear(event, window, cx)
+                })
+                .child("×")
+                .into_any_element(),
+        ),
+        _ => trailing,
+    };
     let mut box_el = div()
         .flex()
         .items_center()
@@ -199,14 +232,17 @@ pub fn search_box(
         .bg(theme.row_odd)
         .border_1()
         .border_color(if accented { theme.accent } else { theme.border })
-        .child(
+        .track_focus(focus)
+        .child(field.render_text(theme, placeholder, focus, window));
+    if hint.is_some() && field.is_empty() && !focus.is_focused(window) {
+        box_el = box_el.child(
             div()
                 .flex_none()
-                .text_size(px(theme.cell_px()))
-                .text_color(theme.accent)
-                .child("⌕"),
-        )
-        .child(field.render_text(theme, placeholder));
+                .text_size(px(theme.small_px()))
+                .text_color(theme.text_faint)
+                .child(hint.unwrap().to_string()),
+        );
+    }
     if let Some(trailing) = trailing {
         box_el = box_el.child(trailing);
     }

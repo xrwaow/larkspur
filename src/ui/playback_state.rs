@@ -231,6 +231,13 @@ impl PlaybackState {
         self.controller.queue()
     }
 
+    /// The queue's generation — bumped on every change to its contents. The
+    /// queue view's cheap per-frame check, so it only snapshots the paths
+    /// (and re-sums the total time) when the queue actually moved.
+    pub fn queue_generation(&self) -> u64 {
+        self.controller.queue_generation()
+    }
+
     // --- actions -------------------------------------------------------
 
     pub fn toggle_play_pause(&mut self) {

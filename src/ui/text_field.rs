@@ -5,12 +5,20 @@
 //! reused by the search box, the settings path box, the inline playlist rename,
 //! and the playlist's add-songs search.
 //!
-//! It owns no focus: the surrounding view tracks focus and routes keys here.
+//! It owns no focus: the surrounding view creates a `FocusHandle` for the box,
+//! tracks it on the box chrome, and routes keys here only while that handle is
+//! focused — so a field never types unless it was actually selected (clicked,
+//! or focused by the chord that opens it), and the caret only draws then.
 //! Editing keys it understands (typing, backspace/delete, caret movement,
 //! `ctrl+a`, and the word/selection chords) are consumed; everything else
 //! (enter, escape, `ctrl+tab`, …) is left for the surrounding view.
 
-use gpui::{div, prelude::*, px, AnyElement, KeyDownEvent};
+use std::time::Duration;
+
+use gpui::{
+    div, prelude::*, px, Animation, AnimationExt, AnyElement, FocusHandle, KeyDownEvent, TextRun,
+    Window,
+};
 
 use crate::ui::theme::Theme;
 
@@ -211,7 +219,18 @@ impl TextField {
     }
 
     /// Render the box: the text with a caret and selection, or a placeholder.
-    pub fn render(&self, theme: Theme, placeholder: &str) -> AnyElement {
+    ///
+    /// `focus` is the handle the surrounding view tracks on the box chrome: the
+    /// caret and selection only draw while it holds window focus, and clicking
+    /// the chrome focuses it (gpui focuses `track_focus` elements on mouse
+    /// down), so a field never types unless it was actually selected.
+    pub fn render(
+        &self,
+        theme: Theme,
+        placeholder: &str,
+        focus: &FocusHandle,
+        window: &Window,
+    ) -> AnyElement {
         div()
             .flex()
             .items_center()
@@ -222,15 +241,29 @@ impl TextField {
             .bg(theme.row_odd)
             .border_1()
             .border_color(theme.border)
-            .child(self.render_text(theme, Some(placeholder)))
+            .track_focus(focus)
+            .child(self.render_text(theme, Some(placeholder), focus, window))
             .into_any_element()
     }
 
     /// Render just the editable text — the caret, selection, and placeholder —
     /// so a caller can wrap it in its own chrome (e.g. the search box).
-    pub fn render_text(&self, theme: Theme, placeholder: Option<&str>) -> AnyElement {
+    ///
+    /// The value is laid out as **one** text run with the caret overlaid at its
+    /// measured x position. Splitting the text around the caret (the old way)
+    /// shaped each side separately, which dropped the kerning across the
+    /// boundary — characters visibly shifted size as the caret moved past them.
+    pub fn render_text(
+        &self,
+        theme: Theme,
+        placeholder: Option<&str>,
+        focus: &FocusHandle,
+        window: &Window,
+    ) -> AnyElement {
         let caret_px = (theme.cell_px() + 2.0).max(10.0);
+        let focused = focus.is_focused(window);
         let mut row = div()
+            .relative()
             .flex_1()
             .min_w_0()
             .overflow_hidden()
@@ -240,7 +273,7 @@ impl TextField {
             .text_color(theme.text);
 
         match self.selection() {
-            Some((start, end)) => {
+            Some((start, end)) if focused => {
                 row = row
                     .child(self.value[..start].to_string())
                     .child(
@@ -253,26 +286,35 @@ impl TextField {
                     )
                     .child(self.value[end..].to_string());
             }
-            None => {
-                let (before, after) = self.value.split_at(self.caret.min(self.value.len()));
-                row = row
-                    .child(before.to_string())
-                    // The caret is drawn *over* the text rather than between it:
-                    // a zero-width, relatively-positioned wrapper holds an
-                    // absolutely-positioned bar, so moving the caret never nudges
-                    // the characters around it.
-                    .child(
-                        div().relative().flex_none().w(px(0.0)).h(px(caret_px)).child(
-                            div()
-                                .absolute()
-                                .top_0()
-                                .left_0()
-                                .w(px(2.0))
-                                .h(px(caret_px))
-                                .bg(theme.accent),
-                        ),
-                    )
-                    .child(after.to_string());
+            _ => {
+                row = row.child(self.value.clone());
+                if focused {
+                    let x = caret_x(&self.value, self.caret, theme, window);
+                    row = row.child(
+                        div()
+                            .absolute()
+                            .top_0()
+                            .bottom_0()
+                            .left(px(x))
+                            .flex()
+                            .items_center()
+                            .child(
+                                div()
+                                    .w(px(2.0))
+                                    .h(px(caret_px))
+                                    .bg(theme.accent)
+                                    // The standard caret blink: a beat on, a
+                                    // beat off, looping.
+                                    .with_animation(
+                                        "caret-blink",
+                                        Animation::new(Duration::from_millis(1100)).repeat(),
+                                        |bar, delta| {
+                                            bar.opacity(if delta < 0.5 { 1.0 } else { 0.0 })
+                                        },
+                                    ),
+                            ),
+                    );
+                }
                 if self.value.is_empty() {
                     if let Some(placeholder) = placeholder {
                         row = row.child(
@@ -288,6 +330,35 @@ impl TextField {
         }
         row.into_any_element()
     }
+}
+
+/// The x offset of `index` within `text`, shaped with the same font and size
+/// the field renders at — so the overlaid caret lands exactly between the
+/// characters it sits between.
+fn caret_x(text: &str, index: usize, theme: Theme, window: &Window) -> f32 {
+    if text.is_empty() {
+        return 0.0;
+    }
+    let run = TextRun {
+        len: text.len(),
+        font: gpui::font(theme.font),
+        color: theme.text.into(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    window
+        .text_system()
+        .shape_text(
+            text.to_string().into(),
+            px(theme.cell_px()),
+            &[run],
+            None,
+            None,
+        )
+        .ok()
+        .and_then(|lines| lines.first().map(|line| f32::from(line.unwrapped_layout.x_for_index(index))))
+        .unwrap_or(0.0)
 }
 
 /// The previous char boundary before `at`.

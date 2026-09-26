@@ -477,8 +477,9 @@ const QUEUE_POLYGONS: &[&[(f32, f32)]] = &[
 ];
 
 /// A fixed-size canvas painting filled polygons given in unit-square
-/// coordinates, scaled into the element's bounds.
-fn icon(
+/// coordinates, scaled into the element's bounds. Shared by the transport's
+/// buttons and the library's shuffle glyph.
+pub(crate) fn icon(
     w: f32,
     h: f32,
     polygons: &'static [&'static [(f32, f32)]],

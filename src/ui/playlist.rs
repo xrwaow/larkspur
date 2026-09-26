@@ -289,7 +289,6 @@ impl Render for PlaylistView {
             panel = panel.child(
                 div()
                     .w_full()
-                    .track_focus(&self.add_focus)
                     .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                         if this.add_query.handle_routed(event, cx) {
                             this.recompute_add(cx);
@@ -297,7 +296,7 @@ impl Render for PlaylistView {
                             cx.notify();
                         }
                     }))
-                    .child(self.add_query.render(theme, "Search the library to add…")),
+                    .child(self.add_query.render(theme, "Search the library to add…", &self.add_focus, window)),
             );
 
             root = root.child(panel);

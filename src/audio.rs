@@ -215,6 +215,10 @@ pub struct PlaybackController {
     _device_sink: MixerDeviceSink, // must outlive the player or audio stops
     player: Player,
     queue: Vec<PathBuf>,
+    /// Bumped on every change to the queue's contents — the UI's cheap "did
+    /// the queue move" check, so the queue view can skip snapshotting
+    /// thousands of paths every frame.
+    queue_generation: u64,
     current: Option<usize>,
     pub metadata: SongMetadata,
     pub duration: Duration,
@@ -233,6 +237,9 @@ impl PlaybackController {
             _device_sink: device_sink,
             player,
             queue,
+            // The constructor's queue counts as change #1, so a queue view
+            // built after this always snapshots it on its first render.
+            queue_generation: 1,
             current: None,
             metadata: SongMetadata::placeholder(),
             duration: Duration::ZERO,
@@ -259,6 +266,7 @@ impl PlaybackController {
         let start = start.min(queue.len() - 1);
         let parts = Self::track_parts(&queue[start])?;
         self.queue = queue;
+        self.queue_generation += 1;
         self.start_track(start, parts);
         Ok(())
     }
@@ -401,6 +409,11 @@ impl PlaybackController {
         (&self.queue, self.current)
     }
 
+    /// The queue's generation — bumped on every change to its contents.
+    pub fn queue_generation(&self) -> u64 {
+        self.queue_generation
+    }
+
     /// Start playing the queue entry at `index` — how the UI's queue view
     /// jumps to a row.
     pub fn play_index(&mut self, index: usize) -> anyhow::Result<()> {
@@ -417,6 +430,7 @@ impl PlaybackController {
         anyhow::ensure!(!paths.is_empty(), "no tracks to queue");
         let first = self.queue.len();
         self.queue.extend(paths);
+        self.queue_generation += 1;
         if self.current.is_none() && self.player.empty() {
             let parts = Self::track_parts(&self.queue[first])?;
             self.start_track(first, parts);
@@ -437,7 +451,9 @@ impl PlaybackController {
     pub fn remove_from_queue(&mut self, paths: &[PathBuf]) -> bool {
         let before = self.queue.len();
         let Some(current) = self.current else {
+            let before = self.queue.len();
             self.queue.retain(|path| !paths.contains(path));
+            self.queue_generation += (self.queue.len() != before) as u64;
             return false;
         };
         let loaded_removed = paths.contains(&self.queue[current]);
@@ -447,6 +463,7 @@ impl PlaybackController {
         if self.queue.len() == before {
             return false;
         }
+        self.queue_generation += 1;
         if loaded_removed {
             if current < self.queue.len() {
                 // The next surviving entry took the removed slot: play it.
@@ -491,6 +508,7 @@ impl PlaybackController {
         }
         let entry = self.queue.remove(from);
         self.queue.insert(to, entry);
+        self.queue_generation += 1;
         // Re-point the loaded track at its entry's new slot; entries between
         // the two slots shift by one to make room.
         if let Some(current) = self.current {
@@ -511,6 +529,7 @@ impl PlaybackController {
     /// track keeps playing; the queue just won't advance past it, and
     /// anything appended afterwards starts from its first entry.
     pub fn clear_queue(&mut self) {
+        self.queue_generation += (!self.queue.is_empty()) as u64;
         self.queue.clear();
         self.current = None;
     }

@@ -25,7 +25,7 @@ pub use config::{Config, DynamicBase, FontKind, ThemeKind, WindowPlacement};
 pub use cover::{CoverCache, DecodedImage};
 pub use identity::{generate_song_id, SongId};
 pub use input::InputAction;
-pub use library::{Library, Release};
+pub use library::{shuffle, Library, Release};
 pub use lyrics::{parse_lrc, LyricLine, Lyrics};
 pub use playlist::{Playlist, PlaylistId, PlaylistKind, PlaylistMeta, PlaylistOrigin};
 pub use scan::{LibraryCache, SyncReport};

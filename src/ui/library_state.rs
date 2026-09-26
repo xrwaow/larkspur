@@ -23,7 +23,8 @@ use std::path::{Path, PathBuf};
 
 use gpui::{Context, Entity, Subscription};
 
-use crate::model::{Library, LibraryCache, PlaylistId, SongId};
+use crate::model::search::Query;
+use crate::model::{shuffle, Library, LibraryCache, Order, PlaylistId, Scope, Selection, SongId};
 use crate::ui::config_state::ConfigState;
 use crate::ui::menu::SongMenuRequest;
 use crate::ui::playback_state::PlaybackState;
@@ -367,6 +368,24 @@ impl LibraryState {
             .map(|playlist| playlist.song_ids.clone())
             .unwrap_or_default();
         self.play(&songs, start, playback, cx);
+    }
+
+    /// Replace the play queue with `scope`'s songs, shuffled — the whole
+    /// library, or one artist's discography. The order the scope yields is
+    /// irrelevant; the shuffle decides the sequence.
+    pub fn play_shuffled(
+        &self,
+        scope: Scope,
+        playback: &Entity<PlaybackState>,
+        cx: &mut Context<Self>,
+    ) {
+        let mut songs = self.library.select_songs(&Selection {
+            scope,
+            query: Query::default(),
+            order: Order::TrackOrder,
+        });
+        shuffle(&mut songs);
+        self.play(&songs, 0, playback, cx);
     }
 
     /// Replace the play queue with `songs`, starting at `start`. Nothing is

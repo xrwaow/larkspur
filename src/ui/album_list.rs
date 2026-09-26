@@ -16,7 +16,7 @@ use std::rc::Rc;
 use gpui::{prelude::*, Context, Entity, KeyDownEvent, Render, ScrollWheelEvent, Subscription, Window};
 
 use crate::model::select::{Order, Scope, Selection};
-use crate::model::{InputAction, Library, PlaylistId};
+use crate::model::{search, InputAction, Library, PlaylistId};
 use crate::ui::albums::{self, AlbumSection, RowActions};
 use crate::ui::animation::Animator;
 use crate::ui::cover_store::CoverStore;
@@ -58,7 +58,7 @@ impl Source {
                 library,
                 library.select(&Selection {
                     scope: Scope::Artist(artist.clone()),
-                    query: crate::model::search::Query::default(),
+                    query: search::Query::default(),
                     order: Order::NewestFirst,
                 }),
             ),
@@ -66,6 +66,38 @@ impl Source {
                 .iter()
                 .filter_map(|id| albums::section_for_playlist(library, *id))
                 .collect(),
+        }
+    }
+
+    /// [`sections`](Self::sections) with `query` filtering the songs *within*
+    /// the scope — the header filter box's live filter. The library scope
+    /// runs the query engine over the whole library; an artist scope filters
+    /// their discography, keeping its newest-first order. A folder's playlists
+    /// are shown as-is — its view offers no box.
+    pub fn sections_with(&self, library: &Library, query: &search::Query) -> Vec<AlbumSection> {
+        let groups = match self {
+            Source::Library => search::search(library, query),
+            Source::Artist(artist) => library.select(&Selection {
+                scope: Scope::Artist(artist.clone()),
+                query: query.clone(),
+                order: Order::NewestFirst,
+            }),
+            Source::Playlists(ids) => {
+                return ids
+                    .iter()
+                    .filter_map(|id| albums::section_for_playlist(library, *id))
+                    .collect();
+            }
+        };
+        albums::sections_from_groups(library, groups)
+    }
+
+    /// The model scope this source draws from — what a shuffle button plays.
+    pub fn scope(&self) -> Scope {
+        match self {
+            Source::Library => Scope::Library,
+            Source::Artist(artist) => Scope::Artist(artist.clone()),
+            Source::Playlists(ids) => Scope::Playlists(ids.clone()),
         }
     }
 }
@@ -115,6 +147,12 @@ impl AlbumListView {
 
     pub fn rows_mut(&mut self) -> &mut RowList {
         &mut self.rows
+    }
+
+    /// Switch what a plain click plays — the library's filter box toggles
+    /// between whole albums (unfiltered) and the matched songs only.
+    pub fn set_play(&mut self, play: Play) {
+        self.play = play;
     }
 
     /// Remember `revision` and mark the rows stale. Returns whether this was

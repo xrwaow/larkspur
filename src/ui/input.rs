@@ -26,6 +26,7 @@ pub fn action_for_key(keystroke: &Keystroke) -> Option<InputAction> {
         }),
         "w" if modifiers.control => Some(InputAction::CloseTab),
         "f" if modifiers.control && modifiers.shift => Some(InputAction::ToggleSearch),
+        "f" if modifiers.control => Some(InputAction::FocusSearch),
         "escape" => Some(InputAction::CloseOverlay),
         "left" => Some(InputAction::SeekBackward),
         "right" => Some(InputAction::SeekForward),

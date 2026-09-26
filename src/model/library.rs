@@ -1,4 +1,5 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap};
+use std::hash::{BuildHasher, Hasher};
 use std::path::PathBuf;
 
 use super::identity::SongId;
@@ -558,6 +559,20 @@ impl Library {
     }
 }
 
+/// Shuffle `items` in place — Fisher–Yates driven by a xorshift64\* seeded
+/// from the hasher's per-process randomness. One shuffle button doesn't
+/// warrant a `rand` dependency.
+pub fn shuffle<T>(items: &mut [T]) {
+    let mut state = std::collections::hash_map::RandomState::new().build_hasher().finish() | 1;
+    for i in (1..items.len()).rev() {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let j = (state.wrapping_mul(0x2545_F491_4F6C_DD1D) % (i as u64 + 1)) as usize;
+        items.swap(i, j);
+    }
+}
+
 /// Artists credited anywhere in the library, deduped — used by tests.
 #[cfg(test)]
 fn artist_set(library: &Library) -> std::collections::BTreeSet<String> {
@@ -884,5 +899,16 @@ mod tests {
         lib.insert_song(tagged(2, "B", "Amy", "Album", 2));
         lib.insert_song(tagged(3, "C", "Zed", "Other", 1));
         assert_eq!(artist_set(&lib), BTreeSet::from(["Amy".to_string(), "Zed".to_string()]));
+    }
+
+    #[test]
+    fn shuffle_keeps_every_item_but_rarely_the_order() {
+        let mut items: Vec<u32> = (0..64).collect();
+        let original = items.clone();
+        shuffle(&mut items);
+        let mut sorted = items.clone();
+        sorted.sort_unstable();
+        assert_eq!(sorted, original, "a shuffle is a permutation");
+        assert_ne!(items, original, "64 items don't shuffle back to identity");
     }
 }

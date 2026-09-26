@@ -47,6 +47,11 @@ pub struct SearchView {
     help_open: bool,
     warnings: Vec<String>,
     focus_handle: FocusHandle,
+    /// The query box's own focus handle — what `ctrl+shift+f` focuses when the
+    /// overlay opens, so typing lands in the box right away. Clicking a result
+    /// row focuses the overlay root instead, which blurs the box: from then on
+    /// `space` pauses playback again until the box is re-selected.
+    input_focus: FocusHandle,
     /// No playback observer — the overlay re-renders with focus changes
     /// anyway; it reads playback while it renders.
     _observe: AlbumListSubs,
@@ -75,13 +80,15 @@ impl SearchView {
             help_open: false,
             warnings: Vec::new(),
             focus_handle: cx.focus_handle(),
+            input_focus: cx.focus_handle(),
             _observe: observe,
         }
     }
 
-    /// The focus handle the tab container hands focus to when it opens search.
+    /// The focus handle the tab container hands focus to when it opens search:
+    /// the query box itself, so it's selected and ready to type in.
     pub fn focus_handle_for_window(&self) -> FocusHandle {
-        self.focus_handle.clone()
+        self.input_focus.clone()
     }
 
     /// Parse and run the current input.
@@ -158,11 +165,14 @@ impl Render for SearchView {
 
         let mut root = div()
             .track_focus(&self.focus_handle)
-            .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
+            .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 // The box owns plain typing and editing keys, including the
-                // selection chords and paste. `escape` and unhandled command
-                // chords (`ctrl+tab`, `ctrl+shift+f`, …) bubble to the tab
-                // container.
+                // selection chords and paste — but only while it's focused.
+                // Blurred (a result row was clicked), keys bubble: `space`
+                // pauses, `enter` plays the selection. `escape` and unhandled
+                // command chords (`ctrl+tab`, `ctrl+shift+f`, …) always bubble
+                // to the tab container.
+                let field_focused = this.input_focus.is_focused(window);
                 if event.keystroke.key == "escape" {
                     return;
                 }
@@ -182,8 +192,9 @@ impl Render for SearchView {
                     }
                 }
                 if event.keystroke.key == "enter" {
-                    // A changed query runs; an unchanged one plays the selection.
-                    if this.input.value != this.submitted {
+                    // A changed query runs — but only from the box; elsewhere
+                    // enter just plays the selection.
+                    if field_focused && this.input.value != this.submitted {
                         this.submit(cx);
                     } else {
                         this.list.dispatch(InputAction::Activate, cx);
@@ -191,7 +202,7 @@ impl Render for SearchView {
                     cx.stop_propagation();
                     return;
                 }
-                if this.input.handle_routed(event, cx) {
+                if field_focused && this.input.handle_routed(event, cx) {
                     cx.stop_propagation();
                     cx.notify();
                 }
@@ -208,6 +219,7 @@ impl Render for SearchView {
                 None,
                 None,
                 Some((&summary, hint_color)),
+                None,
             ));
 
         if sections.is_empty() {
@@ -238,8 +250,11 @@ impl Render for SearchView {
                 .child(search_box(
                     theme,
                     &self.input,
+                    &self.input_focus,
                     Some("artist:sinatra year:>=2000"),
                     self.help_open,
+                    None,
+                    None,
                     Some(
                         div()
                             .id("search-help")
@@ -252,6 +267,7 @@ impl Render for SearchView {
                             .child("?")
                             .into_any_element(),
                     ),
+                    window,
                 )),
         )
     }

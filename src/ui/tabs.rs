@@ -381,7 +381,10 @@ impl TabsView {
         }
     }
 
-    fn dispatch(&mut self, action: InputAction, window: &mut Window, cx: &mut Context<Self>) {
+    /// Apply an `InputAction` at the center: tab switching/closing here, and
+    /// everything else (transport keys) to playback. Also the fallback hub for
+    /// keys that bubble out of the rail with nothing focused.
+    pub fn dispatch(&mut self, action: InputAction, window: &mut Window, cx: &mut Context<Self>) {
         match action {
             InputAction::NextTab => self.step_tab(true, window, cx),
             InputAction::PrevTab => self.step_tab(false, window, cx),
@@ -391,6 +394,19 @@ impl TabsView {
                 } else {
                     self.open_search(window, cx);
                 }
+            }
+            // `ctrl+f`: re-select the search panel's box when it's up,
+            // otherwise the library tab's filter box — switching to the tab if
+            // it isn't the active one.
+            InputAction::FocusSearch => {
+                if self.search_open {
+                    let focus = self.search.read(cx).focus_handle_for_window();
+                    window.focus(&focus);
+                } else {
+                    self.activate(TabId::Browse, window, cx);
+                    self.browse.update(cx, |browse, cx| browse.focus_search(window, cx));
+                }
+                cx.notify();
             }
             InputAction::CloseOverlay => {
                 if self.settings_open {

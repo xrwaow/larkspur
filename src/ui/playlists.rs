@@ -5,7 +5,8 @@
 //! its discography (the album playlists it appears on), since an artist is a
 //! *list* of playlists, not one playlist. Albums, Artists, and Folder View are
 //! collapsible groups, all folded shut at launch; the folder view expands
-//! directory by directory, straight from the filesystem.
+//! directory by directory, straight from the filesystem. The Albums and
+//! Artists groups each carry their own filter box, scoped to that group.
 //!
 //! Custom playlists are edited here: right-clicking one opens a menu to rename
 //! or delete it, and renaming happens inline. The settings button in the header
@@ -25,14 +26,15 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui::{
-    div, list, prelude::*, px, AnyElement, App, ClickEvent, Context, ElementId, Entity,
-    FocusHandle, KeyDownEvent, ListAlignment, ListState, MouseButton, MouseDownEvent, Pixels,
-    Point, Render, Subscription, Window,
+    canvas, div, list, point, prelude::*, px, AnyElement, App, ClickEvent, Context, ElementId,
+    Entity, FocusHandle, KeyDownEvent, ListAlignment, ListState, MouseButton, MouseDownEvent,
+    Pixels, Point, Render, Subscription, Window,
 };
 
-use crate::model::PlaylistId;
+use crate::model::{Playlist, PlaylistId};
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
+use crate::ui::input::action_for_key;
 use crate::ui::library_state::{subdirs, LibraryState};
 use crate::ui::menu::{context_menu, MenuHandler};
 use crate::ui::row_list::OVERDRAW_PX;
@@ -53,6 +55,46 @@ enum MenuTarget {
     Folder(PathBuf),
 }
 
+/// Which group a filter box (or a fold) belongs to.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RailFilter {
+    Albums,
+    Artists,
+}
+
+/// One filterable group's search box: the field, its focus handle, whether the
+/// group is unfolded, and the box's chrome text.
+struct GroupFilter {
+    field: TextField,
+    focus: FocusHandle,
+    open: bool,
+    placeholder: &'static str,
+    hint: Option<&'static str>,
+}
+
+impl GroupFilter {
+    fn new(placeholder: &'static str, hint: Option<&'static str>, cx: &mut App) -> Self {
+        Self { field: TextField::default(), focus: cx.focus_handle(), open: false, placeholder, hint }
+    }
+
+    /// The lowercased query — empty matches everything.
+    fn query(&self) -> String {
+        self.field.value.trim().to_lowercase()
+    }
+
+    /// Whether the group's rows show: unfolded, or a filter needs to reveal
+    /// what the fold is hiding.
+    fn showing(&self) -> bool {
+        self.open || !self.field.is_empty()
+    }
+}
+
+/// The row filter a group's query builds: an empty query matches everything,
+/// so one closure serves filtered and unfiltered builds alike.
+fn query_matches(query: &str) -> impl Fn(&str) -> bool + '_ {
+    move |text: &str| query.is_empty() || text.to_lowercase().contains(query)
+}
+
 pub struct PlaylistsView {
     library: Entity<LibraryState>,
     /// Clicking a playlist opens it as a tab in the center — the rail is how
@@ -61,21 +103,22 @@ pub struct PlaylistsView {
     /// The synced-path list for the folder view lives here.
     config: Entity<ConfigState>,
     themed: Themed,
-    expanded_artist: Option<String>,
-    /// Whether the Albums, Artists, and Folder View groups are expanded. All
-    /// three are dropdowns, folded shut at launch; a filter overrides Albums
-    /// and Artists (a search must be able to reveal matches in a collapsed
-    /// group).
-    albums_open: bool,
-    artists_open: bool,
+    /// Whether the Folder View group is expanded (folded shut at launch). The
+    /// Albums and Artists groups' folds live in their [`GroupFilter`]s — a
+    /// filter overrides the fold, so a search reveals what it's hiding.
     folder_open: bool,
     /// The directories the folder view has expanded, subtree by subtree.
     open_dirs: HashSet<PathBuf>,
-    /// The text filtering the Albums and Artists groups (custom playlists and
-    /// the folder view are never filtered).
-    filter: TextField,
-    /// The playlist being renamed inline, and its edit buffer.
-    renaming: Option<(PlaylistId, TextField)>,
+    /// The Albums and Artists groups' filter boxes, scoped to their group
+    /// (custom playlists and the folder view are never filtered).
+    album_filter: GroupFilter,
+    artist_filter: GroupFilter,
+    /// The artists whose discography is unfolded — several at once, so
+    /// expanding one never folds another.
+    expanded_artists: HashSet<String>,
+    /// The playlist being renamed inline, its edit buffer, and the buffer's
+    /// focus handle (focused when the rename starts, so typing lands there).
+    renaming: Option<(PlaylistId, TextField, FocusHandle)>,
     /// The open right-click menu, if any.
     menu: Option<RailMenu>,
     focus_handle: FocusHandle,
@@ -106,12 +149,11 @@ impl PlaylistsView {
             tabs,
             config,
             themed,
-            expanded_artist: None,
-            albums_open: false,
-            artists_open: false,
             folder_open: false,
             open_dirs: HashSet::new(),
-            filter: TextField::default(),
+            album_filter: GroupFilter::new("Filter albums…", None, cx),
+            artist_filter: GroupFilter::new("Filter artists…", None, cx),
+            expanded_artists: HashSet::new(),
             renaming: None,
             menu: None,
             focus_handle: cx.focus_handle(),
@@ -122,9 +164,25 @@ impl PlaylistsView {
         }
     }
 
+    /// The filter box of `which`, for reads.
+    fn filter(&self, which: RailFilter) -> &GroupFilter {
+        match which {
+            RailFilter::Albums => &self.album_filter,
+            RailFilter::Artists => &self.artist_filter,
+        }
+    }
+
+    /// The filter box of `which`, for edits.
+    fn filter_mut(&mut self, which: RailFilter) -> &mut GroupFilter {
+        match which {
+            RailFilter::Albums => &mut self.album_filter,
+            RailFilter::Artists => &mut self.artist_filter,
+        }
+    }
+
     /// Commit the inline rename, if one is open.
     fn commit_rename(&mut self, cx: &mut Context<Self>) {
-        if let Some((id, field)) = self.renaming.take() {
+        if let Some((id, field, _)) = self.renaming.take() {
             let title = field.value.trim().to_string();
             if !title.is_empty() {
                 self.library.update(cx, |state, cx| state.rename_playlist(id, title, cx));
@@ -145,92 +203,72 @@ impl PlaylistsView {
     /// never per frame — the row *data* is cheap, but rebuilding it (and its
     /// elements) every frame is what made the rail dominate frame time.
     fn build_rows(&self, cx: &Context<Self>) -> Vec<RailRow> {
-        let (custom, albums, artists, discography) = {
-            let state = self.library.read(cx);
-            let lib = state.library();
-
-            let custom: Vec<Row> = lib
-                .custom_playlists()
-                .iter()
-                .map(|p| Row { id: p.id, title: p.meta().title, count: p.len() })
-                .collect();
-            let albums: Vec<Row> = lib
-                .playlists()
-                .iter()
-                .filter(|p| !p.is_custom())
-                .map(|p| Row { id: p.id, title: p.meta().title, count: p.len() })
-                .collect();
-            let artists = lib.artists();
-
-            let discography: Vec<Row> = self
-                .expanded_artist
-                .as_ref()
-                .map(|artist| {
-                    lib.discography(artist)
-                        .into_iter()
-                        .filter_map(|id| lib.playlist(id))
-                        .map(|p| Row { id: p.id, title: p.meta().title, count: p.len() })
-                        .collect()
-                })
-                .unwrap_or_default();
-
-            (custom, albums, artists, discography)
-        };
-
-        // The filter narrows the Albums and Artists groups only — custom
-        // playlists are few and deliberately always visible. An empty query
-        // matches everything, so one code path serves both modes.
-        let query = self.filter.value.trim().to_lowercase();
-        let filtering = !query.is_empty();
-        let matches = |text: &str| text.to_lowercase().contains(&query);
-        let albums: Vec<Row> = albums.into_iter().filter(|r| matches(&r.title)).collect();
-        let artists: Vec<String> = artists.into_iter().filter(|n| matches(n)).collect();
-        let discography: Vec<Row> =
-            discography.into_iter().filter(|r| matches(&r.title)).collect();
-
-        // A filter overrides a collapsed group: searching must reveal what a
-        // dropdown is hiding.
-        let show_albums = filtering || self.albums_open;
-        let show_artists = filtering || self.artists_open;
+        let state = self.library.read(cx);
+        let lib = state.library();
+        let row_of = |p: &Playlist| Row { id: p.id, title: p.meta().title, count: p.len() };
 
         let mut rows: Vec<RailRow> = Vec::new();
 
         rows.push(RailRow::Header("Playlists"));
         rows.push(RailRow::NewPlaylist);
+        let custom = lib.custom_playlists();
         if custom.is_empty() {
             rows.push(RailRow::NoCustom);
         }
-        for row in custom {
+        for playlist in custom {
             // The row being renamed shows an editable field instead of a label.
-            if self.renaming.as_ref().is_some_and(|(renaming, _)| *renaming == row.id) {
+            if self.renaming.as_ref().is_some_and(|(id, _, _)| *id == playlist.id) {
                 rows.push(RailRow::Rename);
             } else {
-                rows.push(RailRow::Custom(row));
+                rows.push(RailRow::Custom(row_of(playlist)));
             }
         }
 
-        rows.push(RailRow::GroupHeader { label: "Albums", open: show_albums });
-        if show_albums {
-            if filtering && albums.is_empty() {
+        // Each group has its own filter box, scoped to that group only —
+        // custom playlists are few and deliberately always visible, and the
+        // folder view ignores filters too. A filter overrides its group's
+        // collapse: searching must reveal what the fold is hiding.
+        let (album_query, artist_query) = (self.album_filter.query(), self.artist_filter.query());
+        let (album_matches, artist_matches) =
+            (query_matches(&album_query), query_matches(&artist_query));
+        let albums: Vec<Row> = lib
+            .playlists()
+            .iter()
+            .filter(|p| !p.is_custom() && album_matches(&p.meta().title))
+            .map(|p| row_of(p))
+            .collect();
+        rows.push(RailRow::GroupHeader { label: "Albums", open: self.album_filter.showing() });
+        if self.album_filter.showing() {
+            rows.push(RailRow::FilterBox(RailFilter::Albums));
+            if !album_query.is_empty() && albums.is_empty() {
                 rows.push(RailRow::NoMatches);
             }
-            for row in albums {
-                rows.push(RailRow::Album(row));
-            }
+            rows.extend(albums.into_iter().map(RailRow::Album));
         }
 
-        rows.push(RailRow::GroupHeader { label: "Artists", open: show_artists });
-        if show_artists {
-            if filtering && artists.is_empty() {
+        rows.push(RailRow::GroupHeader { label: "Artists", open: self.artist_filter.showing() });
+        if self.artist_filter.showing() {
+            rows.push(RailRow::FilterBox(RailFilter::Artists));
+            let all_artists = lib.artists();
+            let artists: Vec<&str> = all_artists
+                .iter()
+                .map(String::as_str)
+                .filter(|name| artist_matches(name))
+                .collect();
+            if !artist_query.is_empty() && artists.is_empty() {
                 rows.push(RailRow::NoMatches);
             }
             for (index, artist) in artists.into_iter().enumerate() {
-                let expanded = self.expanded_artist.as_deref() == Some(artist.as_str());
-                rows.push(RailRow::Artist { index, name: artist, expanded });
+                let expanded = self.expanded_artists.contains(artist);
+                rows.push(RailRow::Artist { index, name: artist.to_string(), expanded });
                 if expanded {
-                    for row in &discography {
-                        rows.push(RailRow::Discography(row.clone()));
-                    }
+                    rows.extend(
+                        lib.discography(artist)
+                            .into_iter()
+                            .filter_map(|id| lib.playlist(id))
+                            .filter(|p| artist_matches(&p.meta().title))
+                            .map(|p| RailRow::Discography(row_of(p))),
+                    );
                 }
             }
         }
@@ -253,71 +291,103 @@ impl PlaylistsView {
     fn render_row(
         &mut self,
         theme: Theme,
-        ix: usize,
-        row: &RailRow,
+        kind: &RailRow,
         selected: Option<PlaylistId>,
+        window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
-        // Every row carries the list's item spacing, matching the gap the old
-        // unvirtualized column had between children.
-        let row = match row {
+        match kind {
             RailRow::Header(label) => section_header(theme, label),
             RailRow::GroupHeader { label, open } => {
                 let toggled = *label;
-                group_header(
-                    theme,
-                    *label,
-                    *open,
-                    cx.listener(move |this, _event, _window, cx| {
+                let group = match toggled {
+                    "Albums" => 0u64,
+                    "Artists" => 1u64,
+                    _ => 2u64,
+                };
+                div()
+                    .id(("group-header", group))
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .px_2()
+                    .pt_2()
+                    .pb_1()
+                    .rounded_md()
+                    .cursor_pointer()
+                    .hover(|d| d.bg(theme.row_hover))
+                    .on_click(cx.listener(move |this, _event, _window, cx| {
                         match toggled {
-                            "Albums" => this.albums_open = !this.albums_open,
-                            "Artists" => this.artists_open = !this.artists_open,
+                            "Albums" => this.album_filter.open = !this.album_filter.open,
+                            "Artists" => this.artist_filter.open = !this.artist_filter.open,
                             _ => this.folder_open = !this.folder_open,
                         }
                         this.dirty = true;
                         cx.notify();
-                    }),
-                )
+                    }))
+                    .child(
+                        div()
+                            .text_size(px(theme.small_px()))
+                            .text_color(theme.text_faint)
+                            .child(toggled.to_string()),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_size(px(theme.small_px()))
+                            .text_color(theme.text_faint)
+                            .child(if *open { "▾" } else { "▸" }),
+                    )
+                    .into_any_element()
             }
-            RailRow::NewPlaylist => nav_row(
+            RailRow::NewPlaylist => rail_row(
                 theme,
-                ix,
                 ("new-playlist", 0u64),
                 "+  New Playlist".to_string(),
                 None,
                 false,
-                false,
-                cx.listener(|this, _event, window, cx| {
+                0,
+                Branch::Plain,
+                Some(cx.listener(|this, _event, window, cx| {
                     let id = this.library.update(cx, |state, cx| state.new_playlist(cx));
                     this.tabs.update(cx, |tabs, cx| tabs.open_playlist(id, window, cx));
-                }),
+                })),
             ),
             RailRow::NoCustom => empty_hint(theme, "No custom playlists yet", false),
             RailRow::Rename => {
-                let field = &self.renaming.as_ref().expect("rename row without a rename").1;
-                rename_row(theme, field)
+                let (_, field, focus) =
+                    self.renaming.as_ref().expect("rename row without a rename");
+                div()
+                    .pb_1()
+                    .child(field.render(theme, "Playlist name", focus, window))
+                    .into_any_element()
             }
-            RailRow::Custom(row) => {
+            RailRow::Custom(row) | RailRow::Album(row) | RailRow::Discography(row) => {
+                // All three open the playlist they stand for; a custom one
+                // additionally takes a right-click menu, and a discography row
+                // hangs off its artist's guide line.
                 let id = row.id;
-                let row_el = nav_row(
+                let (name, depth) = match kind {
+                    RailRow::Custom(_) => ("custom", 0),
+                    RailRow::Album(_) => ("album", 0),
+                    _ => ("discography", 1),
+                };
+                let row_el = rail_row(
                     theme,
-                    ix,
-                    ("custom", id.0),
+                    (name, id.0),
                     row.title.clone(),
                     Some(row.count),
                     selected == Some(id),
-                    false,
-                    cx.listener(move |this, _event, window, cx| {
+                    depth,
+                    Branch::Plain,
+                    Some(cx.listener(move |this, _event, window, cx| {
                         this.tabs.update(cx, |tabs, cx| tabs.open_playlist(id, window, cx));
-                    }),
+                    })),
                 );
-                div()
-                    .id(("custom-menu-target", id.0))
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .on_mouse_down(
-                        MouseButton::Right,
+                if matches!(kind, RailRow::Custom(_)) {
+                    right_click_target(
+                        ("custom-menu-target", id.0),
+                        row_el,
                         cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
                             this.menu = Some(RailMenu {
                                 position: event.position,
@@ -326,61 +396,51 @@ impl PlaylistsView {
                             cx.notify();
                         }),
                     )
-                    .child(row_el)
+                } else {
+                    row_el
+                }
+            }
+            RailRow::FilterBox(which) => {
+                let which = *which;
+                let filter = self.filter(which);
+                div()
+                    .pb_1()
+                    .child(search_box(
+                        theme,
+                        &filter.field,
+                        &filter.focus,
+                        Some(filter.placeholder),
+                        false,
+                        filter.hint,
+                        Some(Box::new(cx.listener(move |this, _event, _window, cx| {
+                            this.filter_mut(which).field.clear();
+                            this.dirty = true;
+                            cx.notify();
+                        }))),
+                        None,
+                        window,
+                    ))
                     .into_any_element()
             }
-            RailRow::Album(row) => {
-                let id = row.id;
-                nav_row(
-                    theme,
-                    ix,
-                    ("album", id.0),
-                    row.title.clone(),
-                    Some(row.count),
-                    selected == Some(id),
-                    false,
-                    cx.listener(move |this, _event, window, cx| {
-                        this.tabs.update(cx, |tabs, cx| tabs.open_playlist(id, window, cx));
-                    }),
-                )
-            }
             RailRow::Artist { index, name, expanded } => {
-                let expanded = *expanded;
-                let label = if expanded { format!("▾  {name}") } else { format!("▸  {name}") };
                 let toggled = name.clone();
-                nav_row(
+                rail_row(
                     theme,
-                    ix,
                     ("artist", *index as u64),
-                    label,
+                    name.clone(),
                     None,
                     false,
-                    false,
-                    cx.listener(move |this, _event, _window, cx| {
-                        this.expanded_artist =
-                            if this.expanded_artist.as_deref() == Some(toggled.as_str()) {
-                                None
-                            } else {
-                                Some(toggled.clone())
-                            };
+                    0,
+                    Branch::Toggle(*expanded),
+                    Some(cx.listener(move |this, _event, _window, cx| {
+                        // Several artists stay unfolded at once; clicking one
+                        // never folds another.
+                        if !this.expanded_artists.remove(&toggled) {
+                            this.expanded_artists.insert(toggled.clone());
+                        }
                         this.dirty = true;
                         cx.notify();
-                    }),
-                )
-            }
-            RailRow::Discography(row) => {
-                let id = row.id;
-                nav_row(
-                    theme,
-                    ix,
-                    ("discography", id.0),
-                    row.title.clone(),
-                    Some(row.count),
-                    selected == Some(id),
-                    true,
-                    cx.listener(move |this, _event, window, cx| {
-                        this.tabs.update(cx, |tabs, cx| tabs.open_playlist(id, window, cx));
-                    }),
+                    })),
                 )
             }
             RailRow::Folder { path, depth, expanded, has_children } => {
@@ -391,42 +451,39 @@ impl PlaylistsView {
                     _ => path.display().to_string(),
                 };
                 let toggled = path.clone();
-                let row_el = folder_row(
+                let row_el = rail_row(
                     theme,
-                    ix,
-                    path_hash(path),
+                    ("folder", path_hash(path)),
                     label,
+                    None,
+                    false,
                     *depth,
-                    *expanded,
-                    *has_children,
-                    cx.listener(move |this, _event, _window, cx| {
+                    // A leaf keeps the trunk line running through it; only
+                    // the chevron marks what can unfold.
+                    if *has_children { Branch::Toggle(*expanded) } else { Branch::Line },
+                    Some(cx.listener(move |this, _event, _window, cx| {
                         if !this.open_dirs.remove(&toggled) {
                             this.open_dirs.insert(toggled.clone());
                         }
                         this.dirty = true;
                         cx.notify();
-                    }),
+                    })),
                 );
                 let target = path.clone();
-                div()
-                    .id(("folder-menu", path_hash(path)))
-                    .w_full()
-                    .on_mouse_down(
-                        MouseButton::Right,
-                        cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
-                            this.menu = Some(RailMenu {
-                                position: event.position,
-                                target: MenuTarget::Folder(target.clone()),
-                            });
-                            cx.notify();
-                        }),
-                    )
-                    .child(row_el)
-                    .into_any_element()
+                right_click_target(
+                    ("folder-menu", path_hash(path)),
+                    row_el,
+                    cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
+                        this.menu = Some(RailMenu {
+                            position: event.position,
+                            target: MenuTarget::Folder(target.clone()),
+                        });
+                        cx.notify();
+                    }),
+                )
             }
             RailRow::NoMatches => empty_hint(theme, "No matches", false),
-        };
-        div().pb_1().child(row).into_any_element()
+        }
     }
 }
 
@@ -438,7 +495,7 @@ impl Container for PlaylistsView {
 
 /// A playlist row, snapshotted out of the library so the borrow is dropped
 /// before elements are built.
-#[derive(Clone)]
+#[derive(Clone, PartialEq)]
 struct Row {
     id: PlaylistId,
     title: String,
@@ -446,6 +503,10 @@ struct Row {
 }
 
 /// One flattened row of the rail — the unit the virtualized list renders.
+/// `PartialEq` drives the minimal splice: only the stretch of rows that
+/// actually changed is handed to the list, so the scroll position survives
+/// rebuilds happening elsewhere.
+#[derive(PartialEq)]
 enum RailRow {
     Header(&'static str),
     /// A collapsible group header (Albums, Artists, Folder View): `open` draws
@@ -458,6 +519,8 @@ enum RailRow {
     /// The inline rename field, shown in place of the custom row being renamed.
     Rename,
     Album(Row),
+    /// One of the rail's filter boxes, rendered under its group's header.
+    FilterBox(RailFilter),
     Artist { index: usize, name: String, expanded: bool },
     /// An album within an expanded artist's discography (rendered indented).
     Discography(Row),
@@ -475,19 +538,26 @@ impl Render for PlaylistsView {
 
         if self.dirty {
             self.dirty = false;
-            self.rows = Rc::new(self.build_rows(cx));
-            // Update the row count without resetting the scroll position —
-            // expanding an artist shouldn't fling the rail back to the top.
-            let count = self.rows.len();
-            let old = self.list_state.item_count();
-            if old != count {
-                self.list_state.splice(0..old, count);
+            let new_rows = self.build_rows(cx);
+            // Splice only the stretch that actually changed. gpui resets a
+            // scroll top that falls inside the spliced range, so replacing the
+            // whole list would fling the rail to the top every time a group
+            // folded or a filter ran; a minimal splice leaves the viewport
+            // alone, and gpui shifts it by the delta for changes above it.
+            let (old, new) = (self.rows.as_ref(), new_rows.as_slice());
+            let head = old.iter().zip(new).take_while(|(a, b)| a == b).count();
+            let mut tail = old.iter().rev().zip(new.iter().rev()).take_while(|(a, b)| a == b).count();
+            tail = tail.min(old.len() - head).min(new.len() - head);
+            let (old_end, new_end) = (old.len() - tail, new.len() - tail);
+            if old[head..old_end] != new[head..new_end] {
+                self.list_state.splice(head..old_end, new_end - head);
             }
+            self.rows = Rc::new(new_rows);
         }
 
         let rows = self.rows.clone();
-        let render = cx.processor(move |this, ix, _window: &mut Window, cx: &mut Context<Self>| {
-            this.render_row(theme, ix, &rows[ix], selected, cx)
+        let render = cx.processor(move |this, ix, window: &mut Window, cx: &mut Context<Self>| {
+            this.render_row(theme, &rows[ix], selected, window, cx)
         });
 
         let mut root = div()
@@ -508,7 +578,7 @@ impl Render for PlaylistsView {
                         }
                         _ => {}
                     }
-                    if let Some((_, field)) = &mut this.renaming {
+                    if let Some((_, field, _)) = &mut this.renaming {
                         if field.handle_routed(event, cx) {
                             cx.stop_propagation();
                             cx.notify();
@@ -521,18 +591,42 @@ impl Render for PlaylistsView {
                     cx.notify();
                     return;
                 }
-                // Escape clears the filter before it bubbles; everything the
-                // field edits (typing, caret moves, paste) is consumed here.
-                if event.keystroke.key == "escape" && !this.filter.is_empty() {
-                    this.filter.clear();
-                    this.dirty = true;
-                    cx.notify();
-                    return;
+                // Each filter box only takes keys while it's focused — selected
+                // by clicking it or by `ctrl+f`. `escape` clears the focused
+                // filter before anything else; an empty one just blurs.
+                let focused = [RailFilter::Albums, RailFilter::Artists]
+                    .into_iter()
+                    .find(|which| this.filter(*which).focus.is_focused(window));
+                if event.keystroke.key == "escape" {
+                    if let Some(which) = focused {
+                        let filter = this.filter_mut(which);
+                        if !filter.field.is_empty() {
+                            filter.field.clear();
+                            this.dirty = true;
+                        } else {
+                            window.focus(&this.focus_handle);
+                        }
+                        cx.notify();
+                        return;
+                    }
                 }
-                if this.filter.handle_routed(event, cx) {
-                    cx.stop_propagation();
-                    this.dirty = true;
-                    cx.notify();
+                let mut consumed = false;
+                if let Some(which) = focused {
+                    consumed = this.filter_mut(which).field.handle_routed(event, cx);
+                    if consumed {
+                        cx.stop_propagation();
+                        this.dirty = true;
+                        cx.notify();
+                    }
+                }
+                // Anything the field doesn't edit — `space`, the command
+                // chords — goes to the same hub a center tab uses: `space`
+                // pauses, `ctrl+shift+f` opens search, and `ctrl+f` comes right
+                // back to this rail's album filter.
+                if !consumed {
+                    if let Some(action) = action_for_key(&event.keystroke) {
+                        this.tabs.update(cx, |tabs, cx| tabs.dispatch(action, window, cx));
+                    }
                 }
             }))
             .size_full()
@@ -544,32 +638,26 @@ impl Render for PlaylistsView {
                 theme,
                 "Library",
                 theme.cell_px(),
-                Some(settings_button(theme, cx.listener(|this, _event, window, cx| {
-                    this.tabs.update(cx, |tabs, cx| tabs.open_settings(window, cx));
-                }))),
+                Some(
+                    div()
+                        .id("open-settings")
+                        .flex_none()
+                        .px_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .text_size(px(theme.cell_px()))
+                        .text_color(theme.text_muted)
+                        .hover(|d| d.bg(theme.row_hover).text_color(theme.text))
+                        .on_click(cx.listener(|this, _event, window, cx| {
+                            this.tabs.update(cx, |tabs, cx| tabs.open_settings(window, cx));
+                        }))
+                        .child("⚙")
+                        .into_any_element(),
+                ),
                 None,
                 if scanning { Some(("scanning…", theme.text_muted)) } else { None },
+                None,
             ))
-            .child(
-                div()
-                    .px_2()
-                    .pb_2()
-                    // Clicking the box focuses the rail, so typing lands in the
-                    // filter (the field itself owns no focus).
-                    .on_mouse_down(
-                        MouseButton::Left,
-                        cx.listener(|this, _event, window, _cx| window.focus(&this.focus_handle)),
-                    )
-                    .child(rail_search(
-                        theme,
-                        &self.filter,
-                        cx.listener(|this, _event, _window, cx| {
-                            this.filter.clear();
-                            this.dirty = true;
-                            cx.notify();
-                        }),
-                    )),
-            )
             .child(
                 div()
                     .flex_1()
@@ -598,9 +686,11 @@ impl Render for PlaylistsView {
 
                     let rename: MenuHandler = Box::new(cx.listener(move |this, _event, window, cx| {
                         this.menu = None;
-                        this.renaming = Some((playlist, TextField::new(title.clone())));
+                        let field = TextField::new(title.clone());
+                        let focus = cx.focus_handle();
+                        this.renaming = Some((playlist, field, focus.clone()));
                         this.dirty = true;
-                        window.focus(&this.focus_handle);
+                        window.focus(&focus);
                         cx.notify();
                     }));
                     let delete: MenuHandler = Box::new(cx.listener(move |this, _event, _window, cx| {
@@ -637,116 +727,134 @@ impl Render for PlaylistsView {
     }
 }
 
-fn settings_button(
+/// One row of the rail — the single builder behind every group, plain
+/// (playlists, albums) or tree (artists, the folder view). Tree rows draw one
+/// guide column per nesting level, and the expand chevron is a painted
+/// triangle sitting on its own guide line, so a subtree reads as one
+/// continuous line from the arrow down through its children. No zebra: rows
+/// sit transparent on the rail and light up on hover/selection.
+#[allow(clippy::too_many_arguments)]
+fn rail_row(
     theme: Theme,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+    id: impl Into<ElementId>,
+    label: String,
+    count: Option<usize>,
+    active: bool,
+    depth: usize,
+    branch: Branch,
+    on_click: Option<impl Fn(&ClickEvent, &mut Window, &mut App) + 'static>,
 ) -> AnyElement {
-    div()
-        .id("open-settings")
-        .flex_none()
-        .px_1()
-        .rounded_md()
-        .cursor_pointer()
-        .text_size(px(theme.cell_px()))
-        .text_color(theme.text_muted)
-        .hover(|d| d.bg(theme.row_hover).text_color(theme.text))
-        .on_click(on_click)
-        .child("⚙")
-        .into_any_element()
-}
-
-/// The editable row shown while renaming.
-fn rename_row(theme: Theme, field: &TextField) -> AnyElement {
-    div()
-        .px_2()
-        .py_1()
-        .child(field.render(theme, "Playlist name"))
-        .into_any_element()
-}
-
-/// A collapsible group header (Albums, Artists, Folder View): the label with
-/// its arrow after it, clickable to fold or unfold the group.
-fn group_header(
-    theme: Theme,
-    label: &'static str,
-    open: bool,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> AnyElement {
-    let group = match label {
-        "Albums" => 0u64,
-        "Artists" => 1u64,
-        _ => 2u64,
+    // The chevron slot is one guide column wide on every row — empty on rows
+    // that can't expand — so labels line up down the rail, and a parent's
+    // arrow sits exactly on the line its children hang from.
+    let guide = theme.cell_px() * 1.1;
+    let slot = match branch {
+        Branch::Plain => div().flex_none().w(px(guide)),
+        Branch::Line => div().flex_none().w(px(guide)).border_l_1().border_color(theme.border),
+        Branch::Toggle(expanded) => div()
+            .flex_none()
+            .relative()
+            .w(px(guide))
+            .border_l_1()
+            .border_color(theme.border)
+            .child(expand_triangle(theme, expanded)),
     };
     div()
-        .id(("group-header", group))
+        .id(id.into())
         .flex()
-        .items_center()
-        .gap_1()
-        .px_2()
-        .pt_2()
-        .pb_1()
+        .w_full()
+        .pl_2()
+        .pr_2()
         .rounded_md()
         .cursor_pointer()
-        .hover(|d| d.bg(theme.row_hover))
-        .on_click(on_click)
-        .child(
-            div()
-                .text_size(px(theme.small_px()))
-                .text_color(theme.text_faint)
-                .child(label.to_string()),
-        )
-        .child(
+        .when_some(on_click, |d, click| {
+            d.hover(|d| d.bg(theme.row_hover)).on_click(click)
+        })
+        .children((0..depth).map(|_| {
             div()
                 .flex_none()
-                .text_size(px(theme.small_px()))
-                .text_color(theme.text_faint)
-                .child(if open { "▾" } else { "▸" }),
-        )
-        .into_any_element()
-}
-
-/// One directory row of the folder view: its name (indented by depth), with
-/// the expand arrow after it — only when the directory has subdirectories.
-/// Zebra-striped like the rail's other rows.
-fn folder_row(
-    theme: Theme,
-    index: usize,
-    id: u64,
-    label: String,
-    depth: usize,
-    expanded: bool,
-    has_children: bool,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> AnyElement {
-    div()
-        .id(("folder", id))
-        .flex()
-        .items_center()
-        .gap_1()
-        .pl(px(theme.cell_px() * (2.0 + depth as f32 * 1.6)))
-        .pr_2()
-        .py_1()
-        .rounded_md()
-        .cursor_pointer()
-        .bg(theme.row_bg(index))
-        .when(has_children, |d| d.hover(|d| d.bg(theme.row_hover)))
-        .when(has_children, |d| d.on_click(on_click))
+                .w(px(guide))
+                .border_l_1()
+                .border_color(theme.border)
+        }))
+        .child(slot)
         .child(
             div()
                 .flex_1()
                 .min_w_0()
-                .truncate()
-                .text_size(px(theme.cell_px()))
-                .text_color(theme.text_muted)
-                .child(label),
+                .flex()
+                .items_center()
+                .justify_between()
+                .py_1()
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .truncate()
+                        .text_size(px(theme.cell_px()))
+                        .text_color(if active { theme.text } else { theme.text_muted })
+                        .child(label),
+                )
+                .when_some(count, |d, count| {
+                    d.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(theme.small_px()))
+                            .text_color(theme.text_faint)
+                            .child(count.to_string()),
+                    )
+                }),
         )
-        .child(
-            div()
-                .flex_none()
-                .text_size(px(theme.small_px()))
-                .text_color(theme.text_faint)
-                .child(if has_children && expanded { "▾" } else if has_children { "▸" } else { "" }),
-        )
+        .into_any_element()
+}
+
+/// The row's own guide column: a plain row draws nothing, a tree row keeps
+/// the line running through it (a leaf folder too — the trunk stays
+/// connected), and an expandable one carries the chevron on that line.
+enum Branch {
+    Plain,
+    Line,
+    Toggle(bool),
+}
+
+/// The expand chevron: a small triangle painted over its guide line — right
+/// when folded, down when open — instead of a text glyph, so it stays glued
+/// to the line whatever the font does.
+fn expand_triangle(theme: Theme, expanded: bool) -> impl IntoElement {
+    canvas(
+        |_, _, _| (),
+        move |bounds, _, window, _| {
+            let half = theme.font_size * 0.15;
+            // Centered on the slot's left edge — the guide line's x — so the
+            // line runs straight through the triangle.
+            let x = f32::from(bounds.origin.x);
+            let y = f32::from(bounds.origin.y + bounds.size.height / 2.0);
+            let mut path = gpui::Path::new(point(px(x - half), px(y - half)));
+            if expanded {
+                path.line_to(point(px(x + half), px(y - half)));
+                path.line_to(point(px(x), px(y + half)));
+            } else {
+                path.line_to(point(px(x - half), px(y + half)));
+                path.line_to(point(px(x + half), px(y)));
+            }
+            window.paint_path(path, theme.text_faint);
+        },
+    )
+    .absolute()
+    .inset_0()
+}
+
+/// A row wrapped so a right-click on it can raise a menu.
+fn right_click_target(
+    id: impl Into<ElementId>,
+    row: AnyElement,
+    on_menu: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    div()
+        .id(id.into())
+        .w_full()
+        .on_mouse_down(MouseButton::Right, on_menu)
+        .child(row)
         .into_any_element()
 }
 
@@ -774,74 +882,4 @@ fn path_hash(path: &Path) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     path.hash(&mut hasher);
     hasher.finish()
-}
-
-/// The rail's filter box: the shared search-box chrome with— once there's
-/// something typed — a clear button at the end.
-fn rail_search(
-    theme: Theme,
-    field: &TextField,
-    on_clear: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> AnyElement {
-    let trailing = (!field.is_empty()).then(|| {
-        div()
-            .id("clear-rail-filter")
-            .flex_none()
-            .px_1()
-            .rounded_md()
-            .cursor_pointer()
-            .text_size(px(theme.small_px()))
-            .text_color(theme.text_faint)
-            .hover(|d| d.bg(theme.row_hover).text_color(theme.text))
-            .on_click(on_clear)
-            .child("×")
-            .into_any_element()
-    });
-    search_box(theme, field, Some("Filter albums & artists…"), false, trailing)
-}
-
-/// A rail navigation row: zebra-striped like every row list, with the active
-/// row overriding the stripe and hover overriding both.
-#[allow(clippy::too_many_arguments)]
-fn nav_row(
-    theme: Theme,
-    index: usize,
-    id: impl Into<ElementId>,
-    label: String,
-    count: Option<usize>,
-    active: bool,
-    indent: bool,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-) -> AnyElement {
-    div()
-        .id(id.into())
-        .flex()
-        .items_center()
-        .justify_between()
-        .w_full()
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .cursor_pointer()
-        .when(indent, |d| d.pl_5())
-        .bg(theme.row_bg(index))
-        .when(active, |d| d.bg(theme.row_active))
-        .hover(|d| d.bg(theme.row_hover))
-        .on_click(on_click)
-        .child(
-            div()
-                .flex_1()
-                .min_w_0()
-                .truncate()
-                .text_size(px(theme.cell_px()))
-                .text_color(if active { theme.text } else { theme.text_muted })
-                .child(label),
-        )
-        .child(
-            div()
-                .text_size(px(theme.small_px()))
-                .text_color(theme.text_faint)
-                .child(count.map(|c| c.to_string()).unwrap_or_default()),
-        )
-        .into_any_element()
 }

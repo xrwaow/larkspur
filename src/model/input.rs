@@ -27,6 +27,9 @@ pub enum InputAction {
     PrevTab,
     /// Toggle the search box, bringing the search panel into view.
     ToggleSearch,
+    /// Focus the library tab's filter box (`ctrl+f`), or the search panel's
+    /// query box when the search panel is already up.
+    FocusSearch,
     /// Close the active tab (or the search panel, if it's up).
     CloseTab,
     /// Dismiss whatever overlay is on top.
