@@ -260,11 +260,15 @@ impl PlaybackState {
     }
 
     pub fn next_track(&mut self) {
-        self.controller.next_track();
+        if self.controller.next_track() {
+            self.reload_track();
+        }
     }
 
     pub fn prev_track(&mut self) {
-        self.controller.prev_track();
+        if self.controller.prev_track() {
+            self.reload_track();
+        }
     }
 
     pub fn seek_fraction(&mut self, fraction: f32) {
@@ -397,12 +401,16 @@ impl PlaybackState {
             }
             InputAction::NextTrack => {
                 let could = self.controller.can_next();
-                self.controller.next_track();
+                if self.controller.next_track() {
+                    self.reload_track();
+                }
                 could
             }
             InputAction::PrevTrack => {
                 let could = self.controller.can_prev();
-                self.controller.prev_track();
+                if self.controller.prev_track() {
+                    self.reload_track();
+                }
                 could
             }
             InputAction::SeekForward => {

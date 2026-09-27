@@ -421,7 +421,7 @@ impl Render for QueueView {
             .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                 this.playback.update(cx, |state, cx| state.clear_queue(cx));
             }))
-            .child("Clear");
+            .child("CLEAR");
 
         let mut panel = div()
             .absolute()

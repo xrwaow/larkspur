@@ -366,19 +366,29 @@ impl PlaybackController {
         }
     }
 
-    pub fn next_track(&mut self) {
-        self.advance();
+    /// Start the next track. Returns whether a new track actually started, so
+    /// the caller knows to reload the waveform.
+    pub fn next_track(&mut self) -> bool {
+        self.advance()
     }
 
-    pub fn prev_track(&mut self) {
+    /// Go back one track — or restart the current one when already at the
+    /// first. Returns whether a *different* track was loaded; restarting the
+    /// same track returns `false`, since its waveform is already current.
+    pub fn prev_track(&mut self) -> bool {
         match self.current {
             Some(i) if i > 0 => {
                 if let Err(e) = self.load_track(i - 1) {
                     eprintln!("failed to load previous track: {e}");
+                    return false;
                 }
+                true
             }
             // First track (or nothing loaded): restart it.
-            _ => self.seek(Duration::ZERO),
+            _ => {
+                self.seek(Duration::ZERO);
+                false
+            }
         }
     }
 
