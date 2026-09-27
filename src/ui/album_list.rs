@@ -13,7 +13,7 @@
 
 use std::rc::Rc;
 
-use gpui::{prelude::*, Context, Entity, KeyDownEvent, Render, ScrollWheelEvent, Subscription, Window};
+use gpui::{prelude::*, Context, Entity, KeyDownEvent, Render, ScrollWheelEvent, SharedString, Subscription, Window};
 
 use crate::model::select::{Order, Scope, Selection};
 use crate::model::{search, InputAction, Library, PlaylistId};
@@ -21,8 +21,9 @@ use crate::ui::albums::{self, AlbumSection, RowActions};
 use crate::ui::animation::Animator;
 use crate::ui::cover_store::CoverStore;
 use crate::ui::drag::DragInfo;
+use crate::ui::format::format_bitrate;
 use crate::ui::input::action_for_key;
-use crate::ui::library_state::LibraryState;
+use crate::ui::library_state::{LibraryState, Request};
 use crate::ui::menu::SongMenuRequest;
 use crate::ui::playback_state::PlaybackState;
 use crate::ui::row_list::{Cell, RowAction, RowList};
@@ -37,69 +38,27 @@ pub enum Play {
     Result,
 }
 
-/// What feeds an album list's sections.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum Source {
-    /// The whole library, grouped by album title (the browse tab).
-    Library,
-    /// One artist's discography, newest first, undated last (an artist tab).
-    Artist(String),
-    /// Exactly these playlists, in given order (a folder view, or the playlist
-    /// container's one playlist).
-    Playlists(Vec<PlaylistId>),
-}
-
-impl Source {
-    /// Snapshot the library into drawable sections.
-    pub fn sections(&self, library: &Library) -> Vec<AlbumSection> {
-        match self {
-            Source::Library => albums::all_sections(library),
-            Source::Artist(artist) => albums::sections_from_groups(
-                library,
-                library.select(&Selection {
-                    scope: Scope::Artist(artist.clone()),
-                    query: search::Query::default(),
-                    order: Order::NewestFirst,
-                }),
-            ),
-            Source::Playlists(ids) => ids
+/// Snapshot a scope into drawable sections, with `query` filtering the songs
+/// *within* it — an empty query is the whole scope. The library scope runs the
+/// query engine over the whole library; an artist scope filters their
+/// discography, keeping its newest-first order. A playlist scope is shown
+/// as-is — its view offers no box.
+pub fn sections(library: &Library, scope: &Scope, query: &search::Query) -> Vec<AlbumSection> {
+    let groups = match scope {
+        Scope::Library => search::search(library, query),
+        Scope::Artist(artist) => library.select(&Selection {
+            scope: Scope::Artist(artist.clone()),
+            query: query.clone(),
+            order: Order::NewestFirst,
+        }),
+        Scope::Playlists(ids) => {
+            return ids
                 .iter()
                 .filter_map(|id| albums::section_for_playlist(library, *id))
-                .collect(),
+                .collect();
         }
-    }
-
-    /// [`sections`](Self::sections) with `query` filtering the songs *within*
-    /// the scope — the header filter box's live filter. The library scope
-    /// runs the query engine over the whole library; an artist scope filters
-    /// their discography, keeping its newest-first order. A folder's playlists
-    /// are shown as-is — its view offers no box.
-    pub fn sections_with(&self, library: &Library, query: &search::Query) -> Vec<AlbumSection> {
-        let groups = match self {
-            Source::Library => search::search(library, query),
-            Source::Artist(artist) => library.select(&Selection {
-                scope: Scope::Artist(artist.clone()),
-                query: query.clone(),
-                order: Order::NewestFirst,
-            }),
-            Source::Playlists(ids) => {
-                return ids
-                    .iter()
-                    .filter_map(|id| albums::section_for_playlist(library, *id))
-                    .collect();
-            }
-        };
-        albums::sections_from_groups(library, groups)
-    }
-
-    /// The model scope this source draws from — what a shuffle button plays.
-    pub fn scope(&self) -> Scope {
-        match self {
-            Source::Library => Scope::Library,
-            Source::Artist(artist) => Scope::Artist(artist.clone()),
-            Source::Playlists(ids) => Scope::Playlists(ids.clone()),
-        }
-    }
+    };
+    albums::sections_from_groups(library, groups)
 }
 
 /// The list state and entities every album view needs: the snapshot rows, the
@@ -179,9 +138,9 @@ impl AlbumListView {
     /// up/down step from when nothing is selected. Views call this after
     /// [`RowList::sync`], once the row indices are current.
     pub fn anchor_to_playing(&mut self, cx: &gpui::App) {
-        let song = self.playback.read(cx).metadata().id;
+        let song = self.playback.read(cx).current_song();
         let (items, sections) = (self.rows.items(), self.rows.sections());
-        self.rows.set_anchor(albums::row_of_song(&items, &sections, song));
+        self.rows.set_anchor(song.and_then(|song| albums::row_of_song(&items, &sections, song)));
     }
 
     /// Play `playlist` from `index` the way `play` chose at construction: the
@@ -258,7 +217,7 @@ impl<V: AlbumList> RowActions<V> for Rows {
         let request =
             SongMenuRequest { songs, position: event.position, playlist: context, queue: false };
         let library = view.list().library.clone();
-        library.update(cx, |state, cx| state.request_song_menu(request, cx));
+        library.update(cx, |state, cx| state.request(Request::SongMenu(request), cx));
     }
 
     fn hover(&self, view: &mut V, item_ix: usize, hovered: bool, cx: &mut Context<V>) {
@@ -344,9 +303,10 @@ pub fn render_rows_with<V: AlbumList>(
     cx: &mut Context<V>,
 ) -> gpui::AnyElement {
     let list = view.list();
-    let current = list.playback.read(cx).metadata().id;
+    let current = list.playback.read(cx).current_song();
     let playing = list.playback.read(cx).is_playing();
-    let live_bitrate = list.playback.read(cx).live_bitrate();
+    let live_bitrate_label =
+        list.playback.read(cx).live_bitrate().map(|bps| SharedString::from(format_bitrate(bps)));
     let sections = list.rows.sections();
     let items = list.rows.items();
     let columns = list.rows.columns();
@@ -365,7 +325,7 @@ pub fn render_rows_with<V: AlbumList>(
             current,
             playing,
             eq_phase,
-            live_bitrate,
+            live_bitrate_label: live_bitrate_label.clone(),
             context,
             highlight: &highlight,
             drag,

@@ -18,16 +18,34 @@
 //! selected belongs to the playlist tab showing it, since each tab keeps its
 //! own.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 
 use gpui::{Context, Entity, Subscription};
 
 use crate::model::search::Query;
-use crate::model::{shuffle, Library, LibraryCache, Order, PlaylistId, Scope, Selection, SongId};
+use crate::model::{
+    generate_song_id, shuffle, Library, LibraryCache, Order, PlaylistId, Scope, Selection, SongId,
+    SongMetadata,
+};
 use crate::ui::config_state::ConfigState;
 use crate::ui::menu::SongMenuRequest;
 use crate::ui::playback_state::PlaybackState;
+
+/// A cross-view intent raised by a row and consumed by the tab container — so
+/// a row anywhere can ask for a tab without holding a handle to the container
+/// that owns it.
+#[derive(Clone)]
+pub enum Request {
+    /// Open (or focus) a playlist's tab.
+    OpenPlaylist(PlaylistId),
+    /// Open a library view scoped to an artist's discography.
+    ArtistView(String),
+    /// Play a folder and open its temporary view.
+    FolderPlay(PathBuf),
+    /// Show a song's context menu.
+    SongMenu(SongMenuRequest),
+}
 
 pub struct LibraryState {
     library: Library,
@@ -42,18 +60,9 @@ pub struct LibraryState {
     /// tell a real edit from a highlight-only notification and skip a needless
     /// rebuild.
     revision: u64,
-    /// A playlist a view asked to open (the song menu's "Go to playlist"). The
-    /// tab container picks it up — so a row in the browse view can open a tab
-    /// without holding a handle to the container that owns it.
-    pending_open_playlist: Option<PlaylistId>,
-    /// An artist a view asked to open a library view for ("Go to artist").
-    pending_artist_view: Option<String>,
-    /// A song whose context menu a row asked to open. The tab container owns
-    /// and renders it, so rows anywhere can raise it.
-    pending_song_menu: Option<SongMenuRequest>,
-    /// A folder the rail's folder view asked to play. The tab container picks
-    /// it up — it holds the playback handle the rail doesn't.
-    pending_folder_play: Option<PathBuf>,
+    /// Cross-view intents a row raised (open a playlist/artist/folder, show a
+    /// song menu). The tab container drains them.
+    requests: VecDeque<Request>,
     scanning: bool,
     /// A rescan was requested while one was already in flight.
     rescan_pending: bool,
@@ -72,6 +81,9 @@ impl LibraryState {
         cache.retain_roots(&roots);
         let mut library = Library::default();
         cache.install(&mut library);
+        // Playlists live in their own file, so they're loaded separately.
+        let (playlists, next_playlist_id) = cache.load_playlists();
+        library.replace_playlists(playlists, next_playlist_id);
 
         let observe_config = cx.observe(&config, |this, config, cx| {
             let roots = config.read(cx).roots().to_vec();
@@ -84,10 +96,7 @@ impl LibraryState {
             roots,
             selected: None,
             revision: 0,
-            pending_open_playlist: None,
-            pending_artist_view: None,
-            pending_song_menu: None,
-            pending_folder_play: None,
+            requests: VecDeque::new(),
             scanning: false,
             rescan_pending: false,
             _observe_config: observe_config,
@@ -124,55 +133,15 @@ impl LibraryState {
 
     // --- cross-view intents --------------------------------------------
 
-    /// Ask the tab container to open a playlist. Consumed by `TabsView`.
-    pub fn request_open_playlist(&mut self, id: PlaylistId, cx: &mut Context<Self>) {
-        self.pending_open_playlist = Some(id);
+    /// Raise a cross-view intent for the tab container to drain.
+    pub fn request(&mut self, request: Request, cx: &mut Context<Self>) {
+        self.requests.push_back(request);
         cx.notify();
     }
 
-    /// Take the pending "open playlist" request, if any.
-    pub fn take_open_playlist(&mut self) -> Option<PlaylistId> {
-        self.pending_open_playlist.take()
-    }
-
-    /// Ask the tab container to open a library view for `artist` — its
-    /// discography. Consumed by `TabsView`.
-    pub fn request_artist_view(&mut self, artist: String, cx: &mut Context<Self>) {
-        self.pending_artist_view = Some(artist);
-        cx.notify();
-    }
-
-    /// Take the pending "artist view" request, if any.
-    pub fn take_artist_view(&mut self) -> Option<String> {
-        self.pending_artist_view.take()
-    }
-
-    /// Ask the tab container to play a folder and open its temporary view.
-    /// Consumed by `TabsView`, which holds the playback handle.
-    pub fn request_folder_play(&mut self, dir: PathBuf, cx: &mut Context<Self>) {
-        self.pending_folder_play = Some(dir);
-        cx.notify();
-    }
-
-    /// Take the pending "play folder" request, if any.
-    pub fn take_folder_play(&mut self) -> Option<PathBuf> {
-        self.pending_folder_play.take()
-    }
-
-    /// Ask the tab container to open a song's context menu at `request`.
-    pub fn request_song_menu(&mut self, request: SongMenuRequest, cx: &mut Context<Self>) {
-        self.pending_song_menu = Some(request);
-        cx.notify();
-    }
-
-    /// The pending song-menu request, if any. Read (not taken) so the tab
-    /// container can copy it into its own state; call [`clear_song_menu`] after.
-    pub fn pending_song_menu(&self) -> Option<&SongMenuRequest> {
-        self.pending_song_menu.as_ref()
-    }
-
-    pub fn clear_song_menu(&mut self) {
-        self.pending_song_menu = None;
+    /// Take the next pending intent, if any.
+    pub fn take_request(&mut self) -> Option<Request> {
+        self.requests.pop_front()
     }
 
     // --- actions -------------------------------------------------------
@@ -242,7 +211,7 @@ impl LibraryState {
         let id = self.library.create_custom("New Playlist");
         self.library.add_songs(id, &songs);
         self.selected = Some(id);
-        self.pending_open_playlist = Some(id);
+        self.requests.push_back(Request::OpenPlaylist(id));
         self.revision += 1;
         self.persist();
         cx.notify();
@@ -264,7 +233,7 @@ impl LibraryState {
         let count = songs.len();
         let id = self.library.create_temporary(format!("{count} songs"), songs.clone());
         self.play(&songs, 0, playback, cx);
-        self.pending_open_playlist = Some(id);
+        self.requests.push_back(Request::OpenPlaylist(id));
         self.revision += 1;
         cx.notify();
     }
@@ -398,19 +367,55 @@ impl LibraryState {
         playback: &Entity<PlaybackState>,
         cx: &mut Context<Self>,
     ) {
-        let paths: Vec<PathBuf> = songs
+        let entries: Vec<(SongId, PathBuf)> = songs
             .iter()
-            .filter_map(|id| self.library.get(*id))
-            .map(|song| song.path.clone())
+            .filter_map(|id| self.library.get(*id).map(|song| (*id, song.path.clone())))
             .collect();
-        if paths.is_empty() {
+        if entries.is_empty() {
             return;
         }
         playback.update(cx, |playback, cx| {
-            if playback.play_paths(paths, start, cx) {
+            if playback.play_paths(entries, start, cx) {
                 cx.notify();
             }
         });
+    }
+
+    /// Queue `paths` — loading any the library hasn't scanned yet — and start
+    /// at `start`. The command-line entry point.
+    pub fn play_files(
+        &mut self,
+        paths: Vec<PathBuf>,
+        start: usize,
+        playback: &Entity<PlaybackState>,
+        cx: &mut Context<Self>,
+    ) {
+        let entries = self.ensure_songs(&paths);
+        if entries.is_empty() {
+            return;
+        }
+        playback.update(cx, |playback, cx| {
+            if playback.play_paths(entries, start, cx) {
+                cx.notify();
+            }
+        });
+    }
+
+    /// Ensure every path is in the library (loading tags for any that aren't),
+    /// returning `(SongId, path)` pairs — so a queued file is always
+    /// resolvable to metadata.
+    fn ensure_songs(&mut self, paths: &[PathBuf]) -> Vec<(SongId, PathBuf)> {
+        let mut entries = Vec::new();
+        for path in paths {
+            let Ok(id) = generate_song_id(path) else { continue };
+            if self.library.get(id).is_none() {
+                if let Ok(song) = SongMetadata::load(path) {
+                    self.library.insert_song(song);
+                }
+            }
+            entries.push((id, path.clone()));
+        }
+        entries
     }
 
     // --- internals -----------------------------------------------------
@@ -482,7 +487,7 @@ impl LibraryState {
                     cache.retain_roots(&state.roots);
                 }
                 state.ensure_selection();
-                state.persist();
+                state.persist_songs();
                 if !report.errors.is_empty() {
                     eprintln!("scan: {} file(s) could not be read", report.errors.len());
                 }
@@ -497,12 +502,23 @@ impl LibraryState {
         .detach();
     }
 
+    /// Persist the user-owned playlists — what a playlist edit writes. Small,
+    /// so it's fine on the UI thread; the song cache is written separately.
     fn persist(&mut self) {
         // Field-split so the mutable cache and the immutable library don't
         // borrow all of `self` at once.
         let Self { cache, library, .. } = self;
-        if let Some(cache) = cache.as_mut() {
-            if let Err(e) = cache.save(library) {
+        if let Some(cache) = cache.as_ref() {
+            if let Err(e) = cache.save_playlists(library) {
+                eprintln!("failed to save playlists: {e}");
+            }
+        }
+    }
+
+    /// Persist the scanned song cache — written after a scan, not per edit.
+    fn persist_songs(&mut self) {
+        if let Some(cache) = self.cache.as_ref() {
+            if let Err(e) = cache.save() {
                 eprintln!("failed to save library cache: {e}");
             }
         }

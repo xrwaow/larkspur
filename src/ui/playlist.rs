@@ -21,7 +21,7 @@ use std::rc::Rc;
 
 use gpui::{
     div, prelude::*, px, AnyElement, ClickEvent, Context, Entity, FocusHandle, Focusable,
-    KeyDownEvent, Render, Window,
+    KeyDownEvent, Render, SharedString, Window,
 };
 
 use crate::model::search;
@@ -75,8 +75,7 @@ impl PlaylistView {
             album_list::observe(&library, Some(&playback), &covers, &animator, cx);
         // The playlist tab draws the library's rows, so it shares the browse
         // list's typography — one size, so the tabs can't drift apart.
-        let themed =
-            Themed::with_container(BrowseView::container_id(), BrowseView::default_font_size(), &config, cx);
+        let themed = BrowseView::themed(&config, cx);
         let is_custom = is_custom(&library, playlist, cx);
         Self {
             themed,
@@ -210,10 +209,15 @@ impl Render for PlaylistView {
                 theme,
                 covers: self.list.covers(),
                 library: self.list.library(),
-                current: self.list.playback().read(cx).metadata().id,
+                current: self.list.playback().read(cx).current_song(),
                 playing: self.list.playback().read(cx).is_playing(),
                 eq_phase: 0.0,
-                live_bitrate: self.list.playback().read(cx).live_bitrate(),
+                live_bitrate_label: self
+                    .list
+                    .playback()
+                    .read(cx)
+                    .live_bitrate()
+                    .map(|bps| SharedString::from(crate::ui::format::format_bitrate(bps))),
                 context: Some(playlist),
                 highlight: &highlight,
                 drag: None,

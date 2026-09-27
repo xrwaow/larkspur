@@ -13,15 +13,15 @@
 
 use std::collections::BTreeSet;
 use std::rc::Rc;
-use std::time::Duration;
 
 use gpui::{
     canvas, div, fill, img, point, prelude::*, px, size, AnyElement, App, Bounds, ClickEvent,
-    Context, ElementId, Entity, MouseButton, MouseDownEvent, ObjectFit, Pixels, Rgba, Window,
+    Context, ElementId, Entity, MouseButton, MouseDownEvent, ObjectFit, Pixels, Rgba, SharedString,
+    Window,
 };
 
 use crate::model::search::AlbumGroup;
-use crate::model::{Library, PlaylistId, SongId, SongMetadata};
+use crate::model::{Library, PlaylistId, ReleaseDate, SongId, SongMetadata};
 use crate::ui::cover_store::{CoverImage, CoverStore};
 use crate::ui::drag::{self, DragInfo};
 use crate::ui::format::{format_bitrate, format_duration};
@@ -84,10 +84,12 @@ pub struct TrackRow {
     pub number: usize,
     pub title: String,
     pub artist: String,
-    pub secs: u64,
-    /// The file's declared/average bitrate, in bps. `None` when the tags don't
-    /// carry one.
-    pub nominal_bitrate: Option<u32>,
+    /// The duration label, preformatted once per rebuild so render doesn't
+    /// format per row per frame.
+    pub duration: SharedString,
+    /// The declared-bitrate label, preformatted once per rebuild. The playing
+    /// row swaps in the live number at render.
+    pub bitrate: SharedString,
 }
 
 /// One album section — its header data plus its tracks.
@@ -98,17 +100,12 @@ pub struct AlbumSection {
     /// The `format | bitrate | tracks | time` line.
     pub meta: String,
     pub year: String,
-    /// The section's full release date, when its songs declare one — what the
-    /// library's chronological ordering sorts by (year, then month/day).
-    pub date: Option<(u16, u8, u8)>,
+    /// The section's release date (packed `YYYYMMDD`), when its songs declare
+    /// one — what the library's chronological ordering sorts by.
+    pub date: Option<ReleaseDate>,
     /// The song whose cover represents the album.
     pub cover_song: Option<SongId>,
     pub tracks: Vec<TrackRow>,
-}
-
-/// Snapshot the library into drawable sections.
-pub fn all_sections(library: &Library) -> Vec<AlbumSection> {
-    sections_from_groups(library, crate::model::search::all_albums(library))
 }
 
 /// Snapshot a set of album groups (e.g. search results) into drawable sections.
@@ -134,16 +131,18 @@ fn section(library: &Library, group: AlbumGroup) -> Option<AlbumSection> {
             number: song.track_position.map(usize::from).unwrap_or(index + 1),
             title: song.display_title(),
             artist: song.artists.join(", "),
-            secs: song.duration.as_secs(),
-            nominal_bitrate: song.nominal_bitrate,
+            duration: format_duration(song.duration).into(),
+            bitrate: song.nominal_bitrate.map(format_bitrate).unwrap_or_default().into(),
         })
         .collect();
 
     // An empty playlist (a freshly created custom one) still needs a header —
     // taken from the playlist's own metadata, since there's no first song to
-    // borrow artist/year/cover from.
+    // borrow artist/date/cover from. Only albums carry a release date; a
+    // custom playlist spans arbitrary tracks, so one would mislead.
     let custom = playlist.is_custom();
-    let (artist, meta, year, date, cover_song) = match songs.first() {
+    let date = if custom { None } else { songs.iter().find_map(|song| song.date) };
+    let (artist, meta, cover_song) = match songs.first() {
         Some(first) => {
             let total_secs: u64 = songs.iter().map(|song| song.duration.as_secs()).sum();
             (
@@ -155,44 +154,30 @@ fn section(library: &Library, group: AlbumGroup) -> Option<AlbumSection> {
                     custom_artist(&songs)
                 } else {
                     playlist
-                        .meta()
-                        .artist
+                        .artist()
+                        .map(str::to_string)
                         .unwrap_or_else(|| first.album_artist().to_string())
                 },
                 album_meta(songs.len(), total_secs),
-                // A custom playlist spans arbitrary tracks, so a single release
-                // year would be misleading — only albums carry one.
-                if custom {
-                    String::new()
-                } else {
-                    songs
-                        .iter()
-                        .find_map(|song| song.year)
-                        .map(|year| year.to_string())
-                        .unwrap_or_default()
-                },
-                if custom { None } else { songs.iter().find_map(|song| song.release_date) },
                 // An explicit cover wins; otherwise the first song's — so a
                 // custom playlist borrows its first track's art until custom
                 // covers land.
-                playlist.meta().cover.or(Some(first.id)),
+                playlist.cover().or(Some(first.id)),
             )
         }
         None => (
-            playlist.meta().artist.unwrap_or_default(),
+            playlist.artist().unwrap_or_default().to_string(),
             "0 Tracks".to_string(),
-            String::new(),
-            None,
-            playlist.meta().cover,
+            playlist.cover(),
         ),
     };
 
     Some(AlbumSection {
         playlist: group.playlist,
         artist,
-        album: playlist.meta().title,
+        album: playlist.title().to_string(),
         meta,
-        year,
+        year: date.map(|date| date.year().to_string()).unwrap_or_default(),
         date,
         cover_song,
         tracks,
@@ -339,7 +324,7 @@ pub fn step_selectable(items: &[ListItem], current: Option<usize>, forward: bool
 /// The selection remembers the order rows were picked in: queueing and playing
 /// a multi-row selection follow that pick order, not the list's order.
 #[derive(Default, Clone)]
-pub struct Selection {
+pub struct RowSelection {
     selected: BTreeSet<usize>,
     /// The selected rows in the order they were picked. A shift-range has no
     /// per-row pick order, so it lands here in list order.
@@ -349,7 +334,7 @@ pub struct Selection {
     anchor: Option<usize>,
 }
 
-impl Selection {
+impl RowSelection {
     pub fn is_empty(&self) -> bool {
         self.selected.is_empty()
     }
@@ -492,15 +477,15 @@ pub struct RowContext<'a> {
     pub covers: &'a Entity<CoverStore>,
     pub library: &'a Entity<LibraryState>,
     /// The currently-playing song, if it is one.
-    pub current: SongId,
+    pub current: Option<SongId>,
     /// Whether audio is actually playing, so the playing row's equalizer only
     /// animates while it should.
     pub playing: bool,
     /// The shared clock's elapsed seconds, driving the equalizer's motion.
     pub eq_phase: f32,
-    /// The playing song's live bitrate — shown on its row instead of the
-    /// declared one.
-    pub live_bitrate: Option<u32>,
+    /// The playing song's live bitrate label, preformatted once per frame —
+    /// shown on its row instead of the declared one.
+    pub live_bitrate_label: Option<SharedString>,
     /// The playlist the row's menu offers as a destination (the open one).
     pub context: Option<PlaylistId>,
     pub highlight: &'a Highlight,
@@ -527,7 +512,7 @@ struct RowPaint {
     title_offset: f32,
     /// The artist cell's marquee offset, in px — each slides on its own hover.
     artist_offset: f32,
-    bitrate: Option<u32>,
+    bitrate: SharedString,
     /// This row's vertical shift for an in-flight drag, in px.
     translate: f32,
     /// This row is the dragged one — it hides while the view draws it
@@ -567,7 +552,7 @@ pub fn render_item<V: Render + 'static>(
     };
 
     let song = track.song;
-    let playing = context.current == song;
+    let playing = context.current == Some(song);
     // An in-flight drag: the grabbed row hides (the view draws it following
     // the pointer), the rows between it and the target shift to make room.
     let (translate, hidden) = match context.drag.and_then(|drag| drag::row_shift(ix, &drag)) {
@@ -583,7 +568,7 @@ pub fn render_item<V: Render + 'static>(
         hover: context.highlight.hover(ix),
         title_offset: context.highlight.marquee_offset(ix, Cell::Title),
         artist_offset: context.highlight.marquee_offset(ix, Cell::Artist),
-        bitrate: row_bitrate(playing, track.nominal_bitrate, context.live_bitrate),
+        bitrate: row_bitrate(playing, &track.bitrate, context.live_bitrate_label.as_ref()),
         translate,
         hidden,
         slim: context.slim,
@@ -796,8 +781,8 @@ fn compact_row(
         // Fill the gap so the numeric columns stay right-aligned.
         .child(div().flex_1().min_w_0())
         .child(year_cell(theme, year))
-        .when(!paint.slim, |d| d.child(bitrate_cell(theme, paint.bitrate)))
-        .when(!paint.slim, |d| d.child(duration_cell(theme, track)))
+        .when(!paint.slim, |d| d.child(bitrate_cell(theme, paint.bitrate.clone())))
+        .when(!paint.slim, |d| d.child(duration_cell(theme, track.duration.clone())))
         .into_any_element()
 }
 
@@ -871,8 +856,8 @@ fn track_row(
         // the numeric columns stay put. Slim rows (the queue) end at the gap —
         // no numeric columns follow, so there's nothing to keep put.
         .when(!paint.slim, |d| d.child(div().w(px(theme.action_col())).flex_none()))
-        .when(!paint.slim, |d| d.child(bitrate_cell(theme, paint.bitrate)))
-        .when(!paint.slim, |d| d.child(duration_cell(theme, track)))
+        .when(!paint.slim, |d| d.child(bitrate_cell(theme, paint.bitrate.clone())))
+        .when(!paint.slim, |d| d.child(duration_cell(theme, track.duration.clone())))
         .into_any_element()
 }
 
@@ -1025,25 +1010,25 @@ fn row_background(
 
 /// The declared/current bitrate, right-aligned just left of the duration.
 /// Empty when nothing is known.
-fn bitrate_cell(theme: Theme, bitrate: Option<u32>) -> AnyElement {
+fn bitrate_cell(theme: Theme, label: SharedString) -> AnyElement {
     div()
         .w(px(theme.bitrate_col()))
         .flex_none()
         .text_right()
         .text_size(px(theme.small_px()))
         .text_color(theme.text_faint)
-        .child(bitrate.map(format_bitrate).unwrap_or_default())
+        .child(label)
         .into_any_element()
 }
 
-fn duration_cell(theme: Theme, track: &TrackRow) -> AnyElement {
+fn duration_cell(theme: Theme, label: SharedString) -> AnyElement {
     div()
         .w(px(theme.length_col()))
         .flex_none()
         .text_right()
         .text_size(px(theme.small_px()))
         .text_color(theme.text_faint)
-        .child(format_duration(Duration::from_secs(track.secs)))
+        .child(label)
         .into_any_element()
 }
 
@@ -1060,13 +1045,14 @@ fn year_cell(theme: Theme, year: &str) -> AnyElement {
         .into_any_element()
 }
 
-/// The bitrate a row shows: the live number while it's playing, its declared
-/// bitrate otherwise.
-pub fn row_bitrate(playing: bool, nominal: Option<u32>, live: Option<u32>) -> Option<u32> {
+/// The bitrate label a row shows: the live number while it's playing, its
+/// declared label otherwise. A `SharedString` clone is a refcount bump, so a
+/// non-playing row costs no allocation.
+fn row_bitrate(playing: bool, nominal: &SharedString, live: Option<&SharedString>) -> SharedString {
     if playing {
-        live.or(nominal)
+        live.cloned().unwrap_or_else(|| nominal.clone())
     } else {
-        nominal
+        nominal.clone()
     }
 }
 
@@ -1106,8 +1092,7 @@ mod tests {
             album_name: Some(album.to_string()),
             album_artist: None,
             track_position: None,
-            year: None,
-            release_date: None,
+            date: None,
             nominal_bitrate: None,
             lyrics: Lyrics::None,
             duration: Duration::ZERO,
@@ -1176,9 +1161,11 @@ mod tests {
 
     #[test]
     fn row_bitrate_prefers_live_while_playing() {
-        assert_eq!(row_bitrate(true, Some(320_000), Some(256_000)), Some(256_000));
-        assert_eq!(row_bitrate(true, Some(320_000), None), Some(320_000));
-        assert_eq!(row_bitrate(false, Some(320_000), Some(256_000)), Some(320_000));
+        let nominal = SharedString::from("320 kb/s");
+        let live = SharedString::from("256 kb/s");
+        assert_eq!(row_bitrate(true, &nominal, Some(&live)), live);
+        assert_eq!(row_bitrate(true, &nominal, None), nominal);
+        assert_eq!(row_bitrate(false, &nominal, Some(&live)), nominal);
     }
 
     fn section_with_tracks(count: usize) -> AlbumSection {
@@ -1196,8 +1183,8 @@ mod tests {
                     number: i + 1,
                     title: String::new(),
                     artist: String::new(),
-                    secs: 0,
-                    nominal_bitrate: None,
+                    duration: SharedString::from(""),
+                    bitrate: SharedString::from(""),
                 })
                 .collect(),
         }
@@ -1245,7 +1232,7 @@ mod tests {
     fn selection_ranges_skip_headers() {
         let sections = vec![section_with_tracks(2), section_with_tracks(2)];
         let items = flatten(&sections); // Header, T0, T1, Header, T0, T1
-        let mut selection = Selection::default();
+        let mut selection = RowSelection::default();
         selection.set_single(1);
         selection.extend_to(4, &items);
         assert_eq!(selection.len(), 3, "rows 1, 2, 4 — the header at 3 is skipped");
@@ -1256,7 +1243,7 @@ mod tests {
 
     #[test]
     fn selection_toggle_adds_then_removes() {
-        let mut selection = Selection::default();
+        let mut selection = RowSelection::default();
         selection.toggle(3);
         assert!(selection.contains(3));
         selection.toggle(3);
@@ -1268,7 +1255,7 @@ mod tests {
     fn songs_follow_pick_order_not_list_order() {
         let sections = vec![section_with_tracks(4)];
         let items = flatten(&sections); // Header, T0, T1, T2, T3
-        let mut selection = Selection::default();
+        let mut selection = RowSelection::default();
         selection.toggle(3); // song 2
         selection.toggle(1); // song 0
         selection.toggle(4); // song 3
@@ -1283,7 +1270,7 @@ mod tests {
     fn a_shift_range_queues_in_list_order() {
         let sections = vec![section_with_tracks(4)];
         let items = flatten(&sections); // Header, T0, T1, T2, T3
-        let mut selection = Selection::default();
+        let mut selection = RowSelection::default();
         selection.set_single(4);
         selection.extend_to(1, &items);
         assert_eq!(selection.songs(&items, &sections), vec![0, 1, 2, 3]);

@@ -64,7 +64,7 @@ pub struct LyricsView {
     position: Duration,
     /// The track the state above belongs to, so a track change snaps rather than
     /// scrolling from the previous song's position.
-    song: SongId,
+    song: Option<SongId>,
     /// The header title's marquee — the same fade/slide/spring-back the list
     /// rows use.
     title_marquee: Marquee,
@@ -99,7 +99,7 @@ impl LyricsView {
             offset: Tween::new(0.0),
             anchor: None,
             position: Duration::ZERO,
-            song: 0,
+            song: None,
             title_marquee: Marquee::new(),
             _observe: observe,
             _observe_animator: observe_animator,
@@ -118,10 +118,10 @@ impl LyricsView {
         let transition = Duration::from_secs_f32(TRANSITION_SECS);
         let (song, position, anchor, fading) = {
             let state = self.state.read(cx);
-            let metadata = state.metadata();
+            let metadata = state.metadata(cx);
             let position = state.live_position();
-            let (anchor, fading) = match &metadata.lyrics {
-                Lyrics::Synced(lines) if !lines.is_empty() => (
+            let (anchor, fading) = match metadata.as_ref().map(|m| &m.lyrics) {
+                Some(Lyrics::Synced(lines)) if !lines.is_empty() => (
                     Some(anchor_at(lines, position, transition)),
                     // Keep re-rendering while a colour is crossing, so the fade
                     // advances frame by frame even between playback reports.
@@ -129,7 +129,7 @@ impl LyricsView {
                 ),
                 _ => (None, false),
             };
-            (metadata.id, position, anchor, fading)
+            (metadata.map(|m| m.id), position, anchor, fading)
         };
 
         let mut changed = fading;
@@ -185,14 +185,12 @@ impl Render for LyricsView {
 
         // The body is built against the borrowed lyrics, so nothing is cloned
         // per frame — the click handlers only need `cx` immutably.
-        let state = self.state.read(cx);
-        let metadata = state.metadata();
-        let title = metadata.display_title();
+        let metadata = self.state.read(cx).metadata(cx);
+        let title = metadata.as_ref().map(|m| m.display_title()).unwrap_or_default();
         let title_travel = marquee::travel_for(&title, title_width, LYRIC_TITLE_CHARS);
 
-        let body: AnyElement = match &metadata.lyrics {
-            Lyrics::None => empty_lyrics_hint(theme),
-            Lyrics::Plain(text) => div()
+        let body: AnyElement = match metadata.as_ref().map(|m| &m.lyrics) {
+            Some(Lyrics::Plain(text)) => div()
                 .id("lyrics-scroll")
                 .size_full()
                 .overflow_y_scroll()
@@ -209,8 +207,7 @@ impl Render for LyricsView {
                     div().w_full().flex_none().whitespace_normal().child(line.to_string())
                 }))
                 .into_any_element(),
-            Lyrics::Synced(lines) if lines.is_empty() => empty_lyrics_hint(theme),
-            Lyrics::Synced(lines) => {
+            Some(Lyrics::Synced(lines)) if !lines.is_empty() => {
                 let line = |index: usize, cx: &Context<Self>| -> AnyElement {
                     let timestamp = lines[index].timestamp;
                     synced_line(
@@ -278,6 +275,7 @@ impl Render for LyricsView {
                     )
                     .into_any_element()
             }
+            _ => empty_lyrics_hint(theme),
         };
 
         div()

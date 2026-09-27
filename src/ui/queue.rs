@@ -28,7 +28,7 @@ use gpui::{
     MouseMoveEvent, MouseUpEvent, Render, Window,
 };
 
-use crate::model::{generate_song_id, PlaylistId};
+use crate::model::{PlaylistId, SongId};
 use crate::ui::album_list::{self, AlbumList, AlbumListSubs, AlbumListView, Play};
 use crate::ui::albums::{AlbumSection, RowActions, TrackRow};
 use crate::ui::animation::{Animator, Tween};
@@ -37,9 +37,9 @@ use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::{Container, SECTION_GAP};
 use crate::ui::cover_store::CoverStore;
 use crate::ui::drag::Drag;
-use crate::ui::format::format_duration;
+use crate::ui::format::{format_bitrate, format_duration};
 use crate::ui::layout::RAIL_PX;
-use crate::ui::library_state::LibraryState;
+use crate::ui::library_state::{LibraryState, Request};
 use crate::ui::marquee;
 use crate::ui::menu::SongMenuRequest;
 use crate::ui::playback::BAR_WIDTH;
@@ -76,10 +76,10 @@ pub struct QueueView {
     open_target: bool,
     /// The shared table shell — rows, selection, marquees, virtualized list.
     list: AlbumListView,
-    /// The queue paths the rows were last built from, and the controller
+    /// The queue entries the rows were last built from, and the controller
     /// generation they were built at — the snapshot happens only when the
     /// generation moves, never per frame.
-    queue_paths: Vec<PathBuf>,
+    queue_entries: Vec<(SongId, PathBuf)>,
     queue_generation: u64,
     /// The queue's total time, computed with the snapshot.
     total_secs: u64,
@@ -129,8 +129,7 @@ impl QueueView {
         .detach();
         // The queue renders the library's rows, so it shares the browse
         // container's typography — the same as the playlist and search tabs.
-        let themed =
-            Themed::with_container(BrowseView::container_id(), BrowseView::default_font_size(), &config, cx);
+        let themed = BrowseView::themed(&config, cx);
         Self {
             playback,
             library,
@@ -139,7 +138,7 @@ impl QueueView {
             slide: Tween::new(0.0),
             open_target: false,
             list,
-            queue_paths: Vec::new(),
+            queue_entries: Vec::new(),
             queue_generation: 0,
             total_secs: 0,
             drag: Drag::default(),
@@ -150,34 +149,36 @@ impl QueueView {
     /// The queue as one drawable section: every path a track row, numbered by
     /// queue position. `PlaylistId(0)` is inert — the row actions play from
     /// the queue index, not the section's playlist.
-    fn queue_section(&self, queue: &[PathBuf], cx: &App) -> AlbumSection {
+    fn queue_section(&self, queue: &[(SongId, PathBuf)], cx: &App) -> AlbumSection {
         let library = self.library.read(cx).library();
         let tracks = queue
             .iter()
             .enumerate()
-            .map(|(index, path)| {
-                let song = generate_song_id(path).unwrap_or(0);
-                match library.get(song) {
-                    Some(song) => TrackRow {
-                        song: song.id,
-                        number: index + 1,
-                        title: song.display_title(),
-                        artist: song.artists.join(", "),
-                        secs: song.duration.as_secs(),
-                        nominal_bitrate: song.nominal_bitrate,
-                    },
-                    None => TrackRow {
-                        song,
-                        number: index + 1,
-                        title: path
-                            .file_stem()
+            .map(|(index, (id, path))| {
+                let (title, artist, duration, bitrate) = match library.get(*id) {
+                    Some(song) => (
+                        song.display_title(),
+                        song.artists.join(", "),
+                        format_duration(song.duration),
+                        song.nominal_bitrate.map(format_bitrate).unwrap_or_default(),
+                    ),
+                    None => (
+                        path.file_stem()
                             .unwrap_or(path.as_os_str())
                             .to_string_lossy()
                             .into_owned(),
-                        artist: "Unknown Artist".to_string(),
-                        secs: 0,
-                        nominal_bitrate: None,
-                    },
+                        "Unknown Artist".to_string(),
+                        String::new(),
+                        String::new(),
+                    ),
+                };
+                TrackRow {
+                    song: *id,
+                    number: index + 1,
+                    title,
+                    artist,
+                    duration: duration.into(),
+                    bitrate: bitrate.into(),
                 }
             })
             .collect();
@@ -196,7 +197,7 @@ impl QueueView {
     /// End the drag: drop the grabbed entry at the row it's over. A release
     /// without a grab does nothing.
     fn release_drag(&mut self, cx: &mut Context<Self>) {
-        let dropped = self.drag.release(self.queue_paths.len());
+        let dropped = self.drag.release(self.queue_entries.len());
         if let Some((from, to)) = dropped.filter(|(from, to)| from != to) {
             self.playback.update(cx, |state, cx| state.move_queue_entry(from, to, cx));
         }
@@ -205,11 +206,11 @@ impl QueueView {
         }
     }
 
-    /// A queue entry's display labels — the library's metadata when the path
-    /// is scanned, the file name otherwise.
-    fn entry_labels(&self, path: &Path, cx: &App) -> (String, String) {
+    /// A queue entry's display labels — the library's metadata when the id is
+    /// scanned, the file name otherwise.
+    fn entry_labels(&self, id: SongId, path: &Path, cx: &App) -> (String, String) {
         let library = self.library.read(cx).library();
-        match library.get(generate_song_id(path).unwrap_or(0)) {
+        match library.get(id) {
             Some(song) => (song.display_title(), song.artists.join(", ")),
             None => (
                 path.file_stem().unwrap_or(path.as_os_str()).to_string_lossy().into_owned(),
@@ -297,7 +298,7 @@ impl RowActions<QueueView> for QueueRows {
         let request =
             SongMenuRequest { songs, position: event.position, playlist: None, queue: true };
         let library = view.list().library().clone();
-        library.update(cx, |state, cx| state.request_song_menu(request, cx));
+        library.update(cx, |state, cx| state.request(Request::SongMenu(request), cx));
     }
 
     fn hover(&self, view: &mut QueueView, item_ix: usize, hovered: bool, cx: &mut Context<QueueView>) {
@@ -354,12 +355,12 @@ impl Render for QueueView {
         let queue_changed = generation != self.queue_generation;
         if queue_changed {
             self.queue_generation = generation;
-            self.queue_paths = self.playback.read(cx).queue().0.to_vec();
+            self.queue_entries = self.playback.read(cx).queue().0.to_vec();
             let library = self.library.read(cx).library();
             self.total_secs = self
-                .queue_paths
+                .queue_entries
                 .iter()
-                .filter_map(|path| library.get(generate_song_id(path).unwrap_or(0)))
+                .filter_map(|(id, _)| library.get(*id))
                 .map(|song| song.duration.as_secs())
                 .sum();
         }
@@ -390,7 +391,7 @@ impl Render for QueueView {
         // Rebuild when the rows are stale or the queue moved; otherwise keep
         // the selection and marquee state.
         let fresh = if self.list.rows().is_dirty() || queue_changed {
-            Some(vec![self.queue_section(&self.queue_paths, cx)])
+            Some(vec![self.queue_section(&self.queue_entries, cx)])
         } else {
             None
         };
@@ -440,7 +441,7 @@ impl Render for QueueView {
             // The drag's move/release listeners sit on the panel root, so a
             // drag keeps tracking however far the pointer roams inside it.
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
-                if this.drag.drag(event.position.y, this.queue_paths.len()) {
+                if this.drag.drag(event.position.y, this.queue_entries.len()) {
                     cx.notify();
                 }
             }))
@@ -512,8 +513,8 @@ impl Render for QueueView {
         // `top` is in window coordinates; the panel spans the tabs container,
         // whose top is the window's, so they coincide.
         if let Some(info) = drag_info {
-            let path = self.queue_paths[info.grabbed].clone();
-            let (title, artist) = self.entry_labels(&path, cx);
+            let (id, path) = self.queue_entries[info.grabbed].clone();
+            let (title, artist) = self.entry_labels(id, &path, cx);
             let columns = self.list.rows().columns();
             panel = panel.child(
                 div()

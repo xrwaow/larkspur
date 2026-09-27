@@ -2,12 +2,12 @@
 //! underneath.
 //!
 //! This is the container from the mock. It's the "easy search": it walks the
-//! [`album_list::Source`] it was scoped to and draws the result through GPUI's
-//! virtualized [`list`], so a multi-thousand-song library only ever draws the
-//! rows near the viewport (plus a little overdraw) instead of all of them. The
-//! whole list shell — selection, keyboard navigation, paging, hover fades —
-//! lives in [`AlbumList`]; this view only scopes the source (library, one
-//! artist's discography, a folder's playlists) and draws its header.
+//! [`Scope`] it was scoped to and draws the result through GPUI's virtualized
+//! [`list`], so a multi-thousand-song library only ever draws the rows near the
+//! viewport (plus a little overdraw) instead of all of them. The whole list
+//! shell — selection, keyboard navigation, paging, hover fades — lives in
+//! [`AlbumList`]; this view only scopes the source (library, one artist's
+//! discography, a folder's playlists) and draws its header.
 //!
 //! The library and artist scopes carry the header's filter box (`ctrl+f`)
 //! and shuffle button: the box live-filters the sections through the same
@@ -18,8 +18,8 @@
 
 use gpui::{div, prelude::*, px, Context, Entity, FocusHandle, KeyDownEvent, Render, Window};
 
-use crate::model::{search, InputAction, PlaylistId};
-use crate::ui::album_list::{self, AlbumList, AlbumListSubs, AlbumListView, Play, Source};
+use crate::model::{search, InputAction, PlaylistId, Scope};
+use crate::ui::album_list::{self, AlbumList, AlbumListSubs, AlbumListView, Play};
 use crate::ui::albums;
 use crate::ui::animation::Animator;
 use crate::ui::config_state::{ConfigState, Themed};
@@ -37,7 +37,7 @@ pub struct BrowseView {
     list: AlbumListView,
     /// What the sections are built from (the library, an artist, a folder's
     /// playlists).
-    source: Source,
+    scope: Scope,
     /// A folder scope's tab/header title.
     scope_title: Option<String>,
     /// The scope's filter box, and its focus handle — `ctrl+f` lands here,
@@ -63,7 +63,7 @@ impl BrowseView {
         Self {
             themed,
             list: AlbumListView::new(library, playback, covers, animator, Play::Playlist),
-            source: Source::Library,
+            scope: Scope::Library,
             scope_title: None,
             search: TextField::default(),
             search_focus: cx.focus_handle(),
@@ -77,6 +77,13 @@ impl BrowseView {
         self.focus_handle.clone()
     }
 
+    /// The theme for a view that renders the library's rows — the playlist,
+    /// search, and queue tabs share the browse list's typography so they can't
+    /// drift from it.
+    pub fn themed<C: 'static>(config: &Entity<ConfigState>, cx: &mut Context<C>) -> Themed {
+        Themed::with_container(Self::container_id(), Self::default_font_size(), config, cx)
+    }
+
     /// Select the library's filter box — what `ctrl+f` lands on.
     pub fn focus_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.search_focus);
@@ -85,9 +92,9 @@ impl BrowseView {
 
     /// Scope the library to `artist`'s discography (or clear the scope).
     pub fn set_artist_filter(&mut self, artist: Option<String>, cx: &mut Context<Self>) {
-        let source = artist.map_or(Source::Library, Source::Artist);
-        if self.source != source {
-            self.source = source;
+        let scope = artist.map_or(Scope::Library, Scope::Artist);
+        if self.scope != scope {
+            self.scope = scope;
             self.scope_title = None;
             self.list.rows_mut().mark_dirty();
             cx.notify();
@@ -102,7 +109,7 @@ impl BrowseView {
         playlists: Vec<PlaylistId>,
         cx: &mut Context<Self>,
     ) {
-        self.source = Source::Playlists(playlists);
+        self.scope = Scope::Playlists(playlists);
         self.scope_title = Some(title);
         self.list.rows_mut().mark_dirty();
         cx.notify();
@@ -112,11 +119,12 @@ impl BrowseView {
     /// grouped by album like the search panel's results.
     fn build_sections(&self, cx: &Context<Self>) -> Vec<albums::AlbumSection> {
         let library = self.list.library().read(cx).library();
-        if self.search.is_empty() {
-            return self.source.sections(library);
-        }
-        let (query, _) = search::parse(&self.search.value);
-        self.source.sections_with(library, &query)
+        let query = if self.search.is_empty() {
+            search::Query::default()
+        } else {
+            search::parse(&self.search.value).0
+        };
+        album_list::sections(library, &self.scope, &query)
     }
 }
 
@@ -153,14 +161,14 @@ impl Render for BrowseView {
         // the artist; the library tab is the fallback. This is the header text,
         // not the tab strip's (see `TabsView::tab_title`) — they agree because
         // both read the same scope.
-        let title = match &self.source {
-            Source::Library => "Library".to_string(),
-            Source::Artist(artist) => artist.clone(),
-            Source::Playlists(_) => self.scope_title.clone().unwrap_or_else(|| "Library".to_string()),
+        let title = match &self.scope {
+            Scope::Library => "Library".to_string(),
+            Scope::Artist(artist) => artist.clone(),
+            Scope::Playlists(_) => self.scope_title.clone().unwrap_or_else(|| "Library".to_string()),
         };
         // The filter box's placeholder names its scope.
-        let placeholder = match &self.source {
-            Source::Artist(_) => "Filter the discography…",
+        let placeholder = match &self.scope {
+            Scope::Artist(_) => "Filter the discography…",
             _ => "Filter the library…",
         };
 
@@ -222,7 +230,7 @@ impl Render for BrowseView {
                 // the whole library; an artist tab, their discography. A
                 // folder view is a played folder's temporary playlists —
                 // already exactly what was asked for — so it shows neither.
-                matches!(self.source, Source::Library | Source::Artist(_)).then(|| {
+                matches!(self.scope, Scope::Library | Scope::Artist(_)).then(|| {
                     // Fixed-width and pushed to the right edge: the albums·songs
                     // readout changes with the filter, and a flexed box would
                     // resize on every keystroke.
@@ -264,7 +272,7 @@ impl Render for BrowseView {
                                 .hover(|d| d.bg(theme.row_hover))
                                 .on_click(cx.listener(|this, _event, _window, cx| {
                                     let playback = this.list.playback().clone();
-                                    let scope = this.source.scope();
+                                    let scope = this.scope.clone();
                                     this.list.library().clone().update(cx, |state, cx| {
                                         state.play_shuffled(scope, &playback, cx)
                                     });

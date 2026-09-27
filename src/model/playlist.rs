@@ -1,9 +1,10 @@
 //! Playlists — the uniform container for a list of songs.
 //!
-//! Autogen (album) and custom playlists share one schema. They differ only
-//! in where their [`PlaylistMeta`] comes from and whether a rescan rebuilds
-//! them: autogen playlists are derived from song tags and read-only, custom
-//! ones are user-owned and persisted.
+//! Autogen (album) and custom playlists share one [`Playlist`] struct; the
+//! variant-specific data lives in [`PlaylistKind`]. They differ in where their
+//! title comes from and whether a rescan rebuilds them: autogen playlists are
+//! derived from song tags and read-only, custom ones are user-owned and
+//! persisted.
 //!
 //! An *artist* is not a playlist — it's a list of playlists (their albums).
 //! Those groupings are derived on demand from [`Library`](super::library::Library)
@@ -25,17 +26,19 @@ use super::identity::SongId;
 #[serde(transparent)]
 pub struct PlaylistId(pub u64);
 
-/// Whether a playlist is derived from the library or owned by the user.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+/// Whether a playlist is derived from the library or owned by the user, plus
+/// the data only that variant carries.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlaylistKind {
-    /// Rebuilt from song tags on every rescan; read-only.
-    Auto,
+    /// Rebuilt from song tags on every rescan; read-only. The [`PlaylistOrigin`]
+    /// is the natural key a rescan matches on, so a rebuilt album keeps its id.
+    Auto(PlaylistOrigin),
     /// User-owned: add/remove/rename/delete; persisted.
-    Custom,
-    /// Created on the fly ("Play folder", a multi-row selection played as
-    /// one). Never persisted and dropped by a rescan — it lives exactly as
-    /// long as the tab that shows it.
-    Temporary,
+    Custom { title: String },
+    /// Created on the fly ("Play folder", a multi-row selection played as one).
+    /// Never persisted and dropped by a rescan — it lives exactly as long as
+    /// the tab that shows it.
+    Temporary { title: String },
 }
 
 /// The natural key an autogen playlist is matched by on rescan, so a rebuilt
@@ -49,63 +52,57 @@ pub enum PlaylistOrigin {
     Album { name: String, artist: String, dir: PathBuf },
 }
 
-/// What's *declared about* a playlist — the uniform schema autogen and
-/// custom playlists share.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub struct PlaylistMeta {
-    pub title: String,
-    /// Album artist for an autogen album playlist; `None` for custom.
-    pub artist: Option<String>,
-    /// The song whose cover represents this playlist.
-    ///
-    /// `None` means "inherit": the UI shows an autogen playlist's first
-    /// song's cover, and falls back to the now-playing cover for a custom
-    /// playlist that has no art of its own.
-    pub cover: Option<SongId>,
-}
-
-impl PlaylistMeta {
-    pub fn new(title: impl Into<String>) -> Self {
-        Self { title: title.into(), artist: None, cover: None }
-    }
-}
-
 /// A list of songs, referencing them by [`SongId`] rather than owning
 /// `SongMetadata` copies.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Playlist {
     pub id: PlaylistId,
-    /// Stored for user-owned playlists only. An autogen playlist's meta is
-    /// *derived* from its origin and first song (see [`Playlist::meta`]), so
-    /// the two copies a rescan would otherwise rewrite can't drift apart.
-    pub meta: Option<PlaylistMeta>,
     pub kind: PlaylistKind,
     pub song_ids: Vec<SongId>,
-    /// Present for [`PlaylistKind::Auto`]; the key a rescan matches on.
-    pub origin: Option<PlaylistOrigin>,
 }
 
 impl Playlist {
-    /// What the playlist declares about itself. Autogen playlists derive
-    /// theirs from the origin and the first song (whose cover represents the
-    /// album); custom and temporary playlists use their stored meta.
-    pub fn meta(&self) -> PlaylistMeta {
-        match &self.origin {
-            Some(PlaylistOrigin::Album { name, artist, .. }) => PlaylistMeta {
-                title: name.clone(),
-                artist: Some(artist.clone()),
-                cover: self.song_ids.first().copied(),
-            },
-            None => self.meta.clone().unwrap_or_else(|| PlaylistMeta::new("")),
+    /// The playlist's title: an autogen album's name, or a custom/temporary
+    /// playlist's stored title.
+    pub fn title(&self) -> &str {
+        match &self.kind {
+            PlaylistKind::Auto(PlaylistOrigin::Album { name, .. }) => name,
+            PlaylistKind::Custom { title } | PlaylistKind::Temporary { title } => title,
         }
     }
 
+    /// The album artist, for an autogen album playlist.
+    pub fn artist(&self) -> Option<&str> {
+        match &self.kind {
+            PlaylistKind::Auto(PlaylistOrigin::Album { artist, .. }) => Some(artist),
+            _ => None,
+        }
+    }
+
+    /// The natural key a rescan matches an autogen playlist on.
+    pub fn origin(&self) -> Option<&PlaylistOrigin> {
+        match &self.kind {
+            PlaylistKind::Auto(origin) => Some(origin),
+            _ => None,
+        }
+    }
+
+    /// The song whose cover represents the playlist — its first, when it has
+    /// one.
+    pub fn cover(&self) -> Option<SongId> {
+        self.song_ids.first().copied()
+    }
+
+    pub fn is_auto(&self) -> bool {
+        matches!(self.kind, PlaylistKind::Auto(_))
+    }
+
     pub fn is_custom(&self) -> bool {
-        self.kind == PlaylistKind::Custom
+        matches!(self.kind, PlaylistKind::Custom { .. })
     }
 
     pub fn is_temporary(&self) -> bool {
-        self.kind == PlaylistKind::Temporary
+        matches!(self.kind, PlaylistKind::Temporary { .. })
     }
 
     pub fn contains(&self, song: SongId) -> bool {
@@ -114,9 +111,5 @@ impl Playlist {
 
     pub fn len(&self) -> usize {
         self.song_ids.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.song_ids.is_empty()
     }
 }

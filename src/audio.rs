@@ -8,7 +8,7 @@ use std::time::Duration;
 use rodio::source::SeekError;
 use rodio::{Decoder, DeviceSinkBuilder, MixerDeviceSink, Player, Source};
 
-use crate::model::SongMetadata;
+use crate::model::SongId;
 
 /// How playback behaves when a track finishes.
 #[derive(Clone, Copy, PartialEq, Eq, Default, Debug)]
@@ -214,13 +214,13 @@ pub enum SongStatus {
 pub struct PlaybackController {
     _device_sink: MixerDeviceSink, // must outlive the player or audio stops
     player: Player,
-    queue: Vec<PathBuf>,
+    queue: Vec<(SongId, PathBuf)>,
     /// Bumped on every change to the queue's contents — the UI's cheap "did
     /// the queue move" check, so the queue view can skip snapshotting
-    /// thousands of paths every frame.
+    /// thousands of entries every frame.
     queue_generation: u64,
     current: Option<usize>,
-    pub metadata: SongMetadata,
+    /// The loaded track's real stream duration, for seek clamping.
     pub duration: Duration,
     /// The live-audio ring the visualizer reads. Shared with every source this
     /// controller appends, so it always reflects whatever is playing.
@@ -229,7 +229,7 @@ pub struct PlaybackController {
 }
 
 impl PlaybackController {
-    pub fn new(queue: Vec<PathBuf>) -> anyhow::Result<Self> {
+    pub fn new(queue: Vec<(SongId, PathBuf)>) -> anyhow::Result<Self> {
         let device_sink = DeviceSinkBuilder::open_default_sink()?;
         let player = Player::connect_new(device_sink.mixer());
 
@@ -241,7 +241,6 @@ impl PlaybackController {
             // built after this always snapshots it on its first render.
             queue_generation: 1,
             current: None,
-            metadata: SongMetadata::placeholder(),
             duration: Duration::ZERO,
             tap: Arc::new(SampleTap::new()),
             repeat: RepeatMode::Off,
@@ -250,7 +249,7 @@ impl PlaybackController {
         // An empty queue is valid: the app may launch with only a directory to
         // scan, and a track gets queued once the library is up.
         if !this.queue.is_empty() {
-            let parts = Self::track_parts(&this.queue[0])?;
+            let parts = Self::track_parts(&this.queue[0].1)?;
             this.start_track(0, parts);
         }
         Ok(this)
@@ -261,38 +260,35 @@ impl PlaybackController {
     /// This is how a playlist becomes the play queue: the UI resolves the
     /// playlist's [`SongId`](crate::model::SongId)s to paths and hands them
     /// over — the controller never needs to know what a playlist is.
-    pub fn set_queue(&mut self, queue: Vec<PathBuf>, start: usize) -> anyhow::Result<()> {
+    pub fn set_queue(&mut self, queue: Vec<(SongId, PathBuf)>, start: usize) -> anyhow::Result<()> {
         anyhow::ensure!(!queue.is_empty(), "empty queue");
         let start = start.min(queue.len() - 1);
-        let parts = Self::track_parts(&queue[start])?;
+        let parts = Self::track_parts(&queue[start].1)?;
         self.queue = queue;
         self.queue_generation += 1;
         self.start_track(start, parts);
         Ok(())
     }
 
-    /// Decode + tag-read one track.
-    fn track_parts(path: &Path) -> anyhow::Result<(TrackSource, SongMetadata, Duration)> {
-        let metadata = SongMetadata::load(path)?;
+    /// Decode one track. The metadata is *not* read here — the library already
+    /// holds it, keyed by the entry's [`SongId`], so the controller only needs
+    /// the decoder and its real stream duration.
+    fn track_parts(path: &Path) -> anyhow::Result<(TrackSource, Duration)> {
         let source = build_source(path)?;
-        // Prefer the decoder's real stream duration over the tag value —
-        // tags can drift from the actual audio, and seek clamping should
-        // match what's actually seekable.
-        let duration = source.total_duration().unwrap_or(metadata.duration);
-        Ok((source, metadata, duration))
+        // Prefer the decoder's real stream duration over any tag value — tags
+        // can drift from the actual audio, and seek clamping should match what
+        // is actually seekable.
+        let duration = source.total_duration().unwrap_or(Duration::ZERO);
+        Ok((source, duration))
     }
 
     fn load_track(&mut self, index: usize) -> anyhow::Result<()> {
-        let parts = Self::track_parts(&self.queue[index])?;
+        let parts = Self::track_parts(&self.queue[index].1)?;
         self.start_track(index, parts);
         Ok(())
     }
 
-    fn start_track(
-        &mut self,
-        index: usize,
-        (source, metadata, duration): (TrackSource, SongMetadata, Duration),
-    ) {
+    fn start_track(&mut self, index: usize, (source, duration): (TrackSource, Duration)) {
         // skip_one (not clear — that blocks until the current track
         // finishes!) tells the audio thread to drop the current source;
         // the new one is queued behind it and starts immediately after.
@@ -305,7 +301,6 @@ impl PlaybackController {
         self.player.append(TapSource::new(source, self.tap.clone()));
         self.player.play();
         self.current = Some(index);
-        self.metadata = metadata;
         self.duration = duration;
     }
 
@@ -321,7 +316,7 @@ impl PlaybackController {
         // endless restart loop.
         if self.repeat == RepeatMode::Once {
             if let Some(i) = self.current {
-                if let Ok(parts) = Self::track_parts(&self.queue[i]) {
+                if let Ok(parts) = Self::track_parts(&self.queue[i].1) {
                     self.repeat = RepeatMode::Off;
                     self.start_track(i, parts);
                     return true;
@@ -353,13 +348,13 @@ impl PlaybackController {
         if next >= self.queue.len() {
             return false;
         }
-        match Self::track_parts(&self.queue[next]) {
+        match Self::track_parts(&self.queue[next].1) {
             Ok(parts) => {
                 self.start_track(next, parts);
                 true
             }
             Err(e) => {
-                eprintln!("failed to load {:?}: {e}", self.queue[next]);
+                eprintln!("failed to load {:?}: {e}", self.queue[next].1);
                 // Drop whatever is playing so we land in the ended state
                 // instead of looping on a broken file every tick.
                 if !self.player.empty() {
@@ -405,7 +400,7 @@ impl PlaybackController {
 
     /// The play queue and the index of the loaded track, for the UI's queue
     /// view. Read-only: the queue is replaced wholesale via [`set_queue`].
-    pub fn queue(&self) -> (&[PathBuf], Option<usize>) {
+    pub fn queue(&self) -> (&[(SongId, PathBuf)], Option<usize>) {
         (&self.queue, self.current)
     }
 
@@ -426,13 +421,13 @@ impl PlaybackController {
     /// nothing playing (an empty queue) the first appended one begins
     /// playing; a drained queue picks the appended tracks up on the next
     /// tick, like any track that finishes.
-    pub fn add_to_queue(&mut self, paths: Vec<PathBuf>) -> anyhow::Result<bool> {
-        anyhow::ensure!(!paths.is_empty(), "no tracks to queue");
+    pub fn add_to_queue(&mut self, entries: Vec<(SongId, PathBuf)>) -> anyhow::Result<bool> {
+        anyhow::ensure!(!entries.is_empty(), "no tracks to queue");
         let first = self.queue.len();
-        self.queue.extend(paths);
+        self.queue.extend(entries);
         self.queue_generation += 1;
         if self.current.is_none() && self.player.empty() {
-            let parts = Self::track_parts(&self.queue[first])?;
+            let parts = Self::track_parts(&self.queue[first].1)?;
             self.start_track(first, parts);
             return Ok(true);
         }
@@ -448,18 +443,16 @@ impl PlaybackController {
     /// surviving entry); with nothing after it the queue lands in its
     /// played-out state on the last surviving entry, and an emptied queue
     /// stops playback.
-    pub fn remove_from_queue(&mut self, paths: &[PathBuf]) -> bool {
+    pub fn remove_from_queue(&mut self, ids: &[SongId]) -> bool {
         let before = self.queue.len();
         let Some(current) = self.current else {
-            let before = self.queue.len();
-            self.queue.retain(|path| !paths.contains(path));
+            self.queue.retain(|(id, _)| !ids.contains(id));
             self.queue_generation += (self.queue.len() != before) as u64;
             return false;
         };
-        let loaded_removed = paths.contains(&self.queue[current]);
-        let removed_before =
-            self.queue[..current].iter().filter(|path| paths.contains(path)).count();
-        self.queue.retain(|path| !paths.contains(path));
+        let loaded_removed = ids.contains(&self.queue[current].0);
+        let removed_before = self.queue[..current].iter().filter(|(id, _)| ids.contains(id)).count();
+        self.queue.retain(|(id, _)| !ids.contains(id));
         if self.queue.len() == before {
             return false;
         }
@@ -467,10 +460,10 @@ impl PlaybackController {
         if loaded_removed {
             if current < self.queue.len() {
                 // The next surviving entry took the removed slot: play it.
-                match Self::track_parts(&self.queue[current]) {
+                match Self::track_parts(&self.queue[current].1) {
                     Ok(parts) => self.start_track(current, parts),
                     Err(e) => {
-                        eprintln!("failed to load {:?}: {e}", self.queue[current]);
+                        eprintln!("failed to load {:?}: {e}", self.queue[current].1);
                         if !self.player.empty() {
                             self.player.skip_one();
                         }
@@ -537,9 +530,13 @@ impl PlaybackController {
     /// Path of the currently-loaded track, for the UI to load the waveform
     /// (and later, cover art) from without touching the decoder.
     pub fn current_path(&self) -> Option<&Path> {
-        self.current
-            .and_then(|i| self.queue.get(i))
-            .map(PathBuf::as_path)
+        self.current.and_then(|i| self.queue.get(i)).map(|(_, path)| path.as_path())
+    }
+
+    /// The loaded track's [`SongId`], if any — the UI resolves its metadata
+    /// from the library with this.
+    pub fn current_id(&self) -> Option<SongId> {
+        self.current.and_then(|i| self.queue.get(i)).map(|(id, _)| *id)
     }
 
     /// The live-audio ring the visualizer transforms. Cheap: clones an `Arc`.

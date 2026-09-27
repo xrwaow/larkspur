@@ -6,7 +6,7 @@ use gpui::{
 use crate::model::{SongId, ThemeKind};
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
-use crate::ui::cover_store::{CoverStore, FullCover};
+use crate::ui::cover_store::{CoverImage, CoverStore};
 use crate::ui::playback_state::PlaybackState;
 
 /// The now-playing cover square.
@@ -79,17 +79,9 @@ impl CoverView {
 
     /// Ask the store for the current track's cover, if it isn't known yet.
     fn request_current(&mut self, state: &Entity<PlaybackState>, cx: &mut Context<Self>) {
-        let (id, path, has_art) = {
-            let state = state.read(cx);
-            let song = state.metadata();
-            (song.id, song.path.clone(), song.has_art)
-        };
-        // `SongMetadata::placeholder` is id 0 with an empty path — nothing to
-        // decode until a track is actually chosen.
-        if id == 0 || path.as_os_str().is_empty() {
-            return;
-        }
-        self.covers.update(cx, |store, cx| store.request_full(id, path, has_art, cx));
+        let Some(song) = state.read(cx).metadata(cx) else { return };
+        self.covers
+            .update(cx, |store, cx| store.request_full(song.id, song.path.clone(), song.has_art, cx));
     }
 
     /// Push the current cover's accent into the config, if the dynamic theme is
@@ -99,8 +91,8 @@ impl CoverView {
         if self.config.read(cx).theme_kind() != ThemeKind::Dynamic {
             return;
         }
-        let id = self.state.read(cx).metadata().id;
-        if id == 0 || self.accent.as_ref().is_some_and(|(cached, _)| *cached == id) {
+        let Some(id) = self.state.read(cx).current_song() else { return };
+        if self.accent.as_ref().is_some_and(|(cached, _)| *cached == id) {
             return;
         }
         let Some(accent) = self.covers.read(cx).accent(id) else {
@@ -122,17 +114,17 @@ impl Container for CoverView {
 impl Render for CoverView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.themed.theme();
-        let id = self.state.read(cx).metadata().id;
-        let cover = self.covers.read(cx).full(id);
+        let id = self.state.read(cx).current_song();
+        let cover = id.and_then(|id| self.covers.read(cx).full(id));
 
         let art: AnyElement = match cover {
-            Some(FullCover::Ready(image)) => img(image)
+            Some(CoverImage::Ready(image)) => img(image)
                 .size_full()
                 .object_fit(ObjectFit::Cover)
                 .into_any_element(),
-            Some(FullCover::Loading) => placeholder(theme, "Loading…"),
+            Some(CoverImage::Loading) => placeholder(theme, "Loading…"),
             // Nothing playing, no art, or no art on this file.
-            Some(FullCover::Missing) | None => placeholder(theme, "♪"),
+            Some(CoverImage::Missing) | None => placeholder(theme, "♪"),
         };
 
         div()

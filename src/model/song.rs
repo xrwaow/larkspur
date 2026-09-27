@@ -9,6 +9,37 @@ use serde::{Deserialize, Serialize};
 use super::identity::{generate_song_id, SongId};
 use super::lyrics::{load_sidecar, looks_like_lrc, parse_lrc, Lyrics};
 
+/// A release date packed as `YYYYMMDD` (e.g. `20230501`), with zeros for
+/// unknown components: `20030000` is year-only, `20030500` is year + month.
+///
+/// One integer field, most-significant-first, so chronological ordering is a
+/// plain compare with no month/day tie-breaking — and a year-only tag stays
+/// distinguishable from a real January 1st. Decompose with
+/// [`year`](Self::year)/[`month`](Self::month)/[`day`](Self::day) at display.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct ReleaseDate(pub u32);
+
+impl ReleaseDate {
+    pub fn new(year: u16, month: Option<u8>, day: Option<u8>) -> Self {
+        Self(year as u32 * 10_000 + month.unwrap_or(0) as u32 * 100 + day.unwrap_or(0) as u32)
+    }
+
+    pub fn year(self) -> u16 {
+        (self.0 / 10_000) as u16
+    }
+
+    pub fn month(self) -> Option<u8> {
+        let month = ((self.0 / 100) % 100) as u8;
+        (month > 0).then_some(month)
+    }
+
+    pub fn day(self) -> Option<u8> {
+        let day = (self.0 % 100) as u8;
+        (day > 0).then_some(day)
+    }
+}
+
 /// What's *declared about the file*, loaded once via `lofty`.
 ///
 /// Static and per-file: title, artists, album, track position, duration,
@@ -32,14 +63,12 @@ pub struct SongMetadata {
     /// playlist instead of splitting it per track artist.
     pub album_artist: Option<String>,
     pub track_position: Option<u16>,
-    /// Release year, when the tags declare one (`Year`, `RecordingDate`, or
-    /// `ReleaseDate`). Drives the browse header's year and date filters.
-    pub year: Option<u16>,
-    /// The full release date — year, month, day — when the tag carries one
-    /// (`2003-05-01`). What the library's chronological ordering uses: songs
-    /// of the same year order by month/day rather than alphabetically.
+    /// The release date, packed as `YYYYMMDD` (`20030501`), when the tags
+    /// declare one (`Year`, `RecordingDate`, or `ReleaseDate`); a year-only
+    /// tag packs as `20030000`. Drives the browse header's year and the date
+    /// filters, and is the library's chronological sort key.
     #[serde(default)]
-    pub release_date: Option<(u16, u8, u8)>,
+    pub date: Option<ReleaseDate>,
     /// Declared/average bitrate from the file's properties, in **bits per
     /// second**.
     ///
@@ -56,29 +85,6 @@ pub struct SongMetadata {
 }
 
 impl SongMetadata {
-    /// A stand-in for "nothing loaded yet".
-    ///
-    /// Lets the player exist before a track is chosen (e.g. the app launched
-    /// with only a directory to scan), so the UI always has something to
-    /// render instead of an `Option` threaded through every view.
-    pub fn placeholder() -> Self {
-        Self {
-            id: 0,
-            path: PathBuf::new(),
-            song_name: None,
-            artists: Vec::new(),
-            album_name: None,
-            album_artist: None,
-            track_position: None,
-            year: None,
-            release_date: None,
-            nominal_bitrate: None,
-            lyrics: Lyrics::None,
-            duration: Duration::ZERO,
-            has_art: false,
-        }
-    }
-
     /// Read tags and properties for `path`.
     ///
     /// Succeeds for untagged files too — they're still playable songs, just
@@ -113,8 +119,7 @@ impl SongMetadata {
                 album_name: None,
                 album_artist: None,
                 track_position: None,
-                year: None,
-                release_date: None,
+                date: None,
                 nominal_bitrate: None,
                 lyrics: sidecar.unwrap_or(Lyrics::None),
                 duration,
@@ -130,7 +135,7 @@ impl SongMetadata {
         let album_name = tag.album().map(|s| s.into_owned());
         let album_artist = tag.get_string(&ItemKey::AlbumArtist).map(|s| s.to_string());
         let track_position = tag.track().map(|n| n as u16);
-        let (year, release_date) = read_date(tag);
+        let date = read_date(tag);
 
         let lyrics = sidecar.unwrap_or_else(|| {
             tag.get_string(&ItemKey::Lyrics)
@@ -156,8 +161,7 @@ impl SongMetadata {
             album_name,
             album_artist,
             track_position,
-            year,
-            release_date,
+            date,
             nominal_bitrate,
             lyrics,
             duration,
@@ -204,34 +208,31 @@ impl SongMetadata {
 
 }
 
-/// The date a tag declares — the year, plus the month and day when the value
-/// carries them — trying the three keys that carry one.
+/// The date a tag declares, packed — trying the three keys that carry one.
 ///
 /// `Year` is the Vorbis-comment key (and ID3v2.3 `TYER`); `RecordingDate`
 /// (`TDRC`) and `ReleaseDate` (`TDRL`) are ISO-ish dates like `2003-05-01`,
 /// which is why only the leading numbers are read: `2003-05-01 12:00` still
 /// yields May 1st, and a bare `2003` yields the year alone.
-fn read_date(tag: &Tag) -> (Option<u16>, Option<(u16, u8, u8)>) {
+fn read_date(tag: &Tag) -> Option<ReleaseDate> {
     [ItemKey::Year, ItemKey::RecordingDate, ItemKey::ReleaseDate]
         .iter()
-        .find_map(|key| tag.get_string(key).map(parse_date))
-        .unwrap_or((None, None))
+        .find_map(|key| tag.get_string(key).and_then(parse_date))
 }
 
-/// Parse a date-ish tag value into `(year, (year, month, day))`.
+/// Parse a date-ish tag value into a packed [`ReleaseDate`].
 ///
 /// The leading number is the year; a `-`/`/`-separated month and day follow
 /// when present. A compact `20030501` (no separators) is split by position.
 /// Anything that doesn't fit degrades: a value with a month but no day keeps
-/// the year and drops the rest.
-fn parse_date(s: &str) -> (Option<u16>, Option<(u16, u8, u8)>) {
+/// the year and drops the rest, and a value with no usable year yields `None`.
+fn parse_date(s: &str) -> Option<ReleaseDate> {
     let trimmed = s.trim();
     let mut numbers: Vec<u32> = trimmed
         .split(|c: char| !c.is_ascii_digit())
         .filter(|part| !part.is_empty())
         .map(|part| part.parse().ok())
-        .collect::<Option<Vec<_>>>()
-        .unwrap_or_default();
+        .collect::<Option<Vec<_>>>()?;
 
     // `20030501`: one unseparated run of eight digits is year/month/day.
     if numbers.len() == 1 && trimmed.len() == 8 && trimmed.bytes().all(|b| b.is_ascii_digit()) {
@@ -239,34 +240,49 @@ fn parse_date(s: &str) -> (Option<u16>, Option<(u16, u8, u8)>) {
         numbers = vec![n / 10_000, (n / 100) % 100, n % 100];
     }
 
-    let year = numbers.first().copied().filter(|y| (1000..=9999).contains(y)).map(|y| y as u16);
+    let year = numbers.first().copied().filter(|y| (1000..=9999).contains(y))? as u16;
     let month = numbers.get(1).copied().filter(|m| (1..=12).contains(m)).map(|m| m as u8);
-    let day = numbers.get(2).copied().filter(|d| (1..=31).contains(d)).map(|d| d as u8);
-    let date = match (year, month, day) {
-        (Some(y), Some(m), Some(d)) => Some((y, m, d)),
-        _ => None,
-    };
-    (year, date)
+    // A day is only meaningful alongside a month.
+    let day = month.and_then(|_| {
+        numbers.get(2).copied().filter(|d| (1..=31).contains(d)).map(|d| d as u8)
+    });
+    Some(ReleaseDate::new(year, month, day))
 }
 
 #[cfg(test)]
 mod tests {
-    use super::parse_date;
+    use super::{parse_date, ReleaseDate};
 
     #[test]
     fn parse_date_reads_the_year_and_the_month_day_when_present() {
-        assert_eq!(parse_date("2003"), (Some(2003), None));
-        assert_eq!(parse_date("2003-05-01"), (Some(2003), Some((2003, 5, 1))));
-        assert_eq!(parse_date("2003/5/1"), (Some(2003), Some((2003, 5, 1))));
+        let year_only = ReleaseDate::new(2003, None, None);
+        let full = ReleaseDate::new(2003, Some(5), Some(1));
+        assert_eq!(parse_date("2003"), Some(year_only));
+        assert_eq!(parse_date("2003-05-01"), Some(full));
+        assert_eq!(parse_date("2003/5/1"), Some(full));
         // A timestamp after the date is ignored.
-        assert_eq!(parse_date("2003-05-01 12:00"), (Some(2003), Some((2003, 5, 1))));
+        assert_eq!(parse_date("2003-05-01 12:00"), Some(full));
         // A compact `YYYYMMDD` has no separators to split on.
-        assert_eq!(parse_date("20030501"), (Some(2003), Some((2003, 5, 1))));
-        // A month without a day keeps the year only.
-        assert_eq!(parse_date("2003-05"), (Some(2003), None));
+        assert_eq!(parse_date("20030501"), Some(full));
+        // A month without a day keeps the year and month.
+        assert_eq!(parse_date("2003-05"), Some(ReleaseDate::new(2003, Some(5), None)));
         // Out-of-range or non-date values degrade to nothing.
-        assert_eq!(parse_date("13"), (None, None));
-        assert_eq!(parse_date("2003-13-01"), (Some(2003), None));
-        assert_eq!(parse_date(""), (None, None));
+        assert_eq!(parse_date("13"), None);
+        assert_eq!(parse_date("2003-13-01"), Some(year_only));
+        assert_eq!(parse_date(""), None);
+    }
+
+    #[test]
+    fn packed_dates_sort_chronologically_and_decompose() {
+        let jan = ReleaseDate::new(2003, Some(1), Some(1));
+        let may = ReleaseDate::new(2003, Some(5), Some(1));
+        let next_year = ReleaseDate::new(2004, Some(1), Some(1));
+        assert!(jan < may && may < next_year, "most-significant field first");
+        assert_eq!(may.year(), 2003);
+        assert_eq!(may.month(), Some(5));
+        assert_eq!(may.day(), Some(1));
+        let year_only = ReleaseDate::new(2003, None, None);
+        assert_eq!((year_only.month(), year_only.day()), (None, None));
+        assert!(year_only < jan, "year-only sorts before a real January");
     }
 }

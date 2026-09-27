@@ -134,7 +134,7 @@ fn bitrate(path: &String) -> anyhow::Result<()> {
     let analysis = analyze_track(path, 120, bucket)?;
     let profile = &analysis.bitrate;
 
-    let buckets: Vec<u32> = profile.buckets().iter().copied().filter(|&b| b > 0).collect();
+    let buckets: Vec<u32> = profile.bitrates().into_iter().filter(|&b| b > 0).collect();
     if buckets.is_empty() {
         println!("{}: no packets", path.display());
         return Ok(());
@@ -147,11 +147,11 @@ fn bitrate(path: &String) -> anyhow::Result<()> {
     println!("{}", path.display());
     println!(
         "  {} buckets of {:?} — min {min}  avg {avg}  max {max} bps",
-        profile.buckets().len(),
+        buckets.len(),
         bucket
     );
     print!("  first 8: ");
-    for bps in profile.buckets().iter().take(8) {
+    for bps in buckets.iter().take(8) {
         print!("{bps} ");
     }
     println!();
@@ -200,7 +200,7 @@ fn library(roots: &[String]) -> anyhow::Result<()> {
         let kind = if playlist.is_custom() { "custom" } else { "auto" };
         println!(
             "\n  [{kind}] {} — {} song(s)",
-            playlist.meta().title,
+            playlist.title(),
             playlist.len()
         );
         for song in library.songs_of(playlist.id).iter().take(4) {

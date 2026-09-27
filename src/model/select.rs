@@ -7,7 +7,7 @@
 
 use super::identity::SongId;
 use super::library::Library;
-use super::playlist::{PlaylistId, PlaylistKind};
+use super::playlist::PlaylistId;
 use super::search::{AlbumGroup, Query};
 
 /// What a [`Selection`] draws its songs from.
@@ -52,7 +52,7 @@ impl Library {
             Scope::Library => self
                 .playlists()
                 .into_iter()
-                .filter(|p| p.kind == PlaylistKind::Auto)
+                .filter(|p| p.is_auto())
                 .map(|p| p.id)
                 .collect(),
             Scope::Artist(artist) => self.discography(artist),
@@ -63,6 +63,7 @@ impl Library {
             Order::NewestFirst => self.sort_by_year(&mut ids),
             Order::TrackOrder => {}
         }
+        let matcher = sel.query.matcher();
         ids.into_iter()
             .filter_map(|id| {
                 let playlist = self.playlist(id)?;
@@ -70,7 +71,7 @@ impl Library {
                     .song_ids
                     .iter()
                     .copied()
-                    .filter(|song| self.get(*song).is_some_and(|song| sel.query.matches(song)))
+                    .filter(|song| self.get(*song).is_some_and(|song| matcher.matches(song)))
                     .collect();
                 (!songs.is_empty()).then_some(AlbumGroup { playlist: id, songs })
             })
@@ -88,7 +89,7 @@ impl Library {
 mod tests {
     use super::*;
     use crate::model::search::parse;
-    use crate::model::{Lyrics, SongMetadata};
+    use crate::model::{Lyrics, ReleaseDate, SongMetadata};
     use std::time::Duration;
 
     fn song(id: SongId, title: &str, artist: &str, album: &str, track: u16) -> SongMetadata {
@@ -100,8 +101,7 @@ mod tests {
             album_name: Some(album.into()),
             album_artist: Some(artist.into()),
             track_position: Some(track),
-            year: None,
-            release_date: None,
+            date: None,
             nominal_bitrate: None,
             lyrics: Lyrics::None,
             duration: Duration::from_secs(180),
@@ -113,11 +113,11 @@ mod tests {
     fn library() -> Library {
         let mut library = Library::default();
         let mut oblivion = song(1, "Oblivion", "Grimes", "Visions", 1);
-        oblivion.year = Some(2012);
+        oblivion.date = Some(ReleaseDate::new(2012, None, None));
         let mut genesis = song(2, "Genesis", "Grimes", "Visions", 2);
-        genesis.year = Some(2012);
+        genesis.date = Some(ReleaseDate::new(2012, None, None));
         let mut kvm = song(3, "Kill V. Maim", "Grimes", "Art Angels", 1);
-        kvm.year = Some(2015);
+        kvm.date = Some(ReleaseDate::new(2015, None, None));
         library.insert_song(oblivion);
         library.insert_song(genesis);
         library.insert_song(kvm);
@@ -127,7 +127,7 @@ mod tests {
     }
 
     fn titles(library: &Library, groups: &[AlbumGroup]) -> Vec<String> {
-        groups.iter().map(|g| library.playlist(g.playlist).unwrap().meta().title).collect()
+        groups.iter().map(|g| library.playlist(g.playlist).unwrap().title().to_string()).collect()
     }
 
     fn selection(scope: Scope, order: Order) -> Selection {

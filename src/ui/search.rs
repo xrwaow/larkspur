@@ -69,8 +69,7 @@ impl SearchView {
         let observe = crate::ui::album_list::observe(&library, None, &covers, &animator, cx);
         // The search overlay draws the library's rows, so it shares the browse
         // list's typography — one size, so the tabs can't drift apart.
-        let themed =
-            Themed::with_container(BrowseView::container_id(), BrowseView::default_font_size(), &config, cx);
+        let themed = BrowseView::themed(&config, cx);
         Self {
             themed,
             list: AlbumListView::new(library, playback, covers, animator, Play::Result),

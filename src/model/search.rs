@@ -58,7 +58,7 @@ use super::identity::SongId;
 use super::library::Library;
 use super::playlist::PlaylistId;
 use super::select::{Order, Scope, Selection};
-use super::song::SongMetadata;
+use super::song::{ReleaseDate, SongMetadata};
 
 /// How a single term is compared against a field.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -142,15 +142,17 @@ impl Query {
     }
 
     /// Whether `song` satisfies every term and every filter.
+    ///
+    /// Convenience for a one-off check; a caller matching many songs should
+    /// build a [`Matcher`] once instead, so the field scope and needed fields
+    /// aren't re-derived per song.
     pub fn matches(&self, song: &SongMetadata) -> bool {
-        if !self.filters.iter().all(|f| f.matches(song)) {
-            return false;
-        }
-        if self.terms.is_empty() {
-            return true;
-        }
-        let haystack = Haystack::new(song, &self.needed_fields());
-        self.terms.iter().all(|term| haystack.matches_term(term, self.scope(), self.mode))
+        self.matcher().matches(song)
+    }
+
+    /// A reusable matcher over this query.
+    pub fn matcher(&self) -> Matcher<'_> {
+        Matcher { query: self, needed: self.needed_fields() }
     }
 
     /// Only the fields this query actually reads, so lyrics aren't lowercased
@@ -172,11 +174,36 @@ impl Query {
     }
 }
 
+/// A [`Query`] with its field scope and needed fields resolved once, so
+/// matching many songs doesn't re-derive them per song.
+pub struct Matcher<'a> {
+    query: &'a Query,
+    needed: Vec<Field>,
+}
+
+impl Matcher<'_> {
+    /// Whether `song` satisfies every term and every filter.
+    pub fn matches(&self, song: &SongMetadata) -> bool {
+        if !self.query.filters.iter().all(|f| f.matches(song)) {
+            return false;
+        }
+        if self.query.terms.is_empty() {
+            return true;
+        }
+        let haystack = Haystack::new(song, &self.needed);
+        self.query
+            .terms
+            .iter()
+            .all(|term| haystack.matches_term(term, self.query.scope(), self.query.mode))
+    }
+}
+
 impl Filter {
     fn matches(&self, song: &SongMetadata) -> bool {
         match self {
             Filter::Year { min, max } => song
-                .year
+                .date
+                .map(ReleaseDate::year)
                 .is_some_and(|y| min.is_none_or(|m| y >= m) && max.is_none_or(|m| y <= m)),
             Filter::Duration { min, max } => {
                 min.is_none_or(|m| song.duration >= m) && max.is_none_or(|m| song.duration <= m)
@@ -554,7 +581,7 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::Lyrics;
+    use crate::model::{Lyrics, ReleaseDate};
 
     fn song(id: SongId, title: &str, artist: &str, album: &str) -> SongMetadata {
         SongMetadata {
@@ -565,8 +592,7 @@ mod tests {
             album_name: Some(album.into()),
             album_artist: Some(artist.into()),
             track_position: None,
-            year: None,
-            release_date: None,
+            date: None,
             nominal_bitrate: Some(320_000),
             lyrics: Lyrics::None,
             duration: Duration::from_secs(180),
@@ -644,7 +670,7 @@ mod tests {
     #[test]
     fn year_filters_accept_ranges_and_comparisons() {
         let mut s = song(1, "Song", "Artist", "Album");
-        s.year = Some(2003);
+        s.date = Some(ReleaseDate::new(2003, None, None));
         assert!(run("year:2003", &s));
         assert!(run("year:2000-2010", &s));
         assert!(!run("year:2012", &s));
@@ -791,7 +817,7 @@ mod tests {
         assert_eq!(groups.len(), 1, "both tracks live in one album");
         let group = &groups[0];
         let album = library.playlist(group.playlist).unwrap();
-        assert_eq!(album.meta().title, "Kill Bill");
+        assert_eq!(album.title(), "Kill Bill");
         assert_eq!(group.songs.len(), 2);
         assert_eq!(group.songs, album.song_ids, "album track order is preserved");
     }
@@ -821,7 +847,7 @@ mod tests {
         let groups = all_albums(&library);
         let titles: Vec<String> = groups
             .iter()
-            .map(|g| library.playlist(g.playlist).unwrap().meta().title)
+            .map(|g| library.playlist(g.playlist).unwrap().title().to_string())
             .collect();
         assert_eq!(titles, vec!["Kill Bill", "Vide Noir"], "alphabetical");
     }

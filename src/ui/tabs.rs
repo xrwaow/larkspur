@@ -31,7 +31,7 @@ use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::cover_store::CoverStore;
 use crate::ui::input::action_for_key;
-use crate::ui::library_state::LibraryState;
+use crate::ui::library_state::{LibraryState, Request};
 use crate::ui::menu::{context_menu, song_menu_items, MenuHandler, SongMenuRequest};
 use crate::ui::playlist::PlaylistView;
 use crate::ui::queue::QueueView;
@@ -465,7 +465,7 @@ impl TabsView {
                 .read(cx)
                 .library()
                 .playlist(*playlist)
-                .map(|playlist| playlist.meta().title)
+                .map(|playlist| playlist.title().to_string())
                 .unwrap_or_default(),
             TabId::Artist(artist) => artist.clone(),
             TabId::Folder(path) => path
@@ -490,11 +490,9 @@ impl Render for TabsView {
         // back to the app name otherwise.
         let title = {
             let state = self.playback.read(cx);
-            let song = state.metadata();
-            if song.id != 0 && !state.ended() {
-                format!("Playing {}", song.display_title())
-            } else {
-                "Larkspur".to_string()
+            match state.metadata(cx).filter(|_| !state.ended()) {
+                Some(song) => format!("Playing {}", song.display_title()),
+                None => "Larkspur".to_string(),
             }
         };
         if self.last_title != title {
@@ -507,23 +505,21 @@ impl Render for TabsView {
         // so an unrelated frame doesn't poll).
         if self.library_dirty {
             self.library_dirty = false;
-            if let Some(id) = self.library.update(cx, |state, _cx| state.take_open_playlist()) {
-                self.open_playlist(id, window, cx);
-            }
-            if let Some(artist) = self.library.update(cx, |state, _cx| state.take_artist_view()) {
-                self.open_artist(artist, window, cx);
-            }
-            if let Some(dir) = self.library.update(cx, |state, _cx| state.take_folder_play()) {
-                let playback = self.playback.clone();
-                let playlists =
-                    self.library.update(cx, |state, cx| state.play_folder(&dir, &playback, cx));
-                if !playlists.is_empty() {
-                    self.open_folder(dir, playlists, window, cx);
+            while let Some(request) = self.library.update(cx, |state, _cx| state.take_request()) {
+                match request {
+                    Request::OpenPlaylist(id) => self.open_playlist(id, window, cx),
+                    Request::ArtistView(artist) => self.open_artist(artist, window, cx),
+                    Request::FolderPlay(dir) => {
+                        let playback = self.playback.clone();
+                        let playlists = self
+                            .library
+                            .update(cx, |state, cx| state.play_folder(&dir, &playback, cx));
+                        if !playlists.is_empty() {
+                            self.open_folder(dir, playlists, window, cx);
+                        }
+                    }
+                    Request::SongMenu(request) => self.menu = Some(request),
                 }
-            }
-            if let Some(request) = self.library.read(cx).pending_song_menu().cloned() {
-                self.library.update(cx, |state, _cx| state.clear_song_menu());
-                self.menu = Some(request);
             }
         }
 

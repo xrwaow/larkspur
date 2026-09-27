@@ -12,8 +12,8 @@ use gpui::{
     MouseDownEvent, Point, Pixels, Window,
 };
 
-use crate::model::{generate_song_id, PlaylistId, SongId};
-use crate::ui::library_state::LibraryState;
+use crate::model::{PlaylistId, SongId};
+use crate::ui::library_state::{LibraryState, Request};
 use crate::ui::playback_state::PlaybackState;
 use crate::ui::theme::Theme;
 
@@ -81,9 +81,9 @@ pub fn song_menu_items(
             items.push((
                 "Add to Queue".to_string(),
                 Box::new(move |_event, _window, cx| {
-                    let path = library.read(cx).library().get(song).map(|song| song.path.clone());
-                    if let Some(path) = path {
-                        playback.update(cx, |state, cx| state.add_to_queue(vec![path], cx));
+                    let entry = library.read(cx).library().get(song).map(|song| (song.id, song.path.clone()));
+                    if let Some(entry) = entry {
+                        playback.update(cx, |state, cx| state.add_to_queue(vec![entry], cx));
                     }
                 }),
             ));
@@ -110,7 +110,7 @@ pub fn song_menu_items(
                 format!("Go to {artist}"),
                 Box::new(move |_event, _window, cx| {
                     let artist = artist.clone();
-                    library.update(cx, |state, cx| state.request_artist_view(artist, cx));
+                    library.update(cx, |state, cx| state.request(Request::ArtistView(artist), cx));
                 }),
             ));
         }
@@ -120,7 +120,7 @@ pub fn song_menu_items(
             items.push((
                 "Go to playlist".to_string(),
                 Box::new(move |_event, _window, cx| {
-                    library.update(cx, |state, cx| state.request_open_playlist(album, cx));
+                    library.update(cx, |state, cx| state.request(Request::OpenPlaylist(album), cx));
                 }),
             ));
         }
@@ -163,12 +163,13 @@ pub fn song_menu_items(
         items.push((
             format!("Add {count} songs to queue"),
             Box::new(move |_event, _window, cx| {
-                let paths: Vec<PathBuf> = songs
+                let entries: Vec<(SongId, PathBuf)> = songs
                     .iter()
-                    .filter_map(|id| library.read(cx).library().get(*id))
-                    .map(|song| song.path.clone())
+                    .filter_map(|id| {
+                        library.read(cx).library().get(*id).map(|song| (song.id, song.path.clone()))
+                    })
                     .collect();
-                playback.update(cx, |state, cx| state.add_to_queue(paths, cx));
+                playback.update(cx, |state, cx| state.add_to_queue(entries, cx));
             }),
         ));
     }
@@ -189,7 +190,7 @@ pub fn song_menu_items(
         .library()
         .custom_playlists()
         .iter()
-        .map(|playlist| (playlist.id, playlist.meta().title))
+        .map(|playlist| (playlist.id, playlist.title().to_string()))
         .collect();
     for (id, title) in custom {
         let library = library.clone();
@@ -227,20 +228,10 @@ pub fn song_menu_items(
     items
 }
 
-/// Drop every queue entry whose hashed path id is in `songs` — the queue
-/// menu's "Remove from queue". The paths come from the controller's queue
-/// rather than the library, so command-line-queued files the library hasn't
-/// scanned yet are still matched.
+/// Drop every queue entry whose id is in `songs` — the queue menu's "Remove
+/// from queue".
 fn remove_queued(playback: &Entity<PlaybackState>, songs: &[SongId], cx: &mut gpui::App) {
-    playback.update(cx, |state, cx| {
-        let (queue, _) = state.queue();
-        let paths: Vec<PathBuf> = queue
-            .iter()
-            .filter(|path| generate_song_id(path).is_ok_and(|id| songs.contains(&id)))
-            .cloned()
-            .collect();
-        state.remove_from_queue(paths, cx);
-    });
+    playback.update(cx, |state, cx| state.remove_from_queue(songs.to_vec(), cx));
 }
 
 /// Build a context menu at `position` (window coordinates).

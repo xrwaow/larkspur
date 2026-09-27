@@ -24,13 +24,14 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
-use gpui::Context;
+use gpui::{App, Context, Entity};
 
 use crate::analysis::{TrackAnalyzer, Waveform};
 use crate::audio::{PlaybackController, RepeatMode, SampleTap, SongStatus};
 use crate::bitrate::BitrateProfile;
-use crate::model::{InputAction, SongMetadata};
+use crate::model::{InputAction, SongId, SongMetadata};
 use crate::ui::animation::SLOW_FPS;
+use crate::ui::library_state::LibraryState;
 
 /// How many bars a waveform is reduced to.
 const WAVEFORM_BUCKETS: usize = 240;
@@ -81,6 +82,9 @@ impl AnalysisSlot {
 
 pub struct PlaybackState {
     controller: PlaybackController,
+    /// The library, read to resolve the current track's metadata by [`SongId`]
+    /// — the controller holds no metadata copy of its own.
+    library: Entity<LibraryState>,
     /// Shared with the background analyzer thread.
     analysis: Arc<Mutex<AnalysisSlot>>,
     /// The revision the UI last rendered, so a tick only notifies on change.
@@ -111,11 +115,16 @@ pub struct PlaybackState {
 }
 
 impl PlaybackState {
-    pub fn new(controller: PlaybackController, cx: &mut Context<Self>) -> Self {
+    pub fn new(
+        controller: PlaybackController,
+        library: Entity<LibraryState>,
+        cx: &mut Context<Self>,
+    ) -> Self {
         let status = controller.status();
         let position = controller.position();
         let mut this = Self {
             controller,
+            library,
             analysis: Arc::new(Mutex::new(AnalysisSlot::new())),
             analysis_revision: 0,
             generation: Arc::new(AtomicU64::new(0)),
@@ -134,8 +143,14 @@ impl PlaybackState {
 
     // --- read-only accessors: what views render from -------------------
 
-    pub fn metadata(&self) -> &SongMetadata {
-        &self.controller.metadata
+    pub fn metadata(&self, cx: &App) -> Option<Arc<SongMetadata>> {
+        let id = self.controller.current_id()?;
+        self.library.read(cx).library().get_arc(id)
+    }
+
+    /// The loaded track's [`SongId`], if any.
+    pub fn current_song(&self) -> Option<SongId> {
+        self.controller.current_id()
     }
 
     pub fn duration(&self) -> Duration {
@@ -227,7 +242,7 @@ impl PlaybackState {
     }
 
     /// The play queue and the index of the loaded entry, for the queue view.
-    pub fn queue(&self) -> (&[PathBuf], Option<usize>) {
+    pub fn queue(&self) -> (&[(SongId, PathBuf)], Option<usize>) {
         self.controller.queue()
     }
 
@@ -291,12 +306,12 @@ impl PlaybackState {
         }
     }
 
-    /// Append `paths` to the play queue — the song menu's "Add to Queue".
-    pub fn add_to_queue(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        if paths.is_empty() {
+    /// Append `entries` to the play queue — the song menu's "Add to Queue".
+    pub fn add_to_queue(&mut self, entries: Vec<(SongId, PathBuf)>, cx: &mut Context<Self>) {
+        if entries.is_empty() {
             return;
         }
-        match self.controller.add_to_queue(paths) {
+        match self.controller.add_to_queue(entries) {
             Ok(started) => {
                 // Only a freshly started track needs a waveform reload;
                 // appending behind a playing one leaves it untouched.
@@ -309,14 +324,14 @@ impl PlaybackState {
         }
     }
 
-    /// Drop every queue entry matching `paths` — the song menu's "Remove from
-    /// queue". Reloads the waveform when the loaded track changed (a new one
-    /// started, or playback stopped).
-    pub fn remove_from_queue(&mut self, paths: Vec<PathBuf>, cx: &mut Context<Self>) {
-        if paths.is_empty() {
+    /// Drop every queue entry whose [`SongId`] is in `ids` — the song menu's
+    /// "Remove from queue". Reloads the waveform when the loaded track changed
+    /// (a new one started, or playback stopped).
+    pub fn remove_from_queue(&mut self, ids: Vec<SongId>, cx: &mut Context<Self>) {
+        if ids.is_empty() {
             return;
         }
-        if self.controller.remove_from_queue(&paths) {
+        if self.controller.remove_from_queue(&ids) {
             self.reload_track();
         }
         cx.notify();
@@ -344,11 +359,16 @@ impl PlaybackState {
     /// Used to turn a playlist into the queue: the caller resolves the
     /// playlist's songs to paths, so this stays playlist-agnostic. Re-loads
     /// the waveform for whatever track ends up current.
-    pub fn play_paths(&mut self, paths: Vec<PathBuf>, start: usize, _cx: &mut Context<Self>) -> bool {
-        if paths.is_empty() {
+    pub fn play_paths(
+        &mut self,
+        entries: Vec<(SongId, PathBuf)>,
+        start: usize,
+        _cx: &mut Context<Self>,
+    ) -> bool {
+        if entries.is_empty() {
             return false;
         }
-        match self.controller.set_queue(paths, start) {
+        match self.controller.set_queue(entries, start) {
             Ok(()) => {
                 self.reload_track();
                 true

@@ -21,7 +21,7 @@ use gpui::{px, Bounds, ListAlignment, ListState, Modifiers, Pixels, Window};
 
 use crate::model::{InputAction, PlaylistId, SongId};
 use crate::ui::albums::{
-    self, AlbumSection, Columns, ListItem, Selection, MAX_ARTIST_CHARS, MAX_TITLE_CHARS,
+    self, AlbumSection, Columns, ListItem, RowSelection, MAX_ARTIST_CHARS, MAX_TITLE_CHARS,
 };
 use crate::ui::animation::Spring;
 use crate::ui::marquee::{self, Marquee};
@@ -163,7 +163,7 @@ pub enum Cell {
 /// hovered index); only rows *in motion* carry an explicit opacity.
 #[derive(Clone, Default)]
 pub struct Highlight {
-    selection: Selection,
+    selection: RowSelection,
     selection_fade: Fades,
     hovered: Option<usize>,
     hover_fade: Fades,
@@ -202,7 +202,7 @@ pub struct RowList {
     list_state: ListState,
     /// The row count the list was last reset to.
     item_count: usize,
-    selection: Selection,
+    selection: RowSelection,
     /// The keyboard cursor, as an item index.
     cursor: Option<usize>,
     /// Where up/down step from when the cursor is `None` — the playing song's
@@ -250,7 +250,7 @@ impl RowList {
             },
             list_state: ListState::new(0, ListAlignment::Top, px(OVERDRAW_PX)),
             item_count: 0,
-            selection: Selection::default(),
+            selection: RowSelection::default(),
             cursor: None,
             anchor: None,
             selection_fade: Fades::default(),
@@ -646,7 +646,7 @@ impl RowList {
     /// Start the crossfade after a selection change: the rows that just left
     /// fade out from full, the rows that just arrived fade in from nothing.
     /// Rows that were already selected are left alone.
-    fn restart_selection_fade(&mut self, previous: &Selection) {
+    fn restart_selection_fade(&mut self, previous: &RowSelection) {
         for ix in previous.iter() {
             if !self.selection.contains(ix) {
                 self.selection_fade.aim(ix, 1.0, 0.0);

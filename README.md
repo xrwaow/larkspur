@@ -39,8 +39,8 @@ Paths are relative to this crate's root. This is the fastest way in:
 | Path | What lives there |
 |------|------------------|
 | `src/lib.rs` | Crate roots — `analysis`, `audio`, `bitrate`, `decode`, `model`, `opus`, `ui`. |
-| `src/model/` | The whole data schema, split by concern: `identity` (`SongId` + hashing), `song` (`SongMetadata` + lofty loading; serde-derived so the scan cache round-trips it whole), `lyrics` (`Lyrics`/`LyricLine` + `parse_lrc` + `.lrc` sidecars), `cover` (`DecodedImage`/`CoverCache`), `library` (`Library` + playlist autogen + derived artist groupings, with a maintained index), `playlist` (`Playlist`/`PlaylistId`/`PlaylistKind`/`PlaylistMeta`/`PlaylistOrigin`), `search` (the query language: `Query`/`parse`/`matches`), `select` (`Scope`/`Order`/`Selection` — the one query path every list view goes through), `scan` (`LibraryCache` + mtime-based incremental sync), `view` (`TabId`), `input` (`InputAction`), `config` (`Config`: theme, waveform style, per-container typefaces and font sizes, synced paths). Framework-agnostic — no GPUI, no rodio — so it unit-tests without a device or a window. |
-| `src/audio.rs` | `PlaybackController` — owns the rodio `Player` and device sink, the `Vec<PathBuf>` queue, seek/next/prev, drain-detection auto-advance (`tick_advance`), and the current track's metadata/duration. `track_parts` is the single place decode source, tags, and duration are chosen. Every source is wrapped in a `TapSource`, which copies the samples it hands out into a shared `SampleTap` ring — that's what makes the visualizer real-time. Deliberately does **not** own the waveform. |
+| `src/model/` | The whole data schema, split by concern: `identity` (`SongId` + hashing), `song` (`SongMetadata`/`ReleaseDate` + lofty loading; serde-derived so the scan cache round-trips it whole), `lyrics` (`Lyrics`/`LyricLine` + `parse_lrc` + `.lrc` sidecars), `cover` (`DecodedImage`/`CoverCache`), `library` (`Library` + playlist autogen + derived artist groupings, with a maintained index), `playlist` (`Playlist`/`PlaylistId`/`PlaylistKind`/`PlaylistOrigin`), `search` (the query language: `Query`/`parse`/`matches`), `select` (`Scope`/`Order`/`Selection` — the one query path every list view goes through), `scan` (`LibraryCache` + mtime-based incremental sync), `view` (`TabId`), `input` (`InputAction`), `config` (`Config`: theme, waveform style, per-container typefaces and font sizes, synced paths). Framework-agnostic — no GPUI, no rodio — so it unit-tests without a device or a window. |
+| `src/audio.rs` | `PlaybackController` — owns the rodio `Player` and device sink, the `Vec<(SongId, PathBuf)>` queue, seek/next/prev, drain-detection auto-advance (`tick_advance`), and the current track's duration. `track_parts` is the single place the decode source and duration are chosen — it does **not** read tags; the library already holds the metadata, keyed by the entry's `SongId`. Every source is wrapped in a `TapSource`, which copies the samples it hands out into a shared `SampleTap` ring — that's what makes the visualizer real-time. Deliberately does **not** own the waveform. |
 | `src/decode.rs` | `open_track(path, gapless)` — the one place a Symphonia container is opened and a playable track selected. Also `PacketDecoder`, the one place a packet is turned into interleaved f32 samples: Opus goes to libopus, everything else to symphonia, and both the playback source and the analysis share it. |
 | `src/opus.rs` | `OpusSource` — symphonia's Ogg demuxer feeding libopus, because symphonia 0.5 demuxes Opus but has no decoder. Handles gapless pre-skip/end trims and accurate seek (decode-and-drop to the exact timestamp). |
 | `src/analysis.rs` | `TrackAnalyzer` — a **sequential, chunked** demux+decode pass: `advance(max_secs)` decodes one bounded slice of media time, folding samples into a fixed number of waveform buckets spread over the track's media time (a `Waveform`, with a running max for auto-scaling) and bucketing packet bytes into the live-bitrate profile. The UI advances it a chunk at a time and publishes the partial waveform, so the transport's bars fill in as the song plays. `analyze_track(path, buckets, bucket)` runs it to completion for the dev `probe`. Also `SpectrumAnalyzer` — the reusable Hann-windowed FFT + log-spaced band fold the real-time visualizer runs over the tapped audio (a hand-rolled radix-2 FFT). |
@@ -60,9 +60,9 @@ Paths are relative to this crate's root. This is the fastest way in:
 | `src/ui/introspect.rs` | Resolves a `LayoutPlan` into rectangles and renders it as an ASCII diagram + dock legend + border/adjacency list. Pure geometry, no GPUI. |
 | `src/ui/playlists.rs` | `PlaylistsView` — the left rail: a settings button, custom playlists, autogen album playlists, and artists (each expanding into its discography, newest release first — several artists can stay unfolded at once; opening one never folds another). The Albums and Artists groups each carry their own filter box. Every row kind draws through one `rail_row` builder — no zebra anywhere on the rail, rows sit transparent and light up on hover/selection; tree rows (artists, the folder view) draw one faint guide column per nesting level as a continuous line, with the expand chevron painted right on the line it hangs its children from. Rebuilds splice only the stretch of rows that changed, so expanding a group or filtering never flings the scroll to the top. Clicking a playlist opens it as a tab in the center, so this view holds the tab container. Right-clicking a custom playlist opens a menu to rename it inline or delete it. A library yields thousands of rows, so like the track lists they're flattened and drawn through GPUI's virtualized `list` (rebuilt only on change) — rendering them all every frame made the whole app run at single-digit fps. |
 | `src/ui/layout.rs` | `app_layout()` — the one definition of the dock/center arrangement, shared by the real UI and the introspection tools. The center is the `tabs` container; the right rail is `lyrics` above `cover`. |
-| `src/ui/albums.rs` | Album sections — the shared rendering behind the browse, search, and playlist containers: snapshot an album into a cover header plus track rows (or one compressed row when it holds a single song, carrying the release year), flatten them into the rows `gpui::list` virtualizes, and request each visible cover as it renders. The title and artist columns are **fixed** to a maximum character count (`Columns`), so songs line up across playlists rather than per section; a longer string fades at the edge and slides on hover (see `marquee`). The playing row swaps its track number for a small animated equalizer. Also owns `Selection`, the item-index set behind shift/ctrl click and keyboard navigation. The album meta line is tracks + time only — the bitrate that matters is per song. |
+| `src/ui/albums.rs` | Album sections — the shared rendering behind the browse, search, and playlist containers: snapshot an album into a cover header plus track rows (or one compressed row when it holds a single song, carrying the release year), flatten them into the rows `gpui::list` virtualizes, and request each visible cover as it renders. The title and artist columns are **fixed** to a maximum character count (`Columns`), so songs line up across playlists rather than per section; a longer string fades at the edge and slides on hover (see `marquee`). The playing row swaps its track number for a small animated equalizer. Also owns `RowSelection`, the item-index set behind shift/ctrl click and keyboard navigation. The album meta line is tracks + time only — the bitrate that matters is per song. |
 | `src/ui/marquee.rs` | The marquee: a text cell that fades, slides, and snaps back. Text longer than its column fades out over one character at the right edge; on hover it slides left so the rest can be read, and on release it snaps back — a stiff, under-damped spring, so it overshoots the start and settles, which reads as the text being *thrown* back into place. The slide **out** is not a spring: a spring's speed scales with distance, so a long title would whip past a short one; instead the offset moves at a constant `SLIDE_PX_PER_SEC`, so every title reads at the same pace; only the snap back is sprung (`SNAP_BACK_STIFFNESS`/`SNAP_BACK_DAMPING`). `Marquee` holds one cell's slide + hover; the lyrics panel's title owns one directly, and a list row keeps one per title/artist cell (in `RowList`, read out through `Highlight`). `char_advance` turns a character count into a column width, `travel_for` into an overflow. |
-| `src/ui/album_list.rs` | `AlbumListView` — the shared shell behind the browse, playlist, and search containers: owns the `RowList`, the state subscriptions, and the virtualized render wiring, parameterized by a `Source` (library / artist / playlist / folder / search) and a play behavior, so each view is a thin wrapper keeping only its distinctive chrome (header, add-songs bar, query box). |
+| `src/ui/album_list.rs` | `AlbumListView` — the shared shell behind the browse, playlist, and search containers: owns the `RowList`, the state subscriptions, and the virtualized render wiring, parameterized by a `Scope` (library / artist / playlists) and a play behavior, so each view is a thin wrapper keeping only its distinctive chrome (header, add-songs bar, query box). |
 | `src/ui/tabs.rs` | `TabsView` — the center container: a strip of tabs (library, one per opened playlist, one per artist opened from “go to {artist}”) over the active container. Search is swapped in over the active tab rather than being a tab of its own. Re-points focus on every switch, so the active container is the input hub; tab switching, tab closing, the `×` buttons, and the transport keys all live here. Only the active container is in the element tree. It also sets the window title (`Playing {song}` / `Larkspur`). |
 | `src/ui/browse.rs` | `BrowseView` — the library browse container. Every album as a headed group (cover, artist, album, `tracks \| time`, year) with its tracks beneath, drawn through GPUI's virtualized `list`; clicking a track plays the album from there. The library tab's header carries a filter box (`ctrl+f`) that live-filters the sections through the same query engine as the search panel — filtered clicks queue the matched songs, unfiltered ones the whole album — and a `⇄` button that plays the whole library shuffled. One instance backs the library tab; “go to {artist}” from a song menu opens another, scoped to that artist's discography (newest first), so it titles the header with the artist instead of “Library”. An artist tab shows the same box and button, scoped: the box filters within the discography (placeholder “Filter the discography…”), and the button shuffles it; a folder view shows neither — it's already exactly the folder's playlists. Selection and navigation come from `RowList`. |
 | `src/ui/lyrics.rs` | `LyricsView` — the right rail's lyrics panel, above the cover. Pins the anchor line to the middle of the panel (50% of its height) whatever the height of the lines around it, and seeks to a line when it's clicked. The header title is a `marquee` cell (fade + slide + spring back). The panel fades its content into the background at the top and bottom edges (`widgets::edge_fade`), so lines dissolve rather than being cut off. The slide **leads the song**: the stack starts moving `TRANSITION_SECS` before a line's timestamp so it lands *on* the line, and the colour **crossfades over the second half of that slide** — the next line starts colouring up once the stack is already moving toward it, while the line it replaces fades out over the same window. Both are driven from the playback position, which is why the panel reads it at full resolution (`live_position`) on every frame of the shared clock. Lines wrap on word boundaries (and break an over-long word per character) instead of being clipped. |
@@ -290,13 +290,16 @@ so a tag edit or cover reload only needs to happen in one place.
 ### `SongMetadata` — static, per-file
 
 Loaded once via `lofty`, holds what's *declared about the file*:
-title, artists, album, track position, **year**, duration, **nominal**
-bitrate, lyrics, cover state.
+title, artists, album, track position, **release date**, duration,
+**nominal** bitrate, lyrics, cover state.
 
-> **Year** comes from the first of `Year` / `RecordingDate` / `ReleaseDate`
-> that parses — the three keys taggers scatter it across. It drives the
-> browse header's year column and the `year:` search filter, and a song with
-> none simply never matches a date filter.
+> **Release date** comes from the first of `Year` / `RecordingDate` /
+> `ReleaseDate` that parses — the three keys taggers scatter it across — and
+> is stored as one packed `YYYYMMDD` integer (`ReleaseDate`), with zeros for
+> unknown components (`20030000` is year-only). One field, so chronological
+> ordering is a plain compare and a year-only tag stays distinguishable from
+> a real January 1st. It drives the browse header's year column and the
+> `year:` search filter; a song with none never matches a date filter.
 
 > **Nominal vs. live bitrate:** `SongMetadata.nominal_bitrate` is the
 > file's average/declared bitrate, normalized to **bits per second** (lofty
@@ -345,8 +348,8 @@ it to build the palette.
 
 ```rust
 struct Library {
-    songs: HashMap<SongId, SongMetadata>,
-    playlists: HashMap<PlaylistId, Playlist>, // Playlist.song_ids: Vec<SongId>
+    songs: HashMap<SongId, Arc<SongMetadata>>, // Arc: cheap to clone on a scan
+    playlists: HashMap<PlaylistId, Playlist>,  // Playlist.song_ids: Vec<SongId>
     next_playlist_id: u64,
     index: Index,   // derived, rebuilt on mutation
 }
@@ -357,33 +360,35 @@ rather than owning duplicate `SongMetadata` structs — avoids the classic
 "edited the tag in one place, three other copies are now stale" bug.
 
 The fields are **private** and the derived `Index` (which album owns each song,
-which playlists each artist appears on, each playlist's release year) is
+which playlists each artist appears on, each playlist's release date) is
 rebuilt by every mutating method — so the hot queries (`album_playlist_of`,
-`discography`, `playlist_year`, the search grouping) are lookups rather than
+`discography`, `release`, the search grouping) are lookups rather than
 scans, and can't be bypassed into going stale. Bulk paths go through
-`replace_songs`/`replace_playlists`/`install`, so the cache never reaches into
+`replace_songs`/`replace_playlists`, so the cache never reaches into
 the library's guts.
 
 ### Playlists — one container, one collection
 
 There is no separate `Playlists` type: `Library` **is** the collection (the
 "list of playlists"), and `Playlist` is the container. Autogen and custom
-playlists share one schema (`PlaylistMeta`); they differ only in where the
-metadata comes from and whether a scan rebuilds them:
+playlists share one `Playlist` struct; the variant-specific data lives in
+`PlaylistKind`, so there's no parallel `meta`/`origin` pair to keep in sync:
 
-- **`PlaylistKind::Auto`** — one per album tag (keyed by album title + album
-  artist, so a compilation stays one playlist), rebuilt by `Library::rebuild_auto`
-  on every scan and read-only. An id is preserved across rebuilds by matching
-  `PlaylistOrigin`, so a rescan doesn't churn ids.
-- **`PlaylistKind::Custom`** — user-owned: `add_song`/`remove_song`/`rename`/
-  `remove_playlist`. Ids come from a persisted monotonic counter, so two
-  playlists may share a title.
+- **`PlaylistKind::Auto(PlaylistOrigin)`** — one per album tag (keyed by album
+  title + album artist, so a compilation stays one playlist), rebuilt by
+  `Library::rebuild_auto` on every scan and read-only. The origin is the
+  natural key a rescan matches on, so a rebuilt album keeps its id.
+- **`PlaylistKind::Custom { title }`** — user-owned: `add_song`/`remove_song`/
+  `rename`/`remove_playlist`. Ids come from a persisted monotonic counter, so
+  two playlists may share a title.
+- **`PlaylistKind::Temporary { title }`** — an ad-hoc view ("Play folder", a
+  selection played as one); never persisted, dropped by a rescan.
 
 An *artist* is not a playlist — it's a list of playlists (their albums), so
 `Library::discography(artist)` and `Library::artist_appears_in(artist)` are
-**derived** on demand rather than stored. `PlaylistMeta.cover` is `None` for
-"inherit": an autogen playlist shows its first song's cover, and so does a
-custom one (until custom covers land).
+**derived** on demand rather than stored. A playlist's cover is its first
+song's (`Playlist::cover`), for autogen and custom alike (until custom covers
+land).
 
 ### Scanning — mtime-based incremental sync
 
@@ -391,10 +396,13 @@ The library is built from a list of directories (`LibraryCache::sync`). Each
 root and each directory under it carries an mtime stamp; an unchanged tree is
 skipped entirely, and within a changed tree only files whose mtime moved are
 re-parsed. A song's stamp is the newer of the audio file's mtime and its
-`.lrc` sidecar's, so editing lyrics re-reads that song. Metadata — including
-year and lyrics — is cached to `~/.cache/larkspur/library.json` (versioned,
-written via a temp file + rename); audio is never cached — it's decoded at
-play time — and cover pixels live in the cover cache instead.
+`.lrc` sidecar's, so editing lyrics re-reads that song. Song metadata —
+including the release date and lyrics — is cached to
+`~/.cache/larkspur/library.json` (versioned, written via a temp file +
+rename); audio is never cached — it's decoded at play time — and cover pixels
+live in the cover cache instead. The user-owned playlists live in a separate
+`playlists.json`, so a playlist edit writes a few kilobytes instead of the
+whole song library.
 
 ### Search — one engine, three views
 
@@ -509,10 +517,11 @@ exchanged.
    not just what's currently in memory. A disk hit short-circuits the file
    entirely. (The `-v2` suffix retires the older 300px/q75 files.)
 5. **State, not `Option`:** `CoverImage::{Loading, Ready(Arc<RenderImage>),
-   Missing}` (and the same shape for `FullCover`) — distinguishes "in flight"
-   from "genuinely has no art", so the UI doesn't re-attempt decodes every
-   frame or flash a placeholder→real swap. A song whose tags declare no picture
-   is recorded `Missing` without ever opening the file.
+   Missing}` — one enum for both the thumbnail and the full now-playing
+   square. It distinguishes "in flight" from "genuinely has no art", so the UI
+   doesn't re-attempt decodes every frame or flash a placeholder→real swap. A
+   song whose tags declare no picture is recorded `Missing` without ever
+   opening the file.
 6. **External cover fallback (planned):** `folder.jpg`/`cover.png` next to
    the audio file, common for FLAC rips without embedded art. `lofty` only
    reads embedded pictures, so this is a separate, album-level lookup path,
@@ -527,8 +536,8 @@ exchanged.
 ## Status
 
 - [x] Core data schema (`model/`)
-- [x] Headless playback (`PlaybackController`) + live-bitrate *tracker*
-      (`bitrate.rs`, unit-tested) — meter not yet wired into playback
+- [x] Headless playback (`PlaybackController`) + live-bitrate tracker
+      (`bitrate.rs`, unit-tested), wired into the playing row
 - [x] GPUI shell + module/workspace container (`ui/`)
 - [x] Shared observable playback state (`Entity<PlaybackState>`) — views
       observe it instead of polling
@@ -599,13 +608,13 @@ exchanged.
       titlebar naming the current track, clipboard paste in every text box, and
       discographies ordered newest-first (undated albums last)
 - [x] Shared structure — `Library` keeps a derived index (song→album,
-      artist→playlists, playlist→year) behind private fields, so the hot queries
-      are lookups and can't go stale; the scan cache stores a whole
+      artist→playlists, playlist→release date) behind private fields, so the hot
+      queries are lookups and can't go stale; the scan cache stores a whole
       `SongMetadata` instead of mirroring its fields; one `PacketDecoder` serves
       playback and analysis; and the three list containers share `RowList`,
       `Themed`, `widgets`, and one key mapping
 - [x] Frame rates — a shared `Animator` clock with swappable `SLOW_FPS` (1, for
-      the transport readouts) and `SMOOTH_FPS` (60, for selection fades and lyric
+      the transport readouts) and `SMOOTH_FPS` (144, for selection fades and lyric
       scrolling), and a dev profile with GPUI's debug-only inspector off
 
 ## Testing & layout introspection

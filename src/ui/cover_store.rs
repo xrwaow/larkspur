@@ -78,21 +78,10 @@ impl Sizes {
     }
 }
 
-/// What the UI can draw for a song's cover right now.
+/// What the UI can draw for a song's cover right now — the same shape for the
+/// browse thumbnail and the full now-playing square.
 #[derive(Clone)]
 pub enum CoverImage {
-    /// Requested; the decode is in flight.
-    Loading,
-    /// Decoded and GPU-ready — hand it straight to `img()`.
-    Ready(Arc<RenderImage>),
-    /// The file has no embedded art.
-    Missing,
-}
-
-/// The now-playing cover — the **full** variant, derived only for the track
-/// that's on screen rather than kept for the whole library.
-#[derive(Clone)]
-pub enum FullCover {
     /// Requested; the decode is in flight.
     Loading,
     /// Decoded and GPU-ready — hand it straight to `img()`.
@@ -114,7 +103,7 @@ pub struct CoverStore {
     /// The full now-playing covers, most-recent first, capped at [`FULL_SLOTS`].
     /// Only tracks just shown live here; a small `Vec` beats an LRU for the
     /// read-only borrow `full` needs.
-    fulls: Vec<(SongId, FullCover)>,
+    fulls: Vec<(SongId, CoverImage)>,
     /// Each decoded cover's dominant colour, for the dynamic theme. Tiny, and
     /// kept even after the pixels are evicted.
     accents: HashMap<SongId, Rgba>,
@@ -150,7 +139,7 @@ impl CoverStore {
     }
 
     /// The full now-playing cover for `id`, if it's one of the recent tracks.
-    pub fn full(&self, id: SongId) -> Option<FullCover> {
+    pub fn full(&self, id: SongId) -> Option<CoverImage> {
         self.fulls.iter().find(|(song, _)| *song == id).map(|(_, cover)| cover.clone())
     }
 
@@ -215,11 +204,11 @@ impl CoverStore {
             return;
         }
         if !has_art {
-            self.record_full(id, FullCover::Missing);
+            self.record_full(id, CoverImage::Missing);
             return;
         }
 
-        self.record_full(id, FullCover::Loading);
+        self.record_full(id, CoverImage::Loading);
         self.full_in_flight.insert(id);
 
         let disk_path = self.cache.disk_path(id);
@@ -237,9 +226,9 @@ impl CoverStore {
                         if let Some(accent) = accent {
                             store.accents.insert(id, accent);
                         }
-                        store.record_full(id, FullCover::Ready(image));
+                        store.record_full(id, CoverImage::Ready(image));
                     }
-                    None => store.record_full(id, FullCover::Missing),
+                    None => store.record_full(id, CoverImage::Missing),
                 }
                 cx.notify();
             })
@@ -270,7 +259,7 @@ impl CoverStore {
 
     /// Record a full cover in the recent-tracks slot list, most-recent first,
     /// evicting beyond [`FULL_SLOTS`].
-    fn record_full(&mut self, id: SongId, cover: FullCover) {
+    fn record_full(&mut self, id: SongId, cover: CoverImage) {
         self.fulls.retain(|(song, _)| *song != id);
         self.fulls.insert(0, (id, cover));
         self.fulls.truncate(FULL_SLOTS);

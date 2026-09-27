@@ -35,7 +35,7 @@ use crate::model::{Playlist, PlaylistId};
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::input::action_for_key;
-use crate::ui::library_state::{subdirs, LibraryState};
+use crate::ui::library_state::{subdirs, LibraryState, Request};
 use crate::ui::menu::{context_menu, MenuHandler};
 use crate::ui::row_list::OVERDRAW_PX;
 use crate::ui::tabs::TabsView;
@@ -205,7 +205,7 @@ impl PlaylistsView {
     fn build_rows(&self, cx: &Context<Self>) -> Vec<RailRow> {
         let state = self.library.read(cx);
         let lib = state.library();
-        let row_of = |p: &Playlist| Row { id: p.id, title: p.meta().title, count: p.len() };
+        let row_of = |p: &Playlist| Row { id: p.id, title: p.title().to_string(), count: p.len() };
 
         let mut rows: Vec<RailRow> = Vec::new();
 
@@ -234,7 +234,7 @@ impl PlaylistsView {
         let albums: Vec<Row> = lib
             .playlists()
             .iter()
-            .filter(|p| !p.is_custom() && album_matches(&p.meta().title))
+            .filter(|p| !p.is_custom() && album_matches(p.title()))
             .map(|p| row_of(p))
             .collect();
         rows.push(RailRow::GroupHeader { label: "Albums", open: self.album_filter.showing() });
@@ -266,7 +266,7 @@ impl PlaylistsView {
                         lib.discography(artist)
                             .into_iter()
                             .filter_map(|id| lib.playlist(id))
-                            .filter(|p| artist_matches(&p.meta().title))
+                            .filter(|p| artist_matches(p.title()))
                             .map(|p| RailRow::Discography(row_of(p))),
                     );
                 }
@@ -681,7 +681,7 @@ impl Render for PlaylistsView {
                         .read(cx)
                         .library()
                         .playlist(playlist)
-                        .map(|p| p.meta().title)
+                        .map(|p| p.title().to_string())
                         .unwrap_or_default();
 
                     let rename: MenuHandler = Box::new(cx.listener(move |this, _event, window, cx| {
@@ -711,7 +711,7 @@ impl Render for PlaylistsView {
                     let play: MenuHandler = Box::new(cx.listener(move |this, _event, _window, cx| {
                         this.menu = None;
                         this.library
-                            .update(cx, |state, cx| state.request_folder_play(path.clone(), cx));
+                            .update(cx, |state, cx| state.request(Request::FolderPlay(path.clone()), cx));
                     }));
                     root = root.child(context_menu(
                         theme,

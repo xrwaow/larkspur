@@ -60,12 +60,6 @@ impl Waveform {
         Self { buckets: vec![0.0; buckets], generated: 0, max: 0.0 }
     }
 
-    /// The generated prefix, normalized to 0.0–1.0 against the running max.
-    pub fn normalized(&self) -> Vec<f32> {
-        let max = self.max.max(1e-6);
-        self.buckets[..self.generated].iter().map(|v| v / max).collect()
-    }
-
     /// Every bucket, normalized against the running max.
     pub fn normalized_all(&self) -> Vec<f32> {
         let max = self.max.max(1e-6);
@@ -248,7 +242,7 @@ impl TrackAnalyzer {
 
     /// The bitrate profile over what's been decoded so far.
     pub fn bitrate(&self) -> BitrateProfile {
-        BitrateProfile::from_byte_counts(self.bucket, self.byte_counts.clone())
+        BitrateProfile::from_byte_counts(self.bucket, Arc::from(self.byte_counts.as_slice()))
     }
 
     /// Run to completion and return the finished analysis.
@@ -258,7 +252,7 @@ impl TrackAnalyzer {
         }
         Ok(TrackAnalysis {
             peaks: Arc::new(self.peaks.waveform().normalized_all()),
-            bitrate: BitrateProfile::from_byte_counts(self.bucket, self.byte_counts),
+            bitrate: BitrateProfile::from_byte_counts(self.bucket, Arc::from(self.byte_counts)),
         })
     }
 }
@@ -502,7 +496,7 @@ mod tests {
     #[test]
     fn normalized_scales_against_the_running_max() {
         let waveform = Waveform { buckets: vec![0.5, 1.0, 0.0], generated: 2, max: 1.0 };
-        assert_eq!(waveform.normalized(), vec![0.5, 1.0]);
+        assert_eq!(&waveform.normalized_all()[..waveform.generated], &[0.5, 1.0]);
         assert_eq!(waveform.normalized_all(), vec![0.5, 1.0, 0.0]);
     }
 
@@ -511,6 +505,5 @@ mod tests {
         let waveform = Waveform::empty(240);
         assert_eq!(waveform.buckets.len(), 240);
         assert_eq!(waveform.generated, 0);
-        assert!(waveform.normalized().is_empty());
     }
 }

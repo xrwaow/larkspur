@@ -84,7 +84,7 @@ fn main() {
                 .unwrap_or((px(1920.0), px(1080.0)));
             Bounds::centered(None, size(width / 2.0, height / 2.0), cx)
         });
-        let controller = PlaybackController::new(files).expect("failed to open the audio device");
+        let controller = PlaybackController::new(Vec::new()).expect("failed to open the audio device");
 
         cx.open_window(
             WindowOptions {
@@ -119,13 +119,24 @@ fn main() {
                     .detach();
                     state
                 });
-                let playback_state = cx.new(|cx| PlaybackState::new(controller, cx));
-
                 // The library is installed from the cache instantly, then
                 // synced against the filesystem in the background. Its roots
                 // come from the config, which it observes.
                 let cache = LibraryCache::open(cache_dir().join("library.json"));
                 let library_state = cx.new(|cx| LibraryState::new(cache, config_state.clone(), cx));
+
+                // Playback resolves the current track's metadata from the
+                // library, so it's built after it.
+                let playback_state =
+                    cx.new(|cx| PlaybackState::new(controller, library_state.clone(), cx));
+
+                // Command-line files are queued now that the library exists, so
+                // each is loaded into it and resolvable to metadata.
+                if !files.is_empty() {
+                    library_state.update(cx, |state, cx| {
+                        state.play_files(files, 0, &playback_state, cx);
+                    });
+                }
 
                 // Covers are decoded off-thread and shared by the now-playing
                 // square and the browse/search thumbnails. Each is derived at
