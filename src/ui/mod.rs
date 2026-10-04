@@ -27,5 +27,6 @@ pub mod settings;
 pub mod tabs;
 pub mod text_field;
 pub mod theme;
+pub mod view_toggle;
 pub mod visualizer;
 pub mod widgets;

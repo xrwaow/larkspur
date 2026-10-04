@@ -13,7 +13,7 @@
 
 use std::rc::Rc;
 
-use gpui::{prelude::*, Context, Entity, KeyDownEvent, Render, ScrollWheelEvent, SharedString, Subscription, Window};
+use gpui::{canvas, div, prelude::*, px, Context, Entity, KeyDownEvent, Render, ScrollWheelEvent, SharedString, Subscription, Window};
 
 use crate::model::select::{Order, Scope, Selection};
 use crate::model::{search, InputAction, Library, PlaylistId};
@@ -71,6 +71,14 @@ pub struct AlbumListView {
     animator: Entity<Animator>,
     play: Play,
     rows: RowList,
+    /// The icon grid's scroll offset, in px from the top — owned outright (no
+    /// native scroller to fight: the grid is translated by this amount and
+    /// clipped), so wheel scrolling and the windowing can never disagree.
+    icon_scroll_y: std::cell::Cell<f32>,
+    /// The icon grid viewport's last measured size, in whole px. Measured by a
+    /// canvas each frame; a change schedules one re-render so the columns
+    /// re-pack against the new size (never trusting a previous-frame guess).
+    icon_viewport: std::rc::Rc<std::cell::Cell<(u32, u32)>>,
     /// The library revision the rows were last built from, so a highlight-only
     /// notify (a tab switch) doesn't rebuild them.
     seen_revision: u64,
@@ -84,7 +92,17 @@ impl AlbumListView {
         animator: Entity<Animator>,
         play: Play,
     ) -> Self {
-        Self { library, playback, covers, animator, play, rows: RowList::new(), seen_revision: 0 }
+        Self {
+            library,
+            playback,
+            covers,
+            animator,
+            play,
+            rows: RowList::new(),
+            icon_scroll_y: std::cell::Cell::new(0.0),
+            icon_viewport: std::rc::Rc::new(std::cell::Cell::new((0, 0))),
+            seen_revision: 0,
+        }
     }
 
     pub fn library(&self) -> &Entity<LibraryState> {
@@ -184,6 +202,43 @@ pub trait AlbumList: Render + Sized {
 /// selection; a plain click plays.
 struct Rows;
 
+/// The row behavior of the icon grid: there are no rows to select, so a click
+/// plays straight away and a right-click opens the same song menu.
+struct Icons;
+
+impl<V: AlbumList> RowActions<V> for Icons {
+    fn activate(
+        &self,
+        view: &mut V,
+        _item_ix: usize,
+        playlist: PlaylistId,
+        index: usize,
+        _event: &gpui::ClickEvent,
+        _window: &mut Window,
+        cx: &mut Context<V>,
+    ) {
+        view.list_mut().play(playlist, index, cx);
+    }
+
+    fn context(
+        &self,
+        view: &mut V,
+        _item_ix: usize,
+        songs: Vec<crate::model::SongId>,
+        context: Option<PlaylistId>,
+        event: &gpui::MouseDownEvent,
+        _window: &mut Window,
+        cx: &mut Context<V>,
+    ) {
+        let request =
+            SongMenuRequest { songs, position: event.position, playlist: context, queue: false };
+        let library = view.list().library.clone();
+        library.update(cx, |state, cx| state.request(Request::SongMenu(request), cx));
+    }
+
+    fn hover(&self, _view: &mut V, _item_ix: usize, _hovered: bool, _cx: &mut Context<V>) {}
+}
+
 impl<V: AlbumList> RowActions<V> for Rows {
     fn activate(
         &self,
@@ -206,12 +261,14 @@ impl<V: AlbumList> RowActions<V> for Rows {
         &self,
         view: &mut V,
         item_ix: usize,
-        _song: crate::model::SongId,
+        _songs: Vec<crate::model::SongId>,
         context: Option<PlaylistId>,
         event: &gpui::MouseDownEvent,
         _window: &mut Window,
         cx: &mut Context<V>,
     ) {
+        // The row's selection-aware songs — a right-click on one row of a
+        // multi-row selection menus them all.
         let songs = view.list_mut().rows.context_songs(item_ix);
         let request =
             SongMenuRequest { songs, position: event.position, playlist: context, queue: false };
@@ -341,6 +398,114 @@ pub fn render_rows_with<V: AlbumList>(
             cx.stop_propagation();
         }),
     )
+}
+
+/// The icon view of the same sections: album covers packed into rows that
+/// fill left to right and wrap down when full (see `albums::pack_rows`),
+/// windowed to the viewport — only the cards near the scroll offset render,
+/// so a huge library stays at full speed.
+///
+/// The viewport size is measured by a canvas inside the tree; when it changes
+/// (first layout, a window resize, the rails moving) one re-render is
+/// scheduled and the rows re-pack against the real size.
+pub fn render_icons<V: AlbumList>(
+    view: &mut V,
+    theme: Theme,
+    context: Option<PlaylistId>,
+    _window: &mut Window,
+    cx: &mut Context<V>,
+) -> gpui::AnyElement {
+    let list = view.list();
+    let (viewport_w, viewport_h) = list.icon_viewport.get();
+    let (viewport_w, viewport_h) = if viewport_w > 1 && viewport_h > 1 {
+        (viewport_w as f32, viewport_h as f32)
+    } else {
+        // Not measured yet (first frame) — a provisional pack, corrected as
+        // soon as the canvas reports the real size.
+        (1400.0, 900.0)
+    };
+    let scroll_y = list.icon_scroll_y.get();
+
+    let sections = list.rows.sections();
+    let layout = albums::pack_rows(sections.len(), viewport_w);
+    let max_scroll = (layout.height - viewport_h).max(0.0);
+
+    let current = list.playback.read(cx).current_song();
+    let eq_phase = list.animator.read(cx).elapsed();
+    let highlight = list.rows.highlight();
+    let covers = list.covers.clone();
+    let library = list.library.clone();
+    let row = albums::RowContext {
+        theme,
+        covers: &covers,
+        library: &library,
+        current,
+        playing: false,
+        eq_phase,
+        live_bitrate_label: None,
+        context,
+        highlight: &highlight,
+        drag: None,
+        slim: false,
+    };
+    let icons: Rc<dyn RowActions<V>> = Rc::new(Icons);
+
+    // The measurer: a canvas stretched over the viewport. Its layout pass
+    // sees the real size every frame; when it changes, one re-render is
+    // scheduled so the pack runs against it.
+    let entity = cx.entity();
+    let measured = list.icon_viewport.clone();
+    let measurer = canvas(
+        move |bounds, window, _cx| {
+            let key =
+                (f32::from(bounds.size.width).round() as u32, f32::from(bounds.size.height).round() as u32);
+            if measured.get() != key {
+                measured.set(key);
+                window.on_next_frame(move |_, cx| entity.update(cx, |_, cx| cx.notify()));
+            }
+        },
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .inset_0();
+
+    // The scrollable area: the grid, translated up by the scroll offset
+    // inside a clipped viewport. There is no native scroller to race with —
+    // the wheel overlay below is the only thing that moves it, updating the
+    // offset and re-rendering so the windowing follows every scroll.
+    div()
+        .relative()
+        .flex_1()
+        .min_w_0()
+        .overflow_hidden()
+        .child(measurer)
+        .child(
+            div()
+                .relative()
+                .top(px(-scroll_y))
+                .child(
+                    albums::render_icon_grid(&row, &sections, &layout, scroll_y, viewport_h, &icons, cx)
+                        .into_any_element(),
+                ),
+        )
+        .child(
+            div().absolute().inset_0().on_scroll_wheel(
+                cx.listener(move |this, event: &ScrollWheelEvent, _window, cx| {
+                    // A positive delta scrolls up; scrolling down moves the
+                    // window toward the content's end. Clamped to the laid-out
+                    // height (which grows with the viewport's width, since
+                    // wider viewports pack taller columns).
+                    let scroll_y = this.list().icon_scroll_y.get();
+                    let next = (scroll_y - wheel_pixels(event)).clamp(0.0, max_scroll);
+                    if scroll_y != next {
+                        this.list_mut().icon_scroll_y.set(next);
+                        cx.notify();
+                    }
+                    cx.stop_propagation();
+                }),
+            ),
+        )
+        .into_any_element()
 }
 
 /// Route a navigation key on the list's root. Used by containers that keep

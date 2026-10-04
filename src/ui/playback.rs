@@ -246,8 +246,9 @@ impl Render for PlaybackView {
                 }),
             );
 
-        // The waveform sits on top; below it a single row with the current
-        // time, the transport controls, and the end time.
+        // The waveform sits on top, flanked by the two times; below it the
+        // transport buttons on the left. The playing song's info and the live
+        // bitrate live in the bottom bar (ui::view_toggle), not here.
         div()
             .flex()
             .flex_col()
@@ -257,143 +258,18 @@ impl Render for PlaybackView {
             .w_full()
             .bg(theme.panel_bg)
             .font_family(theme.font)
-            .child(seek_bar)
             .child(
                 div()
                     .flex()
                     .items_center()
-                    .justify_between()
-                    .w(px(BAR_WIDTH))
+                    .gap_3()
                     .child(
                         div()
                             .text_size(px(theme.small_px()))
                             .text_color(theme.text_muted)
                             .child(format_duration(position)),
                     )
-                    .child(
-                        div()
-                            .flex()
-                            .gap_4()
-                            .items_center()
-                            .child(
-                                // The repeat toggle, to the left of "prev":
-                                // clicks cycle off → repeat-one → repeat-all.
-                                // Lit while any repeat mode is active, and the
-                                // glyph gains a "1" in repeat-one.
-                                div()
-                                    .id("repeat-toggle")
-                                    .cursor_pointer()
-                                    .size(px(36.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
-                                        this.repeat_hovered = *hovered;
-                                        cx.notify();
-                                    }))
-                                    .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                                        this.state.update(cx, |state, cx| state.cycle_repeat(cx));
-                                    }))
-                                    .child(icon(
-                                        15.0,
-                                        14.0,
-                                        if repeat == RepeatMode::Once {
-                                            REPEAT_ONCE_POLYGONS
-                                        } else {
-                                            REPEAT_POLYGONS
-                                        },
-                                        if repeat != RepeatMode::Off || self.repeat_hovered {
-                                            theme.accent
-                                        } else {
-                                            theme.text_muted
-                                        },
-                                    )),
-                            )
-                            .child(transport_button(
-                                "prev",
-                                can_prev,
-                                self.prev_hovered,
-                                PREV_POLYGONS,
-                                theme,
-                                cx.listener(|this, _event, _window, cx| {
-                                    this.dispatch(InputAction::PrevTrack, cx);
-                                }),
-                                cx.listener(|this, hovered: &bool, _window, cx| {
-                                    this.prev_hovered = *hovered;
-                                    cx.notify();
-                                }),
-                            ))
-                            .child(
-                                div()
-                                    .id("play-pause")
-                                    .when(!ended, |d| d.cursor_pointer())
-                                    .when(ended, |d| d.opacity(0.4))
-                                    .rounded_full()
-                                    .size(px(48.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .bg(theme.text_muted)
-                                    .when(!ended, |d| d.hover(|d| d.bg(theme.accent)))
-                                    .on_click(cx.listener(|this, _event, _window, cx| {
-                                        this.dispatch(InputAction::TogglePause, cx);
-                                    }))
-                                    .child(div().flex().items_center().child(if playing {
-                                        icon(13.0, 16.0, PAUSE_POLYGONS, theme.panel_bg)
-                                            .into_any_element()
-                                    } else {
-                                        // Nudge the triangle right so it reads as
-                                        // optically centered in the circle.
-                                        div()
-                                            .pl(px(2.0))
-                                            .child(icon(14.0, 16.0, PLAY_POLYGONS, theme.panel_bg))
-                                            .into_any_element()
-                                    })),
-                            )
-                            .child(transport_button(
-                                "next",
-                                can_next,
-                                self.next_hovered,
-                                NEXT_POLYGONS,
-                                theme,
-                                cx.listener(|this, _event, _window, cx| {
-                                    this.dispatch(InputAction::NextTrack, cx);
-                                }),
-                                cx.listener(|this, hovered: &bool, _window, cx| {
-                                    this.next_hovered = *hovered;
-                                    cx.notify();
-                                }),
-                            ))
-                            .child(
-                                // The queue toggle, to the right of "next": it
-                                // swaps the queue panel in over the tabs, so
-                                // it stays lit while the panel is open.
-                                div()
-                                    .id("queue-toggle")
-                                    .cursor_pointer()
-                                    .size(px(36.0))
-                                    .flex()
-                                    .items_center()
-                                    .justify_center()
-                                    .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
-                                        this.queue_hovered = *hovered;
-                                        cx.notify();
-                                    }))
-                                    .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                                        this.state.update(cx, |state, cx| state.toggle_queue(cx));
-                                    }))
-                                    .child(icon(
-                                        15.0,
-                                        14.0,
-                                        QUEUE_POLYGONS,
-                                        if queue_open || self.queue_hovered {
-                                            theme.accent
-                                        } else {
-                                            theme.text_muted
-                                        },
-                                    )),
-                            ),
-                    )
+                    .child(seek_bar)
                     .child(
                         div()
                             .text_size(px(theme.small_px()))
@@ -401,7 +277,132 @@ impl Render for PlaybackView {
                             .child(format_duration(duration)),
                     ),
             )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .gap_2()
+                    .w_full()
+                    .child(repeat_toggle(theme, repeat, self.repeat_hovered, cx))
+                    .child(transport_button(
+                        "prev",
+                        can_prev,
+                        self.prev_hovered,
+                        PREV_POLYGONS,
+                        theme,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.dispatch(InputAction::PrevTrack, cx);
+                        }),
+                        cx.listener(|this, hovered: &bool, _window, cx| {
+                            this.prev_hovered = *hovered;
+                            cx.notify();
+                        }),
+                    ))
+                    .child(play_button(playing, ended, theme, cx))
+                    .child(transport_button(
+                        "next",
+                        can_next,
+                        self.next_hovered,
+                        NEXT_POLYGONS,
+                        theme,
+                        cx.listener(|this, _event, _window, cx| {
+                            this.dispatch(InputAction::NextTrack, cx);
+                        }),
+                        cx.listener(|this, hovered: &bool, _window, cx| {
+                            this.next_hovered = *hovered;
+                            cx.notify();
+                        }),
+                    ))
+                    .child(queue_toggle(theme, queue_open, self.queue_hovered, cx)),
+            )
     }
+}
+
+/// The play/pause button: a filled circle with the glyph inside.
+fn play_button(playing: bool, ended: bool, theme: Theme, cx: &mut Context<PlaybackView>) -> AnyElement {
+    div()
+        .id("play-pause")
+        .when(!ended, |d| d.cursor_pointer())
+        .when(ended, |d| d.opacity(0.4))
+        .rounded_full()
+        .size(px(48.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .bg(theme.text_muted)
+        .when(!ended, |d| d.hover(|d| d.bg(theme.accent)))
+        .on_click(cx.listener(|this, _event, _window, cx| {
+            this.dispatch(InputAction::TogglePause, cx);
+        }))
+        .child(div().flex().items_center().child(if playing {
+            icon(13.0, 16.0, PAUSE_POLYGONS, theme.panel_bg).into_any_element()
+        } else {
+            // Nudge the triangle right so it reads as optically centered in
+            // the circle.
+            div()
+                .pl(px(2.0))
+                .child(icon(14.0, 16.0, PLAY_POLYGONS, theme.panel_bg))
+                .into_any_element()
+        }))
+        .into_any_element()
+}
+
+/// The repeat toggle: cycles off → repeat-one → repeat-all. Lit while any
+/// repeat mode is active, and the glyph gains a "1" in repeat-one.
+fn repeat_toggle(
+    theme: Theme,
+    repeat: RepeatMode,
+    hovered: bool,
+    cx: &mut Context<PlaybackView>,
+) -> AnyElement {
+    div()
+        .id("repeat-toggle")
+        .cursor_pointer()
+        .size(px(36.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+            this.repeat_hovered = *hovered;
+            cx.notify();
+        }))
+        .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+            this.state.update(cx, |state, cx| state.cycle_repeat(cx));
+        }))
+        .child(icon(
+            15.0,
+            14.0,
+            if repeat == RepeatMode::Once { REPEAT_ONCE_POLYGONS } else { REPEAT_POLYGONS },
+            if repeat != RepeatMode::Off || hovered { theme.accent } else { theme.text_muted },
+        ))
+        .into_any_element()
+}
+
+/// The queue toggle: swaps the queue panel in over the tabs, so it stays lit
+/// while the panel is open.
+fn queue_toggle(theme: Theme, queue_open: bool, hovered: bool, cx: &mut Context<PlaybackView>) -> AnyElement {
+    div()
+        .id("queue-toggle")
+        .cursor_pointer()
+        .size(px(36.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .on_hover(cx.listener(|this, hovered: &bool, _window, cx| {
+            this.queue_hovered = *hovered;
+            cx.notify();
+        }))
+        .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+            this.state.update(cx, |state, cx| state.toggle_queue(cx));
+        }))
+        .child(icon(
+            15.0,
+            14.0,
+            QUEUE_POLYGONS,
+            if queue_open || hovered { theme.accent } else { theme.text_muted },
+        ))
+        .into_any_element()
 }
 
 /// Unit-square polygon sets for the transport icons, painted via

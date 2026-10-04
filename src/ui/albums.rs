@@ -34,6 +34,21 @@ use crate::ui::widgets::blend;
 /// Cover thumbnail size in an album header.
 pub const THUMB_PX: f32 = 64.0;
 
+/// Cover size in the icon grid — the album-header thumbnail's size, the same
+/// "icon size" the playlist headers use.
+pub const ICON_COVER_PX: f32 = THUMB_PX;
+
+/// Padding around one icon card, in px. The icons-per-row a container fits is
+/// its width divided by the card width (cover + twice this) plus the gap.
+pub const ICON_PAD_PX: f32 = 8.0;
+
+/// The full width of one icon card: cover plus padding on both sides.
+pub const ICON_CARD_PX: f32 = ICON_COVER_PX + ICON_PAD_PX * 2.0;
+
+/// Horizontal gap between icon columns, in px. The column count a container
+/// fits is derived from this together with [`ICON_CARD_PX`].
+pub const ICON_GAP_PX: f32 = 8.0;
+
 /// The most characters a title column shows before its text fades and slides.
 pub const MAX_TITLE_CHARS: usize = 48;
 
@@ -428,13 +443,13 @@ pub trait RowActions<V: Render>: 'static {
         cx: &mut Context<V>,
     );
 
-    /// A row was right-clicked. `item_ix` is the row's index in the flattened
-    /// list.
+    /// A row (or, in icon view, an album cover) was right-clicked. `songs` is
+    /// what the menu acts on — the clicked row's song, or the album's songs.
     fn context(
         &self,
         view: &mut V,
         item_ix: usize,
-        song: SongId,
+        songs: Vec<SongId>,
         context: Option<PlaylistId>,
         event: &MouseDownEvent,
         window: &mut Window,
@@ -586,7 +601,7 @@ pub fn render_item<V: Render + 'static>(
     let on_right_click = {
         let actions = actions.clone();
         cx.listener(move |view, event: &MouseDownEvent, window, cx| {
-            actions.context(view, ix, song, playlist_context, event, window, cx)
+            actions.context(view, ix, vec![song], playlist_context, event, window, cx)
         })
     };
     let on_hover = {
@@ -1058,6 +1073,10 @@ fn row_bitrate(playing: bool, nominal: &SharedString, live: Option<&SharedString
     }
 }
 
+/// A square cover thumbnail. Rounding is opt-in per surface — see
+/// `thumbnail_rounded` for the one that carries the radius on the image
+/// element itself (gpui's `overflow_hidden` clips to a rectangular mask that
+/// knows nothing of corner radii, so a rounded wrapper shows no rounding).
 fn thumbnail(theme: Theme, cover: Option<CoverImage>, size: f32) -> AnyElement {
     match cover {
         Some(CoverImage::Ready(image)) => img(image)
@@ -1076,6 +1095,196 @@ fn thumbnail(theme: Theme, cover: Option<CoverImage>, size: f32) -> AnyElement {
             .child("♪")
             .into_any_element(),
     }
+}
+
+/// The rounded variant: the radius has to sit on the image element itself —
+/// gpui's `overflow_hidden` clips to a rectangular mask that knows nothing of
+/// corner radii, so a rounded wrapper around a square image shows no rounding.
+fn thumbnail_rounded(theme: Theme, cover: Option<CoverImage>, size: f32) -> AnyElement {
+    match cover {
+        Some(CoverImage::Ready(image)) => img(image)
+            .size(px(size))
+            .flex_none()
+            .object_fit(ObjectFit::Cover)
+            .rounded_md()
+            .into_any_element(),
+        _ => div()
+            .size(px(size))
+            .flex_none()
+            .rounded_md()
+            .bg(theme.row_odd)
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(theme.text_faint)
+            .child("♪")
+            .into_any_element(),
+    }
+}
+
+/// The uniform height of an icon card: cover plus padding. Icon view draws no
+/// text — the playing song's information lives in the bottom bar — so every
+/// card is the same size and the column packing is exact.
+pub fn icon_card_height() -> f32 {
+    ICON_PAD_PX * 2.0 + ICON_COVER_PX
+}
+
+/// One packed row of the icon grid: the card indices it holds, left to right.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct IconRow {
+    pub cards: Vec<usize>,
+}
+
+/// The packed icon grid: rows of cards plus the height they reach.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct IconLayout {
+    pub rows: Vec<IconRow>,
+    pub height: f32,
+}
+
+/// Pack `count` uniform cards into rows that fill left to right and wrap to
+/// the next row when one is full. The cards-per-row count comes from
+/// `viewport_w`; a partial last row keeps whatever is left over.
+pub fn pack_rows(count: usize, viewport_w: f32) -> IconLayout {
+    let card_h = icon_card_height();
+    let per_row =
+        (((viewport_w + ICON_GAP_PX) / (ICON_CARD_PX + ICON_GAP_PX)).floor() as usize).max(1);
+    let indices: Vec<usize> = (0..count).collect();
+    let rows = indices
+        .chunks(per_row)
+        .map(|chunk| IconRow { cards: chunk.to_vec() })
+        .collect();
+    IconLayout { rows, height: (count.div_ceil(per_row)) as f32 * card_h }
+}
+
+/// How far past the viewport's edges the grid renders cards, in px — the
+/// overdraw that makes fast scrolling not pop cards in from nothing.
+const ICON_OVERDRAW_PX: f32 = 400.0;
+
+/// The icon grid: every album as a cover — no text under it; the playing
+/// song's information lives in the bottom bar. Cards are uniform, packed into
+/// rows that fill left to right and wrap to the next row when one is full
+/// (see [`pack_rows`]).
+///
+/// The grid is windowed to the viewport: only the rows whose (pre-computed)
+/// position intersects the scroll range render, the first one leading with a
+/// spacer of the height scrolled past. That's what keeps a multi-thousand
+/// album library at full speed.
+pub fn render_icon_grid<V: Render + 'static>(
+    context: &RowContext,
+    sections: &[AlbumSection],
+    layout: &IconLayout,
+    scroll_y: f32,
+    viewport_h: f32,
+    actions: &Rc<dyn RowActions<V>>,
+    cx: &mut Context<V>,
+) -> AnyElement {
+    let card_h = icon_card_height();
+    let top = scroll_y - ICON_OVERDRAW_PX;
+    let bottom = scroll_y + viewport_h + ICON_OVERDRAW_PX;
+
+    let mut grid = div()
+        .flex_none()
+        .h(px(layout.height))
+        .flex()
+        .flex_col()
+        .content_start();
+
+    let mut rendered = false;
+    for (ix, row) in layout.rows.iter().enumerate() {
+        // The visible rows with their y offsets; everything above the window
+        // becomes one spacer, and the rows themselves render whole — the
+        // scroll container clips whatever pokes past its top.
+        let y = ix as f32 * card_h;
+        if y >= bottom || y + card_h <= top {
+            continue;
+        }
+        if !rendered && y > 0.0 {
+            grid = grid.child(div().w_full().flex_none().h(px(y)));
+        }
+        rendered = true;
+        grid = grid.child(
+            div()
+                .flex_none()
+                .h(px(card_h))
+                .flex()
+                .flex_row()
+                .gap_x(px(ICON_GAP_PX))
+                .children(row.cards.iter().map(|&card| {
+                    let section = &sections[card];
+                    request_cover(context.covers, context.library, section.cover_song, cx);
+                    let cover = context.covers.read(cx).cover_of(section.cover_song);
+                    icon_card(context, section, cover, actions, cx)
+                })),
+        );
+    }
+
+    // The rows pack to a fixed total width; when the viewport is wider
+    // than that, the block centers so the covers sit with equal spacing from
+    // the window's left and right edges.
+    div()
+        .w_full()
+        .flex()
+        .justify_center()
+        .child(grid)
+        .into_any_element()
+}
+
+/// One icon card: just the cover — uniform with every other card. Clicking it
+/// plays the album (what clicking a header row would do); right-clicking
+/// opens the song menu for the album's songs.
+fn icon_card<V: Render + 'static>(
+    context: &RowContext,
+    section: &AlbumSection,
+    cover: Option<CoverImage>,
+    actions: &Rc<dyn RowActions<V>>,
+    cx: &mut Context<V>,
+) -> AnyElement {
+    let theme = context.theme;
+    let playlist = section.playlist;
+    let songs: Vec<SongId> = section.tracks.iter().map(|track| track.song).collect();
+
+    // The cover plays the album from its first track.
+    let on_click = section.tracks.first().map(|_track| {
+        let actions = actions.clone();
+        cx.listener(move |view, event: &ClickEvent, window, cx| {
+            actions.activate(view, 0, playlist, 0, event, window, cx)
+        })
+    });
+    // Right-click opens the song menu for the album's songs.
+    let on_right_click = {
+        let actions = actions.clone();
+        let songs = songs.clone();
+        let playlist_context = context.context;
+        cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+            actions.context(view, 0, songs.clone(), playlist_context, event, window, cx)
+        })
+    };
+
+    div()
+        .id(ElementId::NamedInteger("icon-cover".into(), section.playlist.0 as u64))
+        .w(px(ICON_CARD_PX))
+        .h(px(icon_card_height()))
+        .flex_none()
+        .flex()
+        .items_start()
+        .justify_start()
+        .p(px(ICON_PAD_PX))
+        .rounded_md()
+        .cursor_pointer()
+        .hover(|d| d.bg(theme.row_hover))
+        .when_some(on_click, |d, on_click| d.on_click(on_click))
+        .when(!songs.is_empty(), |d| {
+            d.on_mouse_down(MouseButton::Right, on_right_click)
+        })
+        // Icon view: singles (one-track sections) get rounded covers;
+        // album and playlist covers stay square.
+        .child(if section.tracks.len() == 1 {
+            thumbnail_rounded(theme, cover, ICON_COVER_PX)
+        } else {
+            thumbnail(theme, cover, ICON_COVER_PX)
+        })
+        .into_any_element()
 }
 
 #[cfg(test)]
@@ -1266,6 +1475,48 @@ mod tests {
         // Deselecting a middle pick keeps the rest in pick order.
         selection.toggle(1);
         assert_eq!(selection.songs(&items, &sections), vec![2, 3]);
+    }
+
+    #[test]
+    fn pack_rows_fills_rows_left_to_right() {
+        // Three uniform cards, a viewport two cards wide: row one holds the
+        // first two (left to right), row two the last — never a shared row.
+        let layout = pack_rows(3, 2.0 * (ICON_CARD_PX + ICON_GAP_PX));
+        let h = icon_card_height();
+        assert_eq!(layout.rows.len(), 2);
+        assert_eq!(layout.rows[0].cards, vec![0, 1], "row one fills left to right");
+        assert_eq!(layout.rows[1].cards, vec![2], "overflow starts the next row");
+        assert_eq!(layout.height, 2.0 * h);
+    }
+
+    #[test]
+    fn pack_rows_keeps_a_partial_last_row() {
+        // Seven cards over two per row: 2 + 2 + 2 + 1, the last row a stub.
+        let layout = pack_rows(7, 2.0 * (ICON_CARD_PX + ICON_GAP_PX));
+        let lens: Vec<usize> = layout.rows.iter().map(|r| r.cards.len()).collect();
+        assert_eq!(lens, vec![2, 2, 2, 1]);
+        assert_eq!(layout.height, 4.0 * icon_card_height());
+    }
+
+    #[test]
+    fn pack_rows_keeps_a_single_card() {
+        let layout = pack_rows(1, 5000.0);
+        assert_eq!(layout.rows.len(), 1);
+        assert_eq!(layout.rows[0].cards, vec![0]);
+        assert_eq!(layout.height, icon_card_height());
+    }
+
+    #[test]
+    fn pack_rows_with_no_cards_is_empty() {
+        let layout = pack_rows(0, 5000.0);
+        assert!(layout.rows.is_empty());
+        assert_eq!(layout.height, 0.0);
+    }
+
+    #[test]
+    fn icon_cards_are_uniform() {
+        // No text under the covers, so every card is exactly cover + padding.
+        assert_eq!(icon_card_height(), ICON_PAD_PX * 2.0 + ICON_COVER_PX);
     }
 
     #[test]

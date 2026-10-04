@@ -296,7 +296,7 @@ impl RowActions<QueueView> for QueueRows {
         &self,
         view: &mut QueueView,
         item_ix: usize,
-        _song: crate::model::SongId,
+        _songs: Vec<crate::model::SongId>,
         _context: Option<PlaylistId>,
         event: &gpui::MouseDownEvent,
         _window: &mut Window,

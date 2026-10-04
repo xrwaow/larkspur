@@ -44,6 +44,9 @@ pub struct BrowseView {
     search: TextField,
     search_focus: FocusHandle,
     focus_handle: FocusHandle,
+    /// The shared config — read for the list/icon view mode (the flag itself
+    /// is persisted there and changed by the bottom bar's toggle).
+    config: Entity<ConfigState>,
     _observe: AlbumListSubs,
 }
 
@@ -66,6 +69,7 @@ impl BrowseView {
             search: TextField::default(),
             search_focus: cx.focus_handle(),
             focus_handle: cx.focus_handle(),
+            config: config.clone(),
             _observe: observe,
         }
     }
@@ -301,6 +305,10 @@ impl Render for BrowseView {
                 },
                 true,
             ));
+        } else if self.config.read(cx).icon_view() {
+            // Icon view: album cards — cover, then its songs — wrapped to the
+            // container's width, instead of the headed track-row list.
+            root = root.child(album_list::render_icons(self, theme, None, window, cx));
         } else {
             root = root.child(album_list::render_rows(self, theme, None, cx));
         }

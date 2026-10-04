@@ -52,6 +52,8 @@ pub struct SearchView {
     /// row focuses the overlay root instead, which blurs the box: from then on
     /// `space` pauses playback again until the box is re-selected.
     input_focus: FocusHandle,
+    /// The shared config — read for the list/icon view mode.
+    config: Entity<ConfigState>,
     /// No playback observer — the overlay re-renders with focus changes
     /// anyway; it reads playback while it renders.
     _observe: AlbumListSubs,
@@ -80,6 +82,7 @@ impl SearchView {
             warnings: Vec::new(),
             focus_handle: cx.focus_handle(),
             input_focus: cx.focus_handle(),
+            config: config.clone(),
             _observe: observe,
         }
     }
@@ -231,6 +234,9 @@ impl Render for SearchView {
                 },
                 true,
             )));
+        } else if self.config.read(cx).icon_view() {
+            // Icon view: result albums as cards — cover, then its songs.
+            root = root.child(crate::ui::album_list::render_icons(self, theme, None, window, cx));
         } else {
             root = root.child(crate::ui::album_list::render_rows(self, theme, None, cx));
         }
