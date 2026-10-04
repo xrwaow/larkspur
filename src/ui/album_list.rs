@@ -41,8 +41,8 @@ pub enum Play {
 /// Snapshot a scope into drawable sections, with `query` filtering the songs
 /// *within* it — an empty query is the whole scope. The library scope runs the
 /// query engine over the whole library; an artist scope filters their
-/// discography, keeping its newest-first order. A playlist scope is shown
-/// as-is — its view offers no box.
+/// discography, keeping its newest-first order; a folder scope resolves the
+/// albums (and singles) under its directory, in folder order.
 pub fn sections(library: &Library, scope: &Scope, query: &search::Query) -> Vec<AlbumSection> {
     let groups = match scope {
         Scope::Library => search::search(library, query),
@@ -51,12 +51,11 @@ pub fn sections(library: &Library, scope: &Scope, query: &search::Query) -> Vec<
             query: query.clone(),
             order: Order::NewestFirst,
         }),
-        Scope::Playlists(ids) => {
-            return ids
-                .iter()
-                .filter_map(|id| albums::section_for_playlist(library, *id))
-                .collect();
-        }
+        Scope::Folder { dir, mode } => library.select(&Selection {
+            scope: Scope::Folder { dir: dir.clone(), mode: *mode },
+            query: query.clone(),
+            order: Order::TrackOrder,
+        }),
     };
     albums::sections_from_groups(library, groups)
 }

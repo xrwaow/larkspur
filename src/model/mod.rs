@@ -31,4 +31,4 @@ pub use playlist::{Playlist, PlaylistId, PlaylistKind, PlaylistOrigin};
 pub use scan::{LibraryCache, SyncReport};
 pub use select::{Order, Scope, Selection};
 pub use song::{ReleaseDate, SongMetadata};
-pub use view::TabId;
+pub use view::{FolderMode, TabId};

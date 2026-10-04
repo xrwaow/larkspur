@@ -8,6 +8,15 @@ use std::path::PathBuf;
 
 use super::playlist::PlaylistId;
 
+/// How much of a folder a folder view covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FolderMode {
+    /// The folder and every subfolder under it, flattened — "Play full folder".
+    Full,
+    /// Only the folder's own songs, no subfolders — "Play folder".
+    Here,
+}
+
 /// Which container a center tab shows.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum TabId {
@@ -19,8 +28,8 @@ pub enum TabId {
     /// "Go to {artist}" menu item. Its own tab rather than a filtered library,
     /// so it sits beside the library instead of replacing it.
     Artist(String),
-    /// A folder played from the rail's folder view: the temporary playlists
-    /// "Play folder" created, shown as one grouped view. Identified by path,
-    /// so re-playing the same folder focuses the existing tab.
+    /// A folder played from the rail's folder view: the albums and singles
+    /// under it, flattened. Identified by path, so re-playing the same folder —
+    /// in either mode — re-scopes the tab that's already open.
     Folder(PathBuf),
 }

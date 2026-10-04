@@ -1,9 +1,9 @@
 //! The center tab container — a strip of tabs over the active container.
 //!
-//! One container per tab: browse, plus one per playlist the user has opened
-//! from the left rail. The strip sits on top and clicking a tab switches which
-//! container is mounted; only the active one is in the element tree, so only it
-//! receives keys.
+//! One container per tab: browse, plus one per playlist, artist, or folder
+//! opened from the left rail and the song menu. The strip sits on top and
+//! clicking a tab switches which container is mounted; only the active one is
+//! in the element tree, so only it receives keys.
 //!
 //! Search and settings are deliberately *not* tabs. `ctrl+shift+f` swaps the
 //! search panel in over whatever tab is active and `esc` (or the same chord)
@@ -17,6 +17,7 @@
 //! bubble up here, which is where tab switching, closing, and the transport
 //! keys live.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use gpui::{
@@ -24,7 +25,7 @@ use gpui::{
     KeyDownEvent, MouseDownEvent, Render, Subscription, Window,
 };
 
-use crate::model::{InputAction, PlaylistId, TabId};
+use crate::model::{FolderMode, InputAction, PlaylistId, TabId};
 use crate::ui::animation::Animator;
 use crate::ui::browse::BrowseView;
 use crate::ui::config_state::{ConfigState, Themed};
@@ -33,6 +34,7 @@ use crate::ui::cover_store::CoverStore;
 use crate::ui::input::action_for_key;
 use crate::ui::library_state::{LibraryState, Request};
 use crate::ui::menu::{context_menu, song_menu_items, MenuHandler, SongMenuRequest};
+use crate::ui::marquee::{self, Marquee};
 use crate::ui::playlist::PlaylistView;
 use crate::ui::queue::QueueView;
 use crate::ui::search::SearchView;
@@ -40,13 +42,14 @@ use crate::ui::settings::SettingsView;
 use crate::ui::playback_state::PlaybackState;
 use crate::ui::theme::Theme;
 
-/// One playlist tab: what it shows, where its focus goes, and — for a folder
-/// view — the temporary playlists it was built from (deleted with the tab).
+/// The most characters a tab's label shows before its text fades and slides.
+const TAB_MAX_CHARS: usize = 28;
+
+/// One playlist tab: what it shows and where its focus goes.
 struct Tab {
     id: TabId,
     view: AnyView,
     focus: FocusHandle,
-    temp: Vec<PlaylistId>,
 }
 
 pub struct TabsView {
@@ -75,12 +78,18 @@ pub struct TabsView {
     menu: Option<SongMenuRequest>,
     /// The window title last set, so the titlebar is only touched on change.
     last_title: String,
+    /// Per-tab marquee — the same fade/slide/spring-back the list rows use,
+    /// so a long label slides on hover instead of being truncated. Its
+    /// region-hover also carries the tab's hover wash, so the fade matches
+    /// whatever background is painted.
+    marquees: HashMap<TabId, Marquee>,
     /// Set when the library notified, so the request poll only runs when
     /// something may actually be pending rather than every frame.
     library_dirty: bool,
     focus_handle: FocusHandle,
     _observe: Subscription,
     _observe_playback: Subscription,
+    _observe_animator: Subscription,
 }
 
 impl TabsView {
@@ -128,6 +137,16 @@ impl TabsView {
             cx.notify();
         });
         let observe_playback = cx.observe(&playback, |_this, _state, cx| cx.notify());
+        let observe_animator = cx.observe(&animator, |this, animator, cx| {
+            let dt = animator.read(cx).dt();
+            let moved = this
+                .marquees
+                .values_mut()
+                .any(|marquee| marquee.tick(dt));
+            if moved {
+                cx.notify();
+            }
+        });
         let themed = Themed::new(&config, cx);
         Self {
             library,
@@ -146,10 +165,12 @@ impl TabsView {
             settings_open: false,
             menu: None,
             last_title: String::new(),
+            marquees: HashMap::new(),
             library_dirty: false,
             focus_handle: cx.focus_handle(),
             _observe: observe,
             _observe_playback: observe_playback,
+            _observe_animator: observe_animator,
         }
     }
 
@@ -181,7 +202,7 @@ impl TabsView {
                 )
             });
             let focus = view.read(cx).focus_handle_for_window();
-            self.tabs.push(Tab { id: tab_id.clone(), view: view.into(), focus, temp: Vec::new() });
+            self.tabs.push(Tab { id: tab_id.clone(), view: view.into(), focus });
         }
         self.activate(tab_id, window, cx);
     }
@@ -205,52 +226,57 @@ impl TabsView {
                 browse
             });
             let focus = view.read(cx).focus_handle_for_window();
-            self.tabs.push(Tab { id: tab_id.clone(), view: view.into(), focus, temp: Vec::new() });
+            self.tabs.push(Tab { id: tab_id.clone(), view: view.into(), focus });
         }
         self.activate(tab_id, window, cx);
     }
 
-    /// Open (or focus) a folder's tab: the temporary playlists "Play folder"
-    /// created, shown as one grouped view. Identified by path, so re-playing
-    /// the same folder focuses the tab that's already open.
+    /// Open (or focus) a folder's tab: the albums and singles under it,
+    /// flattened. Identified by path, so re-playing the same folder — in
+    /// either mode — re-scopes the tab that's already open rather than opening
+    /// a second one.
     pub fn open_folder(
         &mut self,
-        path: PathBuf,
-        playlists: Vec<PlaylistId>,
+        dir: PathBuf,
+        mode: FolderMode,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let tab_id = TabId::Folder(path.clone());
-        if !self.tabs.iter().any(|tab| tab.id == tab_id) {
-            let title = path
-                .file_name()
-                .map(|name| name.to_string_lossy().to_string())
-                .unwrap_or_else(|| path.display().to_string());
-            let view = cx.new(|cx| {
-                let mut browse = BrowseView::new(
-                    self.library.clone(),
-                    self.playback.clone(),
-                    self.covers.clone(),
-                    self.config.clone(),
-                    self.animator.clone(),
-                    cx,
-                );
-                browse.set_playlist_scope(title, playlists.clone(), cx);
-                browse
-            });
-            let focus = view.read(cx).focus_handle_for_window();
-            self.tabs.push(Tab { id: tab_id.clone(), view: view.into(), focus, temp: playlists });
+        let tab_id = TabId::Folder(dir.clone());
+        match self.tabs.iter_mut().find(|tab| tab.id == tab_id) {
+            Some(tab) => {
+                if let Ok(view) = tab.view.clone().downcast::<BrowseView>() {
+                    view.update(cx, |browse, cx| browse.set_folder_scope(dir, mode, cx));
+                }
+            }
+            None => {
+                let view = cx.new(|cx| {
+                    let mut browse = BrowseView::new(
+                        self.library.clone(),
+                        self.playback.clone(),
+                        self.covers.clone(),
+                        self.config.clone(),
+                        self.animator.clone(),
+                        cx,
+                    );
+                    browse.set_folder_scope(dir, mode, cx);
+                    browse
+                });
+                let focus = view.read(cx).focus_handle_for_window();
+                self.tabs.push(Tab { id: tab_id.clone(), view: view.into(), focus });
+            }
         }
         self.activate(tab_id, window, cx);
     }
 
     /// Close a non-browse tab, activating the neighbour that takes its place.
     /// A temporary playlist lives exactly as long as its tab: closing one
-    /// deletes the playlist(s) it was showing.
+    /// deletes the playlist it was showing.
     pub fn close_tab(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
         let Some(index) = self.tabs.iter().position(|tab| tab.id == id) else { return };
-        let tab = self.tabs.remove(index);
-        let mut temps = tab.temp;
+        self.tabs.remove(index);
+        // A temporary playlist tab deletes its playlist with it — it lives
+        // exactly as long as the tab that shows it.
         if let TabId::Playlist(playlist) = &id {
             if self
                 .library
@@ -259,14 +285,8 @@ impl TabsView {
                 .playlist(*playlist)
                 .is_some_and(|p| p.is_temporary())
             {
-                temps.push(*playlist);
+                self.library.update(cx, |state, cx| state.delete_playlist(*playlist, cx));
             }
-        }
-        // One batched delete: a folder tab can carry hundreds of temporary
-        // playlists, and deleting per-playlist meant a full-library cache
-        // write each.
-        if !temps.is_empty() {
-            self.library.update(cx, |state, cx| state.delete_playlists(temps, cx));
         }
         if self.active == id && !self.search_open && !self.settings_open {
             let fallback = self
@@ -432,27 +452,21 @@ impl TabsView {
 
     /// Drop tabs whose backing is gone: a playlist tab whose playlist was
     /// deleted (a rescan also drops temporary playlists, taking their tabs
-    /// with them), or a folder tab whose temporary playlists a rescan removed.
-    /// Artist tabs are scoped by name, not by a library entity, so they're
+    /// with them). Folder tabs resolve their scope live against the library,
+    /// so they can't go stale — they show whatever the folder holds now — and
+    /// artist tabs are scoped by name, not by a library entity, so they're
     /// always kept.
     fn prune(&mut self, cx: &App) {
         let library = self.library.read(cx).library();
         let alive = |id: PlaylistId| library.playlist(id).is_some();
         self.tabs.retain(|tab| match &tab.id {
             TabId::Playlist(id) => alive(*id),
-            TabId::Folder(_) => tab.temp.iter().all(|id| alive(*id)),
             _ => true,
         });
-        let active_gone = match self.active.clone() {
-            TabId::Playlist(id) => !alive(id),
-            TabId::Folder(path) => {
-                let id = TabId::Folder(path.clone());
-                !self.tabs.iter().any(|tab| tab.id == id)
+        if let TabId::Playlist(id) = self.active.clone() {
+            if !alive(id) {
+                self.active = TabId::Browse;
             }
-            _ => false,
-        };
-        if active_gone {
-            self.active = TabId::Browse;
         }
     }
 
@@ -509,14 +523,17 @@ impl Render for TabsView {
                 match request {
                     Request::OpenPlaylist(id) => self.open_playlist(id, window, cx),
                     Request::ArtistView(artist) => self.open_artist(artist, window, cx),
-                    Request::FolderPlay(dir) => {
+                    Request::FolderPlay(dir, mode) => {
                         let playback = self.playback.clone();
-                        let playlists = self
+                        let played = self
                             .library
-                            .update(cx, |state, cx| state.play_folder(&dir, &playback, cx));
-                        if !playlists.is_empty() {
-                            self.open_folder(dir, playlists, window, cx);
+                            .update(cx, |state, cx| state.play_folder(&dir, mode, &playback, cx));
+                        if played {
+                            self.open_folder(dir, mode, window, cx);
                         }
+                    }
+                    Request::FolderOpen(dir, mode) => {
+                        self.open_folder(dir, mode, window, cx);
                     }
                     Request::SongMenu(request) => self.menu = Some(request),
                 }
@@ -525,20 +542,57 @@ impl Render for TabsView {
 
         self.prune(cx);
 
+        // Marquee state for a tab that's gone is dropped with it.
+        self.marquees.retain(|id, _| {
+            id == &TabId::Browse || self.tabs.iter().any(|tab| &tab.id == id)
+        });
+
         let mut strip: Vec<AnyElement> = Vec::new();
+        let tab_px = theme.font_size - 1.0;
+        let advance = marquee::char_advance(window, theme, tab_px);
         for (index, id) in self.tab_ids().into_iter().enumerate() {
             let title = self.tab_title(&id, cx);
+            // A tab is only as wide as its label needs: shorter titles get a
+            // narrower cell; only ones past the max get the fading column.
+            let label_chars = title.chars().count().min(TAB_MAX_CHARS);
+            let label_width = advance * label_chars.max(1) as f32;
+            let title_travel = marquee::travel_for(&title, label_width, label_chars);
             let closable = !matches!(id, TabId::Browse);
+            let active = self.active == id && !self.search_open && !self.settings_open;
+            let marquee = self.marquees.entry(id.clone()).or_default();
+            let tab_hovered = marquee.is_region_hovered();
+            let offset = marquee.offset();
             let activate_id = id.clone();
             let close_id = id.clone();
+            let hover_id = id.clone();
+            let tab_hover_id = id.clone();
             strip.push(tab_button(
                 theme,
                 index,
                 title,
+                label_width,
+                label_chars,
+                tab_px,
+                offset,
+                active,
+                tab_hovered,
+                closable,
+                cx.listener(move |this, hovered: &bool, _window, cx| {
+                    if let Some(marquee) = this.marquees.get_mut(&tab_hover_id) {
+                        if marquee.set_region_hovered(*hovered) {
+                            cx.notify();
+                        }
+                    }
+                }),
+                cx.listener(move |this, hovered: &bool, _window, cx| {
+                    if let Some(marquee) = this.marquees.get_mut(&hover_id) {
+                        if marquee.set_hovered(*hovered, title_travel) {
+                            cx.notify();
+                        }
+                    }
+                }),
                 // An overlay takes over the content area, so no tab is "active"
                 // while one is up.
-                self.active == id && !self.search_open && !self.settings_open,
-                closable,
                 cx.listener(move |this, _event: &ClickEvent, window, cx| {
                     this.activate(activate_id.clone(), window, cx);
                 }),
@@ -687,12 +741,26 @@ fn tab_button(
     theme: Theme,
     index: usize,
     title: String,
+    label_width: f32,
+    label_chars: usize,
+    tab_px: f32,
+    title_offset: f32,
     active: bool,
+    tab_hovered: bool,
     closable: bool,
+    on_tab_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
+    on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_close: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    let tab_px = theme.font_size - 1.0;
+    // The fade dissolves the text into whatever the tab's background is, so
+    // both come from the same `wash`: the highlight when active, the hover
+    // wash when the pointer is over the tab, the strip's panel otherwise.
+    let background = if active {
+        theme.row_active
+    } else {
+        marquee::wash(theme.panel_bg, theme.row_hover, tab_hovered)
+    };
     div()
         .id(("tab", index))
         .flex()
@@ -703,11 +771,32 @@ fn tab_button(
         .rounded_t_md()
         .cursor_pointer()
         .text_size(px(tab_px))
-        .when(active, |d| d.bg(theme.row_active).text_color(theme.text))
-        .when(!active, |d| d.text_color(theme.text_muted))
-        .hover(|d| d.bg(theme.row_hover))
+        .bg(background)
+        .text_color(if active {
+            theme.text
+        } else if tab_hovered {
+            theme.text
+        } else {
+            theme.text_muted
+        })
+        .on_hover(on_tab_hover)
         .on_click(on_click)
-        .child(div().max_w(px(220.0)).truncate().child(title))
+        .child(marquee::marquee_text(
+            theme,
+            ("tab-label", index),
+            &title,
+            label_width,
+            label_chars,
+            tab_px,
+            title_offset,
+            if active || tab_hovered {
+                theme.text
+            } else {
+                theme.text_muted
+            },
+            background,
+            on_hover,
+        ))
         .when(closable, |d| {
             d.child(
                 div()

@@ -1,14 +1,18 @@
 //! Selection — one way to ask the library for songs: a scope, a query, and
 //! an order.
 //!
-//! The browse view, search, and an artist's discography are all the same
-//! question with different parameters, so they share this one entry point
-//! rather than each walking the library their own way.
+//! The browse view, search, an artist's discography, and a played folder are
+//! all the same question with different parameters, so they share this one
+//! entry point rather than each walking the library their own way.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 
 use super::identity::SongId;
 use super::library::Library;
-use super::playlist::PlaylistId;
+use super::playlist::{PlaylistId, PlaylistOrigin};
 use super::search::{AlbumGroup, Query};
+use super::view::FolderMode;
 
 /// What a [`Selection`] draws its songs from.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -18,8 +22,10 @@ pub enum Scope {
     /// One artist's discography — their album playlists, via the library's
     /// artist index.
     Artist(String),
-    /// An explicit list of playlists, each in its own track order.
-    Playlists(Vec<PlaylistId>),
+    /// The albums (and singles) under one directory — the folder view a played
+    /// folder opens. Resolved live against the library, so a rescan updates the
+    /// view instead of stranding it.
+    Folder { dir: PathBuf, mode: FolderMode },
 }
 
 /// How a [`Selection`]'s album groups are sorted.
@@ -30,8 +36,9 @@ pub enum Order {
     AlbumTitle,
     /// Newest release first, undated albums last — the discography order.
     NewestFirst,
-    /// The order the scope itself yields: a playlist list keeps the order it
-    /// was given in.
+    /// The order the scope itself yields: a folder keeps its directory walk
+    /// (directories depth-first, albums by title within each), so re-sorting
+    /// would undo it.
     TrackOrder,
 }
 
@@ -56,12 +63,17 @@ impl Library {
                 .map(|p| p.id)
                 .collect(),
             Scope::Artist(artist) => self.discography(artist),
-            Scope::Playlists(ids) => ids.clone(),
+            Scope::Folder { dir, mode } => self.albums_under(dir, *mode),
         };
-        match sel.order {
-            Order::AlbumTitle => ids.sort_by(|a, b| self.title_of(*a).cmp(&self.title_of(*b))),
-            Order::NewestFirst => self.sort_by_year(&mut ids),
-            Order::TrackOrder => {}
+        // A folder scope arrives already ordered — directories depth-first,
+        // albums by title within each — and re-sorting would undo that walk,
+        // so its order is fixed whatever `sel.order` asks.
+        if !matches!(sel.scope, Scope::Folder { .. }) {
+            match sel.order {
+                Order::AlbumTitle => ids.sort_by(|a, b| self.title_of(*a).cmp(&self.title_of(*b))),
+                Order::NewestFirst => self.sort_by_year(&mut ids),
+                Order::TrackOrder => {}
+            }
         }
         let matcher = sel.query.matcher();
         ids.into_iter()
@@ -74,6 +86,42 @@ impl Library {
                     .filter(|song| self.get(*song).is_some_and(|song| matcher.matches(song)))
                     .collect();
                 (!songs.is_empty()).then_some(AlbumGroup { playlist: id, songs })
+            })
+            .collect()
+    }
+
+    /// The autogen album playlists under `dir`, in folder order: directories
+    /// depth-first — the same order the rail's folder tree walks, since both
+    /// sort paths lexicographically — and within a directory by album title.
+    /// [`FolderMode::Full`] takes every directory under `dir` too;
+    /// [`FolderMode::Here`] only the albums rooted directly in `dir`.
+    ///
+    /// An album playlist's songs all live in one directory — the directory is
+    /// part of its [`PlaylistOrigin`](super::playlist::PlaylistOrigin) key — so
+    /// a covered album is covered whole: no partial albums, and the groups a
+    /// folder scope yields are the playlists as-is.
+    pub fn albums_under(&self, dir: &Path, mode: FolderMode) -> Vec<PlaylistId> {
+        let mut by_dir: HashMap<&Path, Vec<(&str, PlaylistId)>> = HashMap::new();
+        for playlist in self.playlists() {
+            if let Some(PlaylistOrigin::Album { name, dir: album_dir, .. }) = playlist.origin() {
+                let covered = match mode {
+                    FolderMode::Full => album_dir.starts_with(dir),
+                    FolderMode::Here => album_dir == dir,
+                };
+                if covered {
+                    by_dir
+                        .entry(album_dir.as_path())
+                        .or_default()
+                        .push((name.as_str(), playlist.id));
+                }
+            }
+        }
+        let mut dirs: Vec<_> = by_dir.into_iter().collect();
+        dirs.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        dirs.into_iter()
+            .flat_map(|(_, mut albums)| {
+                albums.sort_unstable();
+                albums.into_iter().map(|(_, id)| id)
             })
             .collect()
     }
@@ -151,21 +199,75 @@ mod tests {
         assert!(library.select(&selection(Scope::Artist("Nobody".into()), Order::AlbumTitle)).is_empty());
     }
 
-    #[test]
-    fn playlist_scope_keeps_the_given_playlists_in_track_order() {
-        let mut library = library();
-        let custom = library.create_custom("Faves");
-        library.add_song(custom, 2);
-        library.add_song(custom, 1);
-        let visions = library.album_playlist_of(1).unwrap();
-        let art_angels = library.album_playlist_of(3).unwrap();
+    /// A tagged song living in a specific directory — the folder tests need
+    /// control over the paths, which `song`'s `/music/{album}/` shape fixes.
+    fn song_in(id: SongId, dir: &str, title: &str, artist: &str, album: &str, track: u16) -> SongMetadata {
+        SongMetadata {
+            id,
+            path: format!("{dir}/{title}.flac").into(),
+            song_name: Some(title.into()),
+            artists: vec![artist.into()],
+            album_name: Some(album.into()),
+            album_artist: Some(artist.into()),
+            track_position: Some(track),
+            date: None,
+            nominal_bitrate: None,
+            lyrics: Lyrics::None,
+            duration: Duration::from_secs(180),
+            has_art: false,
+        }
+    }
 
+    /// Albums nested in folders: the two-track `Alpha` directly in `/music/A`,
+    /// the one-track `Alpha Live` in its `live` subfolder, and `Beta` beside
+    /// them in `/music/B`.
+    fn folder_library() -> Library {
+        let mut library = Library::default();
+        library.insert_song(song_in(1, "/music/A", "One", "X", "Alpha", 1));
+        library.insert_song(song_in(2, "/music/A", "Two", "X", "Alpha", 2));
+        library.insert_song(song_in(3, "/music/A/live", "Live", "X", "Alpha Live", 1));
+        library.insert_song(song_in(4, "/music/B", "Beta Song", "Y", "Beta", 1));
+        library.rebuild_auto();
+        library
+    }
+
+    #[test]
+    fn folder_scope_flattens_subfolders_in_walk_order() {
+        let library = folder_library();
         let groups = library.select(&selection(
-            Scope::Playlists(vec![custom, art_angels, visions]),
+            Scope::Folder { dir: "/music".into(), mode: FolderMode::Full },
             Order::TrackOrder,
         ));
-        assert_eq!(titles(&library, &groups), vec!["Faves", "Art Angels", "Visions"]);
-        assert_eq!(groups[0].songs, vec![2, 1], "the playlist's own order, not album order");
+        assert_eq!(titles(&library, &groups), vec!["Alpha", "Alpha Live", "Beta"]);
+        assert_eq!(groups[0].songs, vec![1, 2], "tracks in album order");
+    }
+
+    #[test]
+    fn folder_here_mode_takes_only_the_folders_own_albums() {
+        let library = folder_library();
+        let groups = library.select(&selection(
+            Scope::Folder { dir: "/music/A".into(), mode: FolderMode::Here },
+            Order::TrackOrder,
+        ));
+        assert_eq!(titles(&library, &groups), vec!["Alpha"], "the subfolder's album stays out");
+        let full = library.select(&selection(
+            Scope::Folder { dir: "/music/A".into(), mode: FolderMode::Full },
+            Order::TrackOrder,
+        ));
+        assert_eq!(titles(&library, &full), vec!["Alpha", "Alpha Live"]);
+    }
+
+    #[test]
+    fn albums_in_one_directory_order_by_title() {
+        let mut library = Library::default();
+        library.insert_song(song_in(1, "/music/A", "Zed", "X", "Zebra", 1));
+        library.insert_song(song_in(2, "/music/A", "Apple", "Y", "Apricot", 1));
+        library.rebuild_auto();
+        let groups = library.select(&selection(
+            Scope::Folder { dir: "/music/A".into(), mode: FolderMode::Full },
+            Order::TrackOrder,
+        ));
+        assert_eq!(titles(&library, &groups), vec!["Apricot", "Zebra"]);
     }
 
     #[test]

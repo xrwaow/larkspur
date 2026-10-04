@@ -35,9 +35,9 @@ pub enum PlaylistKind {
     Auto(PlaylistOrigin),
     /// User-owned: add/remove/rename/delete; persisted.
     Custom { title: String },
-    /// Created on the fly ("Play folder", a multi-row selection played as one).
-    /// Never persisted and dropped by a rescan — it lives exactly as long as
-    /// the tab that shows it.
+    /// Created on the fly (a multi-row selection played as one). Never
+    /// persisted and dropped by a rescan — it lives exactly as long as the
+    /// tab that shows it.
     Temporary { title: String },
 }
 

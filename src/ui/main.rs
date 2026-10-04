@@ -163,7 +163,13 @@ fn main() {
                     )
                 });
                 let playlists = cx.new(|cx| {
-                    PlaylistsView::new(library_state.clone(), tabs.clone(), config_state.clone(), cx)
+                    PlaylistsView::new(
+                        library_state.clone(),
+                        tabs.clone(),
+                        config_state.clone(),
+                        animator.clone(),
+                        cx,
+                    )
                 });
 
                 let playback = cx.new(|cx| {

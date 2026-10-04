@@ -179,7 +179,7 @@ impl Render for LyricsView {
         let anchor = self.anchor.unwrap_or(0);
         let position = self.position;
         let transition = Duration::from_secs_f32(TRANSITION_SECS);
-        let title_advance = marquee::char_advance(window, theme);
+        let title_advance = marquee::char_advance(window, theme, theme.cell_px());
         let title_width = title_advance * LYRIC_TITLE_CHARS as f32;
         let title_offset = self.title_marquee.offset();
 
@@ -302,6 +302,7 @@ impl Render for LyricsView {
                                 &title,
                                 title_width,
                                 LYRIC_TITLE_CHARS,
+                                theme.cell_px(),
                                 title_offset,
                                 theme.text,
                                 theme.rail_bg,

@@ -596,6 +596,17 @@ impl RowList {
         self.restart_selection_fade(&previous);
     }
 
+    /// The list's viewport height, in px — 0 before the first layout, so a
+    /// caller can wait to scroll until the panel is actually sized.
+    pub fn viewport_height(&self) -> f32 {
+        f32::from(self.list_state.viewport_bounds().size.height)
+    }
+
+    /// Bring the playing row into view. See [`RowList::reveal`].
+    pub fn reveal(&mut self, ix: usize) {
+        self.reveal_row(ix);
+    }
+
     /// Scroll the list by a page, eased.
     fn page(&mut self, direction: f32) {
         let height = f32::from(self.list_state.viewport_bounds().size.height);
@@ -609,7 +620,7 @@ impl RowList {
     /// The distance is measured from the row's current on-screen bounds, which
     /// only exist for rows inside the overdraw band. A jump to a row outside it
     /// has nothing to measure against, so that one snaps.
-    fn reveal(&mut self, ix: usize) {
+    fn reveal_row(&mut self, ix: usize) {
         match self.reveal_delta(ix) {
             Some(delta) if delta.abs() <= SCROLL_MAX_ANIMATED_PX => self.scroll.queue(delta),
             _ => {

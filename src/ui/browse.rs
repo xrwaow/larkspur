@@ -13,12 +13,14 @@
 //! and shuffle button: the box live-filters the sections through the same
 //! query engine the search panel uses — within the scope, so an artist tab
 //! filters their discography — and the button plays the scope in random
-//! order. A folder view shows a played folder's temporary playlists, exactly
-//! as asked for, so it shows neither.
+//! order. Every scope has both: a folder view shuffles and filters the folder's
+//! albums and singles as they stand right now.
+
+use std::path::PathBuf;
 
 use gpui::{div, prelude::*, px, Context, Entity, FocusHandle, KeyDownEvent, Render, Window};
 
-use crate::model::{search, InputAction, PlaylistId, Scope};
+use crate::model::{search, FolderMode, InputAction, Scope};
 use crate::ui::album_list::{self, AlbumList, AlbumListSubs, AlbumListView, Play};
 use crate::ui::albums;
 use crate::ui::animation::Animator;
@@ -35,11 +37,8 @@ use crate::ui::widgets::{empty_hint, panel_header, search_box};
 pub struct BrowseView {
     themed: Themed,
     list: AlbumListView,
-    /// What the sections are built from (the library, an artist, a folder's
-    /// playlists).
+    /// What the sections are built from (the library, an artist, a folder).
     scope: Scope,
-    /// A folder scope's tab/header title.
-    scope_title: Option<String>,
     /// The scope's filter box, and its focus handle — `ctrl+f` lands here,
     /// and the box only takes keys while it's focused.
     search: TextField,
@@ -64,7 +63,6 @@ impl BrowseView {
             themed,
             list: AlbumListView::new(library, playback, covers, animator, Play::Playlist),
             scope: Scope::Library,
-            scope_title: None,
             search: TextField::default(),
             search_focus: cx.focus_handle(),
             focus_handle: cx.focus_handle(),
@@ -95,24 +93,22 @@ impl BrowseView {
         let scope = artist.map_or(Scope::Library, Scope::Artist);
         if self.scope != scope {
             self.scope = scope;
-            self.scope_title = None;
             self.list.rows_mut().mark_dirty();
             cx.notify();
         }
     }
 
-    /// Show exactly `playlists` as sections, titled `title` — the temporary
-    /// view a played folder opens.
-    pub fn set_playlist_scope(
-        &mut self,
-        title: String,
-        playlists: Vec<PlaylistId>,
-        cx: &mut Context<Self>,
-    ) {
-        self.scope = Scope::Playlists(playlists);
-        self.scope_title = Some(title);
-        self.list.rows_mut().mark_dirty();
-        cx.notify();
+    /// Scope the view to a folder — the albums and singles under it, flattened
+    /// across its subfolders — the view a played folder opens. Resolved live
+    /// against the library, so a rescan updates the tab instead of stranding
+    /// it; re-playing the same folder in the other mode re-scopes it.
+    pub fn set_folder_scope(&mut self, dir: PathBuf, mode: FolderMode, cx: &mut Context<Self>) {
+        let scope = Scope::Folder { dir, mode };
+        if self.scope != scope {
+            self.scope = scope;
+            self.list.rows_mut().mark_dirty();
+            cx.notify();
+        }
     }
     /// Build the sections the list draws: the scope as-is, or — once the
     /// filter box has text — the scope's songs run through the query engine,
@@ -164,11 +160,17 @@ impl Render for BrowseView {
         let title = match &self.scope {
             Scope::Library => "Library".to_string(),
             Scope::Artist(artist) => artist.clone(),
-            Scope::Playlists(_) => self.scope_title.clone().unwrap_or_else(|| "Library".to_string()),
+            // A folder view titles itself with the folder, like the tab strip
+            // does (see `TabsView::tab_title`).
+            Scope::Folder { dir, .. } => dir
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string())
+                .unwrap_or_else(|| dir.display().to_string()),
         };
         // The filter box's placeholder names its scope.
         let placeholder = match &self.scope {
             Scope::Artist(_) => "Filter the discography…",
+            Scope::Folder { .. } => "Filter the folder…",
             _ => "Filter the library…",
         };
 
@@ -227,10 +229,11 @@ impl Render for BrowseView {
                 None,
                 // The scope's header tools share the title's line: the filter
                 // box and the shuffle button. The library filters and shuffles
-                // the whole library; an artist tab, their discography. A
-                // folder view is a played folder's temporary playlists —
-                // already exactly what was asked for — so it shows neither.
-                matches!(self.scope, Scope::Library | Scope::Artist(_)).then(|| {
+                // the whole library; an artist tab, their discography; a
+                // folder view, the folder's albums and singles as they stand
+                // right now.
+                matches!(self.scope, Scope::Library | Scope::Artist(_) | Scope::Folder { .. })
+                    .then(|| {
                     // Fixed-width and pushed to the right edge: the albums·songs
                     // readout changes with the filter, and a flexed box would
                     // resize on every keystroke.

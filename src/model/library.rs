@@ -176,34 +176,21 @@ impl Library {
     }
 
     /// Create a temporary playlist pre-filled with `songs` — the backing for
-    /// an ad-hoc view ("Play folder", a selection played as one). Temporary
-    /// playlists are immutable snapshots: never persisted, dropped by a
-    /// rescan, and deleted when their tab closes.
+    /// an ad-hoc view (a selection played as one). Temporary playlists are
+    /// immutable snapshots: never persisted, dropped by a rescan, and deleted
+    /// when their tab closes.
     pub fn create_temporary(&mut self, title: impl Into<String>, songs: Vec<SongId>) -> PlaylistId {
-        self.create_temporaries(vec![(title.into(), songs)]).remove(0)
-    }
-
-    /// Create several temporary playlists at once, re-indexing once — a
-    /// folder view can need hundreds, and a reindex walks the whole library.
-    pub fn create_temporaries(
-        &mut self,
-        groups: Vec<(String, Vec<SongId>)>,
-    ) -> Vec<PlaylistId> {
-        let mut ids = Vec::with_capacity(groups.len());
-        for (title, songs) in groups {
-            let id = self.alloc_playlist_id();
-            self.playlists.insert(
+        let id = self.alloc_playlist_id();
+        self.playlists.insert(
+            id,
+            Playlist {
                 id,
-                Playlist {
-                    id,
-                    kind: PlaylistKind::Temporary { title },
-                    song_ids: songs,
-                },
-            );
-            ids.push(id);
-        }
+                kind: PlaylistKind::Temporary { title: title.into() },
+                song_ids: songs,
+            },
+        );
         self.reindex();
-        ids
+        id
     }
 
     /// Add a song to a custom playlist.
@@ -274,23 +261,6 @@ impl Library {
         } else {
             None
         }
-    }
-
-    /// Delete several playlists at once, re-indexing once — closing a folder
-    /// tab can remove hundreds of temporary playlists. Autogen playlists are
-    /// skipped. Returns how many were removed.
-    pub fn remove_playlists(&mut self, ids: &[PlaylistId]) -> usize {
-        let mut removed = 0;
-        for id in ids {
-            if self.playlists.get(id).is_some_and(|p| !p.is_auto()) {
-                self.playlists.remove(id);
-                removed += 1;
-            }
-        }
-        if removed > 0 {
-            self.reindex();
-        }
-        removed
     }
 
     /// Every custom playlist, in creation order — the "add to playlist"

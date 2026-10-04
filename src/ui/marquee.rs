@@ -121,11 +121,16 @@ impl Default for Slide {
 }
 
 /// A [`Slide`] plus the hover state that drives it: a standalone title owns one
-/// directly, and a list row keeps one per title/artist cell.
+/// directly, a list row keeps one per title/artist cell, and a tab or rail row
+/// keeps one per label. `hovered` is the slide trigger — the pointer over the
+/// fade zone at the cell's right edge — while `region_hovered` is the pointer
+/// being anywhere over the *containing* row or tab, which is what its
+/// background (and so the fade's colour) follows.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Marquee {
     slide: Slide,
     hovered: bool,
+    region_hovered: bool,
 }
 
 impl Marquee {
@@ -161,21 +166,44 @@ impl Marquee {
         self.hovered
     }
 
+    /// Note whether the pointer is anywhere over the row or tab the cell sits
+    /// in — the state its background follows. Returns whether it changed.
+    pub fn set_region_hovered(&mut self, hovered: bool) -> bool {
+        let changed = self.region_hovered != hovered;
+        self.region_hovered = hovered;
+        changed
+    }
+
+    /// Whether the pointer is anywhere over the containing row or tab.
+    pub fn is_region_hovered(&self) -> bool {
+        self.region_hovered
+    }
+
     /// The current offset, in px.
     pub fn offset(&self) -> f32 {
         self.slide.offset()
     }
 }
 
+/// What a marquee's background is right now: the plain one, or the hover wash
+/// when the pointer is over the containing row or tab. The fade dissolves the
+/// text into this colour, so it has to be whatever is actually painted behind
+/// the text at the same moment — callers re-render on hover anyway (the slide
+/// needs the frames), so passing both colours and the flag here keeps every
+/// marquee's fade honest without each caller hand-rolling the logic.
+pub fn wash(base: Rgba, hover: Rgba, region_hovered: bool) -> Rgba {
+    if region_hovered { hover } else { base }
+}
+
 /// One character's advance in `theme`'s font, in px. The font is monospace, so
 /// this is what turns a character count into a column width.
-pub fn char_advance(window: &Window, theme: Theme) -> f32 {
+pub fn char_advance(window: &Window, theme: Theme, text_px: f32) -> f32 {
     let text_system = window.text_system();
     let font_id = text_system.resolve_font(&gpui::font(theme.font));
     text_system
-        .ch_advance(font_id, px(theme.cell_px()))
+        .ch_advance(font_id, px(text_px))
         .map(f32::from)
-        .unwrap_or(theme.cell_px() * 0.6)
+        .unwrap_or(text_px * 0.6)
 }
 
 /// How far `text` overflows a column of `width` px sized for `max_chars`
@@ -195,11 +223,12 @@ pub fn travel_for(text: &str, width: f32, max_chars: usize) -> f32 {
 /// pointer is over *it*.
 #[allow(clippy::too_many_arguments)]
 pub fn marquee_text(
-    theme: Theme,
+    _theme: Theme,
     id: impl Into<ElementId>,
     text: &str,
     width: f32,
     max_chars: usize,
+    text_px: f32,
     offset: f32,
     color: Rgba,
     background: Rgba,
@@ -221,7 +250,7 @@ pub fn marquee_text(
                 .relative()
                 .left(px(offset))
                 .whitespace_nowrap()
-                .text_size(px(theme.cell_px()))
+                .text_size(px(text_px))
                 .text_color(color)
                 .child(text.to_string()),
         );

@@ -68,7 +68,7 @@ impl Columns {
     /// queue panel) scales its columns to its own width instead of the
     /// tables' fixed 48.
     pub fn sized(window: &Window, theme: Theme, title_chars: usize, artist_chars: usize) -> Self {
-        let advance = marquee::char_advance(window, theme);
+        let advance = marquee::char_advance(window, theme, theme.cell_px());
         Self {
             title: advance * title_chars as f32,
             artist: advance * artist_chars as f32,
@@ -878,6 +878,7 @@ fn title_cell(
         &track.title,
         columns.title,
         columns.title_chars,
+        theme.cell_px(),
         offset,
         if playing { theme.accent } else { theme.text },
         background,
@@ -900,6 +901,7 @@ fn artist_cell(
         &track.artist,
         columns.artist,
         columns.artist_chars,
+        theme.cell_px(),
         offset,
         theme.text_muted,
         background,

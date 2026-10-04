@@ -18,15 +18,15 @@
 //! selected belongs to the playlist tab showing it, since each tab keeps its
 //! own.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 
 use gpui::{Context, Entity, Subscription};
 
 use crate::model::search::Query;
 use crate::model::{
-    generate_song_id, shuffle, Library, LibraryCache, Order, PlaylistId, Scope, Selection, SongId,
-    SongMetadata,
+    generate_song_id, shuffle, FolderMode, Library, LibraryCache, Order, PlaylistId, Scope,
+    Selection, SongId, SongMetadata,
 };
 use crate::ui::config_state::ConfigState;
 use crate::ui::menu::SongMenuRequest;
@@ -41,8 +41,10 @@ pub enum Request {
     OpenPlaylist(PlaylistId),
     /// Open a library view scoped to an artist's discography.
     ArtistView(String),
-    /// Play a folder and open its temporary view.
-    FolderPlay(PathBuf),
+    /// Play a folder and open its folder view.
+    FolderPlay(PathBuf, FolderMode),
+    /// Open a folder's view without playing it.
+    FolderOpen(PathBuf, FolderMode),
     /// Show a song's context menu.
     SongMenu(SongMenuRequest),
 }
@@ -238,59 +240,28 @@ impl LibraryState {
         cx.notify();
     }
 
-    /// Play everything under `dir` and open it as a temporary view: one
-    /// temporary playlist per directory that has songs of its own — the
-    /// folder's own songs first, then each subdirectory depth-first, so the
-    /// tab shows every folder as a header with its playlist under it.
-    /// Returns the temporary playlist ids, in tab order.
+    /// Play a folder and open it as a folder view: the songs under `dir` —
+    /// everything under it for [`FolderMode::Full`], only the folder's own for
+    /// [`FolderMode::Here`] — grouped into their albums and singles exactly as
+    /// the browse view draws the library, flattened across the subfolders.
+    /// Returns whether there was anything to play.
     pub fn play_folder(
-        &mut self,
+        &self,
         dir: &Path,
+        mode: FolderMode,
         playback: &Entity<PlaybackState>,
         cx: &mut Context<Self>,
-    ) -> Vec<PlaylistId> {
-        // Songs grouped by their directory once — the tree walk below then
-        // only looks up, instead of rescanning the whole library per folder.
-        let mut by_parent: HashMap<PathBuf, Vec<SongId>> = HashMap::new();
-        for song in self.library.songs() {
-            if let Some(parent) = song.path.parent() {
-                by_parent.entry(parent.to_path_buf()).or_default().push(song.id);
-            }
+    ) -> bool {
+        let songs = self.library.select_songs(&Selection {
+            scope: Scope::Folder { dir: dir.to_path_buf(), mode },
+            query: Query::default(),
+            order: Order::TrackOrder,
+        });
+        if songs.is_empty() {
+            return false;
         }
-        for songs in by_parent.values_mut() {
-            songs.sort_unstable();
-        }
-
-        let mut groups = Vec::new();
-        self.push_folder_groups(&mut groups, dir, &by_parent);
-        if groups.is_empty() {
-            return Vec::new();
-        }
-        let all: Vec<SongId> =
-            groups.iter().flat_map(|(_, songs)| songs.iter().copied()).collect();
-        let ids = self.library.create_temporaries(groups);
-        self.play(&all, 0, playback, cx);
-        self.revision += 1;
-        cx.notify();
-        ids
-    }
-
-    /// The songs under `dir`, grouped per directory, depth-first: the
-    /// directory's own songs as one group (when it has any), then each
-    /// subdirectory the same way. One group per folder — and so one header
-    /// with its playlist under it in the tab — whatever the tree's depth.
-    fn push_folder_groups(
-        &self,
-        groups: &mut Vec<(String, Vec<SongId>)>,
-        dir: &Path,
-        by_parent: &HashMap<PathBuf, Vec<SongId>>,
-    ) {
-        if let Some(songs) = by_parent.get(dir) {
-            groups.push((dir_name(dir), songs.clone()));
-        }
-        for sub in subdirs(dir) {
-            self.push_folder_groups(groups, &sub, by_parent);
-        }
+        self.play(&songs, 0, playback, cx);
+        true
     }
 
     pub fn rename_playlist(&mut self, playlist: PlaylistId, title: String, cx: &mut Context<Self>) {
@@ -303,19 +274,6 @@ impl LibraryState {
 
     pub fn delete_playlist(&mut self, playlist: PlaylistId, cx: &mut Context<Self>) {
         if self.library.remove_playlist(playlist).is_some() {
-            self.revision += 1;
-            self.ensure_selection();
-            self.persist();
-            cx.notify();
-        }
-    }
-
-    /// Delete several playlists at once — one reindex, one cache write, one
-    /// notification. Closing a folder tab removes every temporary playlist it
-    /// was showing, which can be hundreds; doing that per-playlist froze the
-    /// UI thread on a full-library cache write each.
-    pub fn delete_playlists(&mut self, playlists: Vec<PlaylistId>, cx: &mut Context<Self>) {
-        if self.library.remove_playlists(&playlists) > 0 {
             self.revision += 1;
             self.ensure_selection();
             self.persist();
@@ -526,8 +484,7 @@ impl LibraryState {
 }
 
 /// The immediate subdirectories of `dir`, sorted by name. Empty when the
-/// directory can't be read. Shared by the rail's folder view and the
-/// folder-play grouping.
+/// directory can't be read. The rail's folder view flattens the tree with it.
 pub fn subdirs(dir: &Path) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = std::fs::read_dir(dir)
         .map(|entries| {
@@ -540,12 +497,4 @@ pub fn subdirs(dir: &Path) -> Vec<PathBuf> {
         .unwrap_or_default();
     dirs.sort();
     dirs
-}
-
-/// A directory's own name — the last path component, or the full path when it
-/// has none (a bare root like `/`).
-fn dir_name(path: &Path) -> String {
-    path.file_name()
-        .map(|name| name.to_string_lossy().to_string())
-        .unwrap_or_else(|| path.display().to_string())
 }

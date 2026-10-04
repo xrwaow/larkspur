@@ -9,8 +9,9 @@
 //! Artists groups each carry their own filter box, scoped to that group.
 //!
 //! Custom playlists are edited here: right-clicking one opens a menu to rename
-//! or delete it, and renaming happens inline. The settings button in the header
-//! opens the settings overlay in the center.
+//! or delete it, and renaming happens inline. Right-clicking a folder opens a
+//! menu to open it — the full subtree, or just the folder's own songs. The
+//! settings button in the header opens the settings overlay in the center.
 //!
 //! A library produces *thousands* of rows (one per autogen album playlist, plus
 //! one per artist), and GPUI re-renders and re-lays-out every visible view on
@@ -20,7 +21,7 @@
 //! animation frame paid for thousands of rows of layout and the whole app ran
 //! at single-digit frames per second.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
@@ -31,17 +32,37 @@ use gpui::{
     Pixels, Point, Render, Subscription, Window,
 };
 
-use crate::model::{Playlist, PlaylistId};
+use crate::model::{FolderMode, Playlist, PlaylistId};
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::input::action_for_key;
 use crate::ui::library_state::{subdirs, LibraryState, Request};
 use crate::ui::menu::{context_menu, MenuHandler};
+use crate::ui::marquee::{self, Marquee};
 use crate::ui::row_list::OVERDRAW_PX;
 use crate::ui::tabs::TabsView;
 use crate::ui::text_field::TextField;
 use crate::ui::theme::Theme;
+use crate::ui::animation::Animator;
 use crate::ui::widgets::{empty_hint, panel_header, search_box, section_header};
+
+/// The most characters a rail label shows before its text fades and slides.
+const RAIL_MAX_CHARS: usize = 24;
+
+/// Everything a rail row's marquee label needs, from [`PlaylistsView::label_bits`].
+struct LabelBits {
+    /// The row's marquee state: the slide offset and the region hover that
+    /// drives the row's background wash.
+    state: Marquee,
+    width: f32,
+    chars: usize,
+    /// The pointer moved over/away from the whole row — the wash the fade
+    /// dissolves into.
+    on_region: Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>,
+    /// The pointer moved over/away from the label cell's right fade zone —
+    /// what starts and releases the slide.
+    on_slide: Box<dyn Fn(&bool, &mut Window, &mut App) + 'static>,
+}
 
 /// An open right-click menu in the rail: on a custom playlist or a folder.
 struct RailMenu {
@@ -52,7 +73,10 @@ struct RailMenu {
 /// What the open rail menu acts on.
 enum MenuTarget {
     Playlist(PlaylistId),
-    Folder(PathBuf),
+    /// A folder in the folder view. `here` — the folder has songs directly in
+    /// it; `sub` — its subfolders do. Both can hold, either, or neither, and
+    /// the menu offers "Open full folder" / "Open folder" accordingly.
+    Folder { path: PathBuf, here: bool, sub: bool },
 }
 
 /// Which group a filter box (or a fold) belongs to.
@@ -126,10 +150,16 @@ pub struct PlaylistsView {
     /// rename state changes — never per frame.
     rows: Rc<Vec<RailRow>>,
     list_state: ListState,
+    /// Per-row marquee, keyed by the row's element id — the same
+    /// fade/slide/spring-back the list rows and tabs use, so a long artist,
+    /// album, or folder name slides on hover. The region hover also carries
+    /// the row's hover wash, so the fade matches what's painted.
+    marquees: HashMap<u64, Marquee>,
     /// Set by anything that changes what the rows show; the next render
     /// rebuilds them.
     dirty: bool,
     _observe: Subscription,
+    _observe_animator: Subscription,
 }
 
 impl PlaylistsView {
@@ -137,11 +167,19 @@ impl PlaylistsView {
         library: Entity<LibraryState>,
         tabs: Entity<TabsView>,
         config: Entity<ConfigState>,
+        animator: Entity<Animator>,
         cx: &mut Context<Self>,
     ) -> Self {
         let observe = cx.observe(&library, |this, _state, cx| {
             this.dirty = true;
             cx.notify();
+        });
+        let observe_animator = cx.observe(&animator, |this, animator, cx| {
+            let dt = animator.read(cx).dt();
+            let moved = this.marquees.values_mut().any(|marquee| marquee.tick(dt));
+            if moved {
+                cx.notify();
+            }
         });
         let themed = Themed::new(&config, cx);
         Self {
@@ -159,8 +197,10 @@ impl PlaylistsView {
             focus_handle: cx.focus_handle(),
             rows: Rc::new(Vec::new()),
             list_state: ListState::new(0, ListAlignment::Top, px(OVERDRAW_PX)),
+            marquees: HashMap::new(),
             dirty: true,
             _observe: observe,
+            _observe_animator: observe_animator,
         }
     }
 
@@ -177,6 +217,45 @@ impl PlaylistsView {
         match which {
             RailFilter::Albums => &mut self.album_filter,
             RailFilter::Artists => &mut self.artist_filter,
+        }
+    }
+
+    /// The marquee bits for the rail row with `key`: its slide state and the
+    /// label's measured metrics, plus the two hover listeners — the row's
+    /// (the wash the fade dissolves into) and the label cell's own slide
+    /// trigger. One call per row keeps every rail row's marquee wired the
+    /// same way, with no per-caller patching.
+    fn label_bits(
+        &mut self,
+        key: u64,
+        label: &str,
+        advance: f32,
+        cx: &mut Context<Self>,
+    ) -> LabelBits {
+        let chars = label.chars().count().min(RAIL_MAX_CHARS);
+        let width = advance * chars.max(1) as f32;
+        let travel = marquee::travel_for(label, width, chars);
+        let state = *self.marquees.entry(key).or_default();
+        let on_region = cx.listener(move |this, hovered: &bool, _window, cx| {
+            if let Some(marquee) = this.marquees.get_mut(&key) {
+                if marquee.set_region_hovered(*hovered) {
+                    cx.notify();
+                }
+            }
+        });
+        let on_slide = cx.listener(move |this, hovered: &bool, _window, cx| {
+            if let Some(marquee) = this.marquees.get_mut(&key) {
+                if marquee.set_hovered(*hovered, travel) {
+                    cx.notify();
+                }
+            }
+        });
+        LabelBits {
+            state,
+            width,
+            chars,
+            on_region: Box::new(on_region),
+            on_slide: Box::new(on_slide),
         }
     }
 
@@ -296,6 +375,12 @@ impl PlaylistsView {
         window: &mut Window,
         cx: &mut Context<Self>,
     ) -> AnyElement {
+        // One monospace advance at the rail's own font, so every label's
+        // marquee column and travel math agree.
+        let advance = marquee::char_advance(window, theme, theme.cell_px());
+        // Rows without a marquee never touch this — the marquee arms below
+        // all have a key.
+        let key = row_key(kind).unwrap_or(0);
         match kind {
             RailRow::Header(label) => section_header(theme, label),
             RailRow::GroupHeader { label, open } => {
@@ -340,19 +425,24 @@ impl PlaylistsView {
                     )
                     .into_any_element()
             }
-            RailRow::NewPlaylist => rail_row(
-                theme,
-                ("new-playlist", 0u64),
-                "+  New Playlist".to_string(),
-                None,
-                false,
-                0,
-                Branch::Plain,
-                Some(cx.listener(|this, _event, window, cx| {
-                    let id = this.library.update(cx, |state, cx| state.new_playlist(cx));
-                    this.tabs.update(cx, |tabs, cx| tabs.open_playlist(id, window, cx));
-                })),
-            ),
+            RailRow::NewPlaylist => {
+                let bits = self.label_bits(key, "+  New Playlist", advance, cx);
+                rail_row(
+                    theme,
+                    ("new-playlist", 0u64),
+                    key,
+                    "+  New Playlist".to_string(),
+                    bits,
+                    None,
+                    false,
+                    0,
+                    Branch::Plain,
+                    Some(cx.listener(|this, _event, window, cx| {
+                        let id = this.library.update(cx, |state, cx| state.new_playlist(cx));
+                        this.tabs.update(cx, |tabs, cx| tabs.open_playlist(id, window, cx));
+                    })),
+                )
+            }
             RailRow::NoCustom => empty_hint(theme, "No custom playlists yet", false),
             RailRow::Rename => {
                 let (_, field, focus) =
@@ -372,10 +462,13 @@ impl PlaylistsView {
                     RailRow::Album(_) => ("album", 0),
                     _ => ("discography", 1),
                 };
+                let bits = self.label_bits(key, &row.title, advance, cx);
                 let row_el = rail_row(
                     theme,
                     (name, id.0),
+                    key,
                     row.title.clone(),
+                    bits,
                     Some(row.count),
                     selected == Some(id),
                     depth,
@@ -424,10 +517,13 @@ impl PlaylistsView {
             }
             RailRow::Artist { index, name, expanded } => {
                 let toggled = name.clone();
+                let bits = self.label_bits(key, name, advance, cx);
                 rail_row(
                     theme,
                     ("artist", *index as u64),
+                    key,
                     name.clone(),
+                    bits,
                     None,
                     false,
                     0,
@@ -446,15 +542,18 @@ impl PlaylistsView {
             RailRow::Folder { path, depth, expanded, has_children } => {
                 // Roots read as the paths they are; everything below them is
                 // just its own name.
+                let toggled = path.clone();
                 let label = match path.file_name() {
                     Some(name) if *depth > 0 => name.to_string_lossy().to_string(),
                     _ => path.display().to_string(),
                 };
-                let toggled = path.clone();
+                let bits = self.label_bits(key, &label, advance, cx);
                 let row_el = rail_row(
                     theme,
                     ("folder", path_hash(path)),
+                    key,
                     label,
+                    bits,
                     None,
                     false,
                     *depth,
@@ -474,11 +573,37 @@ impl PlaylistsView {
                     ("folder-menu", path_hash(path)),
                     row_el,
                     cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
-                        this.menu = Some(RailMenu {
-                            position: event.position,
-                            target: MenuTarget::Folder(target.clone()),
-                        });
-                        cx.notify();
+                        // Only a folder with something to show raises a menu:
+                        // songs directly in it ("Open folder") and/or in its
+                        // subfolders ("Open full folder"). One pass over the
+                        // library sorts every song under `target` into one of
+                        // the two.
+                        let lib = this.library.read(cx).library();
+                        let (mut here, mut sub) = (false, false);
+                        for song in lib.songs() {
+                            if !song.path.starts_with(&target) {
+                                continue;
+                            }
+                            if song.path.parent() == Some(target.as_path()) {
+                                here = true;
+                            } else {
+                                sub = true;
+                            }
+                            if here && sub {
+                                break;
+                            }
+                        }
+                        if here || sub {
+                            this.menu = Some(RailMenu {
+                                position: event.position,
+                                target: MenuTarget::Folder {
+                                    path: target.clone(),
+                                    here,
+                                    sub,
+                                },
+                            });
+                            cx.notify();
+                        }
                     }),
                 )
             }
@@ -553,6 +678,9 @@ impl Render for PlaylistsView {
                 self.list_state.splice(head..old_end, new_end - head);
             }
             self.rows = Rc::new(new_rows);
+            // Marquee state for rows that are gone is dropped with them.
+            let keys: HashSet<u64> = self.rows.iter().filter_map(row_key).collect();
+            self.marquees.retain(|key, _| keys.contains(key));
         }
 
         let rows = self.rows.clone();
@@ -704,21 +832,45 @@ impl Render for PlaylistsView {
                         dismiss,
                     ));
                 }
-                MenuTarget::Folder(path) => {
-                    // The rail holds no playback handle, so playing a folder
-                    // goes through the tab container as a request.
-                    let path = path.clone();
-                    let play: MenuHandler = Box::new(cx.listener(move |this, _event, _window, cx| {
-                        this.menu = None;
-                        this.library
-                            .update(cx, |state, cx| state.request(Request::FolderPlay(path.clone()), cx));
-                    }));
-                    root = root.child(context_menu(
-                        theme,
-                        position,
-                        vec![("Play folder".to_string(), play)],
-                        dismiss,
+                MenuTarget::Folder { path, here, sub } => {
+                    // The rail holds no playback handle, so opening a folder
+                    // goes through the tab container as a request. "Open full
+                    // folder" scopes the tab to the folder and its subfolders;
+                    // "Open folder" only the folder's own songs. Nothing is
+                    // played — the view opens on the library's place, and the
+                    // header's shuffle button starts playback from there.
+                    let (path, here, sub) = (path.clone(), *here, *sub);
+                    let full_path = path.clone();
+                    let open_full: MenuHandler = Box::new(cx.listener(
+                        move |this, _event, _window, cx| {
+                            this.menu = None;
+                            this.library.update(cx, |state, cx| {
+                                state.request(
+                                    Request::FolderOpen(full_path.clone(), FolderMode::Full),
+                                    cx,
+                                )
+                            });
+                        },
                     ));
+                    let open_here: MenuHandler = Box::new(cx.listener(
+                        move |this, _event, _window, cx| {
+                            this.menu = None;
+                            this.library.update(cx, |state, cx| {
+                                state.request(
+                                    Request::FolderOpen(path.clone(), FolderMode::Here),
+                                    cx,
+                                )
+                            });
+                        },
+                    ));
+                    let mut items: Vec<(String, MenuHandler)> = Vec::new();
+                    if sub {
+                        items.push(("Open full folder".to_string(), open_full));
+                    }
+                    if here {
+                        items.push(("Open folder".to_string(), open_here));
+                    }
+                    root = root.child(context_menu(theme, position, items, dismiss));
                 }
             }
         }
@@ -732,12 +884,17 @@ impl Render for PlaylistsView {
 /// guide column per nesting level, and the expand chevron is a painted
 /// triangle sitting on its own guide line, so a subtree reads as one
 /// continuous line from the arrow down through its children. No zebra: rows
-/// sit transparent on the rail and light up on hover/selection.
+/// sit transparent on the rail and light up on hover/selection. Labels overflow
+/// as a marquee (fade at the right edge, slide on hover) instead of truncating;
+/// `bits` carries that cell's slide and the row's hover, and the fade
+/// dissolves into the same `wash` the row paints itself with.
 #[allow(clippy::too_many_arguments)]
 fn rail_row(
     theme: Theme,
     id: impl Into<ElementId>,
+    key: u64,
     label: String,
+    bits: LabelBits,
     count: Option<usize>,
     active: bool,
     depth: usize,
@@ -759,6 +916,10 @@ fn rail_row(
             .border_color(theme.border)
             .child(expand_triangle(theme, expanded)),
     };
+    // The fade dissolves the text into whatever the row's background is, so
+    // both come from the same `wash`: the plain rail, or the hover wash while
+    // the pointer is over the row.
+    let background = marquee::wash(theme.rail_bg, theme.row_hover, bits.state.is_region_hovered());
     div()
         .id(id.into())
         .flex()
@@ -767,9 +928,9 @@ fn rail_row(
         .pr_2()
         .rounded_md()
         .cursor_pointer()
-        .when_some(on_click, |d, click| {
-            d.hover(|d| d.bg(theme.row_hover)).on_click(click)
-        })
+        .bg(background)
+        .on_hover(bits.on_region)
+        .when_some(on_click, |d, click| d.on_click(click))
         .children((0..depth).map(|_| {
             div()
                 .flex_none()
@@ -790,10 +951,18 @@ fn rail_row(
                     div()
                         .flex_1()
                         .min_w_0()
-                        .truncate()
-                        .text_size(px(theme.cell_px()))
-                        .text_color(if active { theme.text } else { theme.text_muted })
-                        .child(label),
+                        .child(marquee::marquee_text(
+                            theme,
+                            ("rail-label", key),
+                            &label,
+                            bits.width,
+                            bits.chars,
+                            theme.cell_px(),
+                            bits.state.offset(),
+                            if active { theme.text } else { theme.text_muted },
+                            background,
+                            bits.on_slide,
+                        )),
                 )
                 .when_some(count, |d, count| {
                     d.child(
@@ -875,6 +1044,39 @@ fn push_folder_tree(rows: &mut Vec<RailRow>, dir: &Path, depth: usize, open: &Ha
             push_folder_tree(rows, child, depth + 1, open);
         }
     }
+}
+
+/// A stable marquee key for a rail row: the row's identity hashed with its
+/// kind, so ids from different namespaces (playlist ids, artist indexes,
+/// folder paths) can never collide. Rows without a marquee have none — they
+/// only show in the hover set, never in the map.
+fn row_key(kind: &RailRow) -> Option<u64> {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    match kind {
+        RailRow::NewPlaylist => "new".hash(&mut hasher),
+        RailRow::Custom(row) => {
+            "custom".hash(&mut hasher);
+            row.id.hash(&mut hasher);
+        }
+        RailRow::Album(row) => {
+            "album".hash(&mut hasher);
+            row.id.hash(&mut hasher);
+        }
+        RailRow::Discography(row) => {
+            "discography".hash(&mut hasher);
+            row.id.hash(&mut hasher);
+        }
+        RailRow::Artist { index, .. } => {
+            "artist".hash(&mut hasher);
+            index.hash(&mut hasher);
+        }
+        RailRow::Folder { path, .. } => {
+            "folder".hash(&mut hasher);
+            path.hash(&mut hasher);
+        }
+        _ => return None,
+    }
+    Some(hasher.finish())
 }
 
 /// A stable element id for a directory row.

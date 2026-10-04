@@ -83,6 +83,12 @@ pub struct QueueView {
     queue_generation: u64,
     /// The queue's total time, computed with the snapshot.
     total_secs: u64,
+    /// The queue-open flag last seen in render, so opening can scroll the
+    /// playing entry into view.
+    open_last: bool,
+    /// A row to reveal once the panel has a viewport (the first render of a
+    /// freshly opened panel has none yet).
+    pending_reveal: Option<usize>,
     /// The row grab in flight — hold a row and move to reorder it.
     drag: Drag,
     _subs: AlbumListSubs,
@@ -141,6 +147,8 @@ impl QueueView {
             queue_entries: Vec::new(),
             queue_generation: 0,
             total_secs: 0,
+            open_last: false,
+            pending_reveal: None,
             drag: Drag::default(),
             _subs: subs,
         }
@@ -378,7 +386,7 @@ impl Render for QueueView {
         // 48-character columns assume a window-wide center. One monospace
         // advance turns a width into the character count the marquee's travel
         // math wants.
-        let advance = marquee::char_advance(window, theme);
+        let advance = marquee::char_advance(window, theme, theme.cell_px());
         let text_w = (width - ROW_H_PAD_PX - ROW_GAPS_PX - theme.num_col()).max(0.0);
         let title_chars = ((text_w * 0.58 / advance) as usize).max(8);
         let artist_chars = ((text_w * 0.42 / advance) as usize).max(8);
@@ -400,6 +408,21 @@ impl Render for QueueView {
         // list's row index is the queue index.
         let loaded = self.playback.read(cx).queue().1;
         self.list.rows_mut().set_anchor(loaded);
+
+        // Opening the panel scrolls the playing entry into view — no digging
+        // through a long queue for it. The first render after the flip has no
+        // viewport yet, so the reveal waits for one.
+        let open = self.playback.read(cx).queue_open();
+        if open && !self.open_last {
+            self.pending_reveal = loaded;
+        }
+        self.open_last = open;
+        if let Some(ix) = self.pending_reveal {
+            if self.list.rows().viewport_height() > 0.0 {
+                self.list.rows_mut().reveal(ix);
+                self.pending_reveal = None;
+            }
+        }
 
         // The header is the tab strip's twin: same band height, same rule,
         // so the two containers' horizontal lines line up across the top.
