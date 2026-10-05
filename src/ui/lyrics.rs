@@ -35,8 +35,11 @@ use crate::model::{LyricLine, Lyrics, SongId};
 use crate::ui::animation::{Animator, Tween};
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
-use crate::ui::marquee::{self, Marquee};
+use crate::ui::format::format_duration;
 use crate::ui::playback_state::PlaybackState;
+use crate::ui::queue::QueueView;
+use crate::ui::cover_store::CoverStore;
+use crate::ui::library_state::LibraryState;
 use crate::ui::theme::Theme;
 use crate::ui::widgets::{blend, edge_fade, empty_hint, Side};
 
@@ -47,13 +50,13 @@ const TRANSITION_SECS: f32 = 0.20;
 /// A slide further than this many lines (a seek) snaps instead of scrolling.
 const SNAP_LINES: f32 = 5.0;
 
-/// The header title's column, in characters. The rail is a fixed 240 px (see
-/// `layout::app_layout`), so this is what fits beside the "Lyrics" hint; a
-/// longer title fades and slides on hover.
-const LYRIC_TITLE_CHARS: usize = 16;
-
 pub struct LyricsView {
     state: Entity<PlaybackState>,
+    /// Read for song durations, to total the queue time in the header.
+    library: Entity<LibraryState>,
+    /// The queue, embedded in this rail behind the Queue tab. Shares the same
+    /// `queue_open` flag as the transport's queue button.
+    queue: Entity<QueueView>,
     themed: Themed,
     /// The pixel offset the stack is drawn at while it eases into place.
     offset: Tween,
@@ -65,9 +68,10 @@ pub struct LyricsView {
     /// The track the state above belongs to, so a track change snaps rather than
     /// scrolling from the previous song's position.
     song: Option<SongId>,
-    /// The header title's marquee — the same fade/slide/spring-back the list
-    /// rows use.
-    title_marquee: Marquee,
+    /// The queue's total time, shown beside the tabs. Computed with the queue
+    /// snapshot — only when the controller's generation moves.
+    total_secs: u64,
+    queue_generation: u64,
     _observe: Subscription,
     _observe_animator: Subscription,
 }
@@ -75,10 +79,22 @@ pub struct LyricsView {
 impl LyricsView {
     pub fn new(
         state: Entity<PlaybackState>,
+        library: Entity<LibraryState>,
+        covers: Entity<CoverStore>,
         config: Entity<ConfigState>,
         animator: Entity<Animator>,
         cx: &mut Context<Self>,
     ) -> Self {
+        let queue = cx.new(|cx| {
+            QueueView::new(
+                state.clone(),
+                library.clone(),
+                covers.clone(),
+                config.clone(),
+                animator.clone(),
+                cx,
+            )
+        });
         let observe = cx.observe(&state, |this, _state, cx| {
             this.sync(cx);
             cx.notify();
@@ -86,21 +102,23 @@ impl LyricsView {
         let observe_animator = cx.observe(&animator, |this, animator, cx| {
             let dt = animator.read(cx).dt();
             let moved = this.offset.tick(dt);
-            let marquee = this.title_marquee.tick(dt);
             let changed = this.sync(cx);
-            if moved || marquee || changed {
+            if moved || changed {
                 cx.notify();
             }
         });
         let themed = Themed::new(&config, cx);
         let mut this = Self {
             state,
+            library,
+            queue,
             themed,
             offset: Tween::new(0.0),
             anchor: None,
             position: Duration::ZERO,
             song: None,
-            title_marquee: Marquee::new(),
+            total_secs: 0,
+            queue_generation: 0,
             _observe: observe,
             _observe_animator: observe_animator,
         };
@@ -134,6 +152,20 @@ impl LyricsView {
 
         let mut changed = fading;
         self.position = position;
+
+        // The header's total queue time — re-summed only when the queue moves.
+        let generation = self.state.read(cx).queue_generation();
+        if generation != self.queue_generation {
+            self.queue_generation = generation;
+            let library = self.library.read(cx).library();
+            let (queue, _) = self.state.read(cx).queue();
+            self.total_secs = queue
+                .iter()
+                .filter_map(|(id, _)| library.get(*id))
+                .map(|song| song.duration.as_secs())
+                .sum();
+            changed = true;
+        }
 
         if song != self.song {
             self.song = song;
@@ -173,23 +205,27 @@ impl Container for LyricsView {
 }
 
 impl Render for LyricsView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.themed.theme();
         let offset = self.offset.value();
         let anchor = self.anchor.unwrap_or(0);
         let position = self.position;
         let transition = Duration::from_secs_f32(TRANSITION_SECS);
-        let title_advance = marquee::char_advance(window, theme, theme.cell_px());
-        let title_width = title_advance * LYRIC_TITLE_CHARS as f32;
-        let title_offset = self.title_marquee.offset();
-
         // The body is built against the borrowed lyrics, so nothing is cloned
         // per frame — the click handlers only need `cx` immutably.
         let metadata = self.state.read(cx).metadata(cx);
-        let title = metadata.as_ref().map(|m| m.display_title()).unwrap_or_default();
-        let title_travel = marquee::travel_for(&title, title_width, LYRIC_TITLE_CHARS);
+        let queue_open = self.state.read(cx).queue_open();
 
-        let body: AnyElement = match metadata.as_ref().map(|m| &m.lyrics) {
+        // The header is just a label: "Lyrics" normally, and "Queue" plus the
+        // total time and the CLEAR button while the queue is swapped in (the
+        // transport's queue button toggles the same shared `queue_open` flag
+        // that switches this panel).
+
+        // The queue swaps in over the lyrics body. The edge fades belong to
+        // the scrolling lyrics only — the queue has its own viewport.
+        let body: AnyElement = if queue_open {
+            self.queue.clone().into_any_element()
+        } else { match metadata.as_ref().map(|m| &m.lyrics) {
             Some(Lyrics::Plain(text)) => div()
                 .id("lyrics-scroll")
                 .size_full()
@@ -276,7 +312,8 @@ impl Render for LyricsView {
                     .into_any_element()
             }
             _ => empty_lyrics_hint(theme),
-        };
+        }
+        .into_any_element() };
 
         div()
             .size_full()
@@ -284,51 +321,72 @@ impl Render for LyricsView {
             .flex_col()
             .bg(theme.rail_bg)
             .font_family(theme.font)
-            .child(
+            .child(if queue_open {
                 div()
                     .flex()
                     .items_center()
                     .justify_between()
-                    .gap_4()
                     .px_4()
                     .py_3()
                     .child(
                         div()
-                            .flex_1()
-                            .min_w_0()
-                            .child(marquee::marquee_text(
-                                theme,
-                                "lyrics-title",
-                                &title,
-                                title_width,
-                                LYRIC_TITLE_CHARS,
-                                theme.cell_px(),
-                                title_offset,
-                                theme.text,
-                                theme.rail_bg,
-                                cx.listener(move |this, hovered: &bool, _window, cx| {
-                                    if this.title_marquee.set_hovered(*hovered, title_travel) {
-                                        cx.notify();
-                                    }
-                                }),
-                            )),
+                            .text_size(px(theme.small_px()))
+                            .text_color(theme.text)
+                            .child("Queue"),
                     )
                     .child(
                         div()
-                            .flex_none()
+                            .flex()
+                            .items_center()
+                            .gap_4()
+                            .when(self.total_secs > 0, |d| {
+                                d.child(
+                                    div()
+                                        .text_size(px(theme.small_px()))
+                                        .text_color(theme.text_faint)
+                                        .child(format_duration(Duration::from_secs(self.total_secs))),
+                                )
+                            })
+                            .child(
+                                div()
+                                    .id("queue-clear")
+                                    .px_3()
+                                    .py_1()
+                                    .rounded_md()
+                                    .cursor_pointer()
+                                    .text_size(px(theme.small_px()))
+                                    .text_color(theme.text)
+                                    .bg(theme.row_active)
+                                    .hover(|d| d.bg(theme.row_hover))
+                                    .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                                        this.state.update(cx, |state, cx| state.clear_queue(cx));
+                                    }))
+                                    .child("CLEAR"),
+                            ),
+                    )
+            } else {
+                div()
+                    .flex()
+                    .items_center()
+                    .px_4()
+                    .py_3()
+                    .child(
+                        div()
                             .text_size(px(theme.small_px()))
                             .text_color(theme.text_faint)
                             .child("Lyrics"),
-                    ),
-            )
+                    )
+            })
             .child(
                 div()
                     .relative()
                     .flex_1()
                     .min_h_0()
                     .child(body)
-                    .child(edge_fade(theme.rail_bg, theme.font_size * 2.0, Side::Top))
-                    .child(edge_fade(theme.rail_bg, theme.font_size * 2.0, Side::Bottom)),
+                    .when(!queue_open, |d| {
+                        d.child(edge_fade(theme.rail_bg, theme.font_size * 2.0, Side::Top))
+                            .child(edge_fade(theme.rail_bg, theme.font_size * 2.0, Side::Bottom))
+                    }),
             )
     }
 }

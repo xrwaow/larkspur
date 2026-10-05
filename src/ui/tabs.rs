@@ -22,7 +22,7 @@ use std::path::PathBuf;
 
 use gpui::{
     div, prelude::*, px, AnyElement, AnyView, App, ClickEvent, Context, Entity, FocusHandle,
-    KeyDownEvent, MouseDownEvent, Render, Subscription, Window,
+    KeyDownEvent, MouseDownEvent, Render, SharedString, Subscription, Window,
 };
 
 use crate::model::{FolderMode, InputAction, PlaylistId, TabId};
@@ -31,12 +31,12 @@ use crate::ui::browse::BrowseView;
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::cover_store::CoverStore;
+use crate::ui::format::format_bitrate;
 use crate::ui::input::action_for_key;
 use crate::ui::library_state::{LibraryState, Request};
 use crate::ui::menu::{context_menu, song_menu_items, MenuHandler, SongMenuRequest};
 use crate::ui::marquee::{self, Marquee};
 use crate::ui::playlist::PlaylistView;
-use crate::ui::queue::QueueView;
 use crate::ui::search::SearchView;
 use crate::ui::settings::SettingsView;
 use crate::ui::playback_state::PlaybackState;
@@ -62,9 +62,6 @@ pub struct TabsView {
     browse: Entity<BrowseView>,
     search: Entity<SearchView>,
     settings: Entity<SettingsView>,
-    /// The play-queue panel, swapped in over the tabs from the transport's
-    /// queue button (visibility lives in the shared playback state).
-    queue: Entity<QueueView>,
     /// The non-browse tabs (playlists and artist scopes), in the order they
     /// were opened.
     tabs: Vec<Tab>,
@@ -122,16 +119,6 @@ impl TabsView {
             )
         });
         let settings = cx.new(|cx| SettingsView::new(config.clone(), cx));
-        let queue = cx.new(|cx| {
-            QueueView::new(
-                playback.clone(),
-                library.clone(),
-                covers.clone(),
-                config.clone(),
-                animator.clone(),
-                cx,
-            )
-        });
         let observe = cx.observe(&library, |this, _state, cx| {
             this.library_dirty = true;
             cx.notify();
@@ -158,7 +145,6 @@ impl TabsView {
             browse,
             search,
             settings,
-            queue,
             tabs: Vec::new(),
             active: TabId::Browse,
             search_open: false,
@@ -627,10 +613,6 @@ impl Render for TabsView {
             }
         };
 
-        // The queue panel positions and animates itself (an absolute overlay
-        // over this container's right side); it renders nothing while fully
-        // hidden, so it's simply always mounted.
-        //
         // The song menu is raised by a row anywhere and rendered here, on top of
         // every container. Each item's handler is wrapped so choosing one also
         // dismisses the menu — the action (open a tab, remove from a playlist)
@@ -644,6 +626,7 @@ impl Render for TabsView {
                     &menu.songs,
                     menu.playlist,
                     menu.queue,
+                    menu.card,
                     cx,
                 )
                     .into_iter()
@@ -670,6 +653,18 @@ impl Render for TabsView {
                 }),
             )
         });
+
+        // The live bitrate at the strip's right edge: the live value while
+        // it's known, the declared one otherwise, blank before a track loads.
+        let bitrate = {
+            let state = self.playback.read(cx);
+            let meta = state.metadata(cx);
+            state
+                .live_bitrate()
+                .or(meta.as_ref().and_then(|meta| meta.nominal_bitrate))
+                .map(|bps| SharedString::from(format_bitrate(bps)))
+                .unwrap_or_default()
+        };
 
         let browse_font =
             self.config.read(cx).font_size(BrowseView::container_id(), BrowseView::default_font_size());
@@ -700,10 +695,17 @@ impl Render for TabsView {
                     .h(px(strip_height_px(theme.font_size, browse_font)))
                     .border_b_1()
                     .border_color(theme.border)
-                    .children(strip),
+                    .children(strip)
+                    .child(
+                        div()
+                            .ml_auto()
+                            .flex_none()
+                            .text_size(px(theme.small_px()))
+                            .text_color(theme.text_muted)
+                            .child(bitrate),
+                    ),
             )
             .child(div().flex_1().min_h_0().child(content))
-            .child(self.queue.clone())
             .when_some(menu_element, |d, menu| d.child(menu))
     }
 }

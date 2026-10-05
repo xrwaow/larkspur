@@ -21,7 +21,6 @@ use larkspur::ui::playback::PlaybackView;
 use larkspur::ui::playlists::PlaylistsView;
 use larkspur::ui::playback_state::PlaybackState;
 use larkspur::ui::tabs::TabsView;
-use larkspur::ui::view_toggle::ViewToggleView;
 use larkspur::ui::visualizer::VisualizerView;
 
 fn main() {
@@ -182,16 +181,27 @@ fn main() {
                     )
                 });
                 let lyrics = cx.new(|cx| {
-                    LyricsView::new(playback_state.clone(), config_state.clone(), animator.clone(), cx)
+                    LyricsView::new(
+                        playback_state.clone(),
+                        library_state.clone(),
+                        cover_store.clone(),
+                        config_state.clone(),
+                        animator.clone(),
+                        cx,
+                    )
                 });
                 let visualizer = cx.new(|cx| {
                     VisualizerView::new(playback_state.clone(), config_state.clone(), animator.clone(), cx)
                 });
                 let cover = cx.new(|cx| {
-                    CoverView::new(playback_state.clone(), cover_store.clone(), config_state.clone(), cx)
+                    CoverView::new(
+                        library_state.clone(),
+                        playback_state.clone(),
+                        cover_store.clone(),
+                        config_state.clone(),
+                        cx,
+                    )
                 });
-                let view_toggle =
-                    cx.new(|cx| ViewToggleView::new(config_state.clone(), playback_state.clone(), cx));
 
                 // The active tab is the input hub, so focus lands there.
                 if let Some(focus) = tabs.read(cx).focus_handle_for_window(cx) {
@@ -209,7 +219,6 @@ fn main() {
                     workspace.push(cover);
                     workspace.push(playback);
                     workspace.push(tabs);
-                    workspace.push(view_toggle);
 
                     // The visualizer band is added/removed from the rail live
                     // when its setting flips. The flag guards against re-planning

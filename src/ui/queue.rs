@@ -1,10 +1,9 @@
 //! The play-queue panel.
 //!
-//! An overlay over the tab container's right side, opened from the queue
-//! button in the transport (to the right of "next"). It spans from the player
-//! controls' right edge to the tabs' right end — the region right of the
-//! transport block — and slides in from behind the tabs' right edge when
-//! shown, sliding back out when hidden.
+//! Rendered inline inside the lyrics rail, behind its Queue tab (the same
+//! shared `queue_open` flag the transport's queue button toggles — both open
+//! this one). Its header lives in the lyrics container's strip: the Lyrics |
+//! Queue tabs, the queue's total time, and the CLEAR button.
 //!
 //! The rows are the playlist tables themselves: an [`AlbumListView`] in flat
 //! mode (no album headers — every entry is a song), so the marquee's edge
@@ -19,22 +18,20 @@
 //! name for paths the library doesn't know (files queued from the command
 //! line before any scan).
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::rc::Rc;
-use std::time::Duration;
-
 use gpui::{
-    div, prelude::*, px, App, ClickEvent, Context, Entity, MouseButton, MouseDownEvent,
+    div, prelude::*, App, ClickEvent, Context, Entity, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Render, Window,
 };
 
 use crate::model::{PlaylistId, SongId};
 use crate::ui::album_list::{self, AlbumList, AlbumListSubs, AlbumListView, Play};
 use crate::ui::albums::{AlbumSection, RowActions, TrackRow};
-use crate::ui::animation::{Animator, Tween};
+use crate::ui::animation::Animator;
 use crate::ui::browse::BrowseView;
 use crate::ui::config_state::{ConfigState, Themed};
-use crate::ui::container::{Container, SECTION_GAP};
+use crate::ui::container::Container;
 use crate::ui::cover_store::CoverStore;
 use crate::ui::drag::Drag;
 use crate::ui::format::{format_bitrate, format_duration};
@@ -42,18 +39,9 @@ use crate::ui::layout::RAIL_PX;
 use crate::ui::library_state::{LibraryState, Request};
 use crate::ui::marquee;
 use crate::ui::menu::SongMenuRequest;
-use crate::ui::playback::BAR_WIDTH;
 use crate::ui::playback_state::PlaybackState;
 use crate::ui::row_list::Cell;
-use crate::ui::tabs::{self, TabsView};
 use crate::ui::widgets::empty_hint;
-
-/// How long the slide in/out takes.
-const SLIDE_SECS: f32 = 0.22;
-
-/// Narrowest the panel may get, so a small window can't squeeze it to nothing
-/// (it then overlaps the transport's right portion instead).
-const MIN_WIDTH_PX: f32 = 240.0;
 
 /// A row's horizontal padding (`px_4`) and its inter-cell gaps, subtracted
 /// from the panel width before the text columns are sized. Slim rows end at
@@ -64,16 +52,7 @@ const ROW_GAPS_PX: f32 = 36.0;
 pub struct QueueView {
     playback: Entity<PlaybackState>,
     library: Entity<LibraryState>,
-    /// Read for the tab strip's font size, so the header's rule lines up
-    /// with the tabs' one even when the two containers' sizes differ.
-    config: Entity<ConfigState>,
     themed: Themed,
-    /// The panel's slide: 0.0 fully hidden (sunk past the tabs' right edge),
-    /// 1.0 fully shown. Driven by the shared frame clock.
-    slide: Tween,
-    /// The queue-open flag last seen in the playback state, so the slide only
-    /// retargets when the flag flips.
-    open_target: bool,
     /// The shared table shell — rows, selection, marquees, virtualized list.
     list: AlbumListView,
     /// The queue entries the rows were last built from, and the controller
@@ -108,27 +87,18 @@ impl QueueView {
         list.rows_mut().set_flat();
         list.rows_mut().set_slim();
         let subs = album_list::observe(&library, Some(&playback), &covers, &animator, cx);
-        // Follow the playback state for the open flag that drives the slide
-        // (the queue contents are read during render).
-        cx.observe(&playback, |this, state, cx| {
-            let open = state.read(cx).queue_open();
-            if open != this.open_target {
-                this.open_target = open;
-                // Showing slides in from the right; hiding slides back out.
-                this.slide.to(if open { 1.0 } else { 0.0 }, SLIDE_SECS);
-            }
-            cx.notify();
-        })
+        // Follow the playback state (the queue contents are read during
+        // render; the open flag decides whether to draw at all).
+        cx.observe(&playback, |_this, _state, cx| cx.notify())
         .detach();
-        // Advance the slide and the drag ghost's chase spring on the shared
-        // frame clock — the ghost renders at SMOOTH_FPS between the pointer's
-        // bursty events. The rows tick through the album-list subscription,
-        // so only these two are handled here.
+        // Advance the drag ghost's chase spring on the shared frame clock —
+        // the ghost renders at SMOOTH_FPS between the pointer's bursty events.
+        // The rows tick through the album-list subscription, so only this is
+        // handled here.
         cx.observe(&animator, |this, animator, cx| {
             let dt = animator.read(cx).dt();
-            let slide = this.slide.tick(dt);
             let drag = this.drag.tick(dt);
-            if slide || drag {
+            if drag {
                 cx.notify();
             }
         })
@@ -139,10 +109,7 @@ impl QueueView {
         Self {
             playback,
             library,
-            config: config.clone(),
             themed,
-            slide: Tween::new(0.0),
-            open_target: false,
             list,
             queue_entries: Vec::new(),
             queue_generation: 0,
@@ -211,19 +178,6 @@ impl QueueView {
         }
         if dropped.is_some() {
             cx.notify();
-        }
-    }
-
-    /// A queue entry's display labels — the library's metadata when the id is
-    /// scanned, the file name otherwise.
-    fn entry_labels(&self, id: SongId, path: &Path, cx: &App) -> (String, String) {
-        let library = self.library.read(cx).library();
-        match library.get(id) {
-            Some(song) => (song.display_title(), song.artists.join(", ")),
-            None => (
-                path.file_stem().unwrap_or(path.as_os_str()).to_string_lossy().into_owned(),
-                "Unknown Artist".to_string(),
-            ),
         }
     }
 }
@@ -297,14 +251,20 @@ impl RowActions<QueueView> for QueueRows {
         view: &mut QueueView,
         item_ix: usize,
         _songs: Vec<crate::model::SongId>,
+        _playlist: PlaylistId,
         _context: Option<PlaylistId>,
         event: &gpui::MouseDownEvent,
         _window: &mut Window,
         cx: &mut Context<QueueView>,
     ) {
         let songs = view.list_mut().rows_mut().context_songs(item_ix);
-        let request =
-            SongMenuRequest { songs, position: event.position, playlist: None, queue: true };
+        let request = SongMenuRequest {
+            songs,
+            position: event.position,
+            playlist: None,
+            queue: true,
+            card: None,
+        };
         let library = view.list().library().clone();
         library.update(cx, |state, cx| state.request(Request::SongMenu(request), cx));
     }
@@ -333,26 +293,14 @@ impl Render for QueueView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.themed.theme();
 
-        // Fully slid out: paint nothing and leave no hitbox.
-        if self.slide.value() <= 0.0 && !self.slide.is_animating() {
+        // Hidden: paint nothing and leave no hitbox. The lyrics container only
+        // mounts this behind its Queue tab, so this is the closed state.
+        if !self.playback.read(cx).queue_open() {
             return div().into_any_element();
         }
 
-        // The panel's settled span: from the player controls' right edge (the
-        // centered BAR_WIDTH block) to the tabs' right end. Both rails and the
-        // section gap inset the tab area from the window edges.
-        let inset = RAIL_PX + SECTION_GAP;
-        let viewport_w = f32::from(window.viewport_size().width);
-        let tabs_w = (viewport_w - 2.0 * inset).max(0.0);
-        let final_left =
-            (((viewport_w + BAR_WIDTH) / 2.0 - inset).min(tabs_w - MIN_WIDTH_PX)).max(0.0);
-        let width = (tabs_w - final_left).max(0.0);
-
-        // Slide the rigid panel in from past the tabs' right edge — the dock
-        // stack's overflow_hidden clips it there, so it reads as sliding out
-        // from under the right rail. Leftward while showing, back out
-        // rightward while hiding.
-        let offset = (1.0 - ease_out_cubic(self.slide.value())) * width;
+        // The rows size to the rail they live in.
+        let width = f32::from(RAIL_PX);
 
         // The queue's contents can only have changed when the controller
         // bumped its generation — the cheap per-frame check. The full path
@@ -426,40 +374,12 @@ impl Render for QueueView {
 
         // The header is the tab strip's twin: same band height, same rule,
         // so the two containers' horizontal lines line up across the top.
-        let tabs_font =
-            self.config.read(cx).font_size(TabsView::container_id(), TabsView::default_font_size());
-        let strip_h = tabs::strip_height_px(tabs_font, theme.font_size);
-
-        let clear = div()
-            .id("queue-clear")
-            .flex_none()
-            .px_3()
-            .py_1()
-            .rounded_md()
-            .cursor_pointer()
-            .text_size(px(theme.small_px()))
-            .text_color(theme.text)
-            .bg(theme.row_active)
-            .hover(|d| d.bg(theme.row_hover))
-            .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
-                this.playback.update(cx, |state, cx| state.clear_queue(cx));
-            }))
-            .child("CLEAR");
-
         let mut panel = div()
-            .absolute()
-            .top(px(0.0))
-            .bottom(px(0.0))
-            .left(px(final_left + offset))
-            .w(px(width))
-            // Block clicks from falling through to the tabs underneath.
-            .occlude()
+            .relative()
+            .size_full()
             .flex()
             .flex_col()
             .overflow_hidden()
-            .border_l_1()
-            .border_color(theme.border)
-            .bg(theme.panel_bg)
             .font_family(theme.font)
             // The drag's move/release listeners sit on the panel root, so a
             // drag keeps tracking however far the pointer roams inside it.
@@ -475,44 +395,7 @@ impl Render for QueueView {
             // drag too, so it can't be left hanging.
             .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
                 this.release_drag(cx);
-            }))
-            .child(
-                div()
-                    .flex()
-                    .items_end()
-                    .justify_between()
-                    .gap_4()
-                    .px_4()
-                    .pb_1()
-                    .h(px(strip_h))
-                    .flex_none()
-                    .border_b_1()
-                    .border_color(theme.border)
-                    .child(
-                        div()
-                            .flex()
-                            .items_baseline()
-                            .gap_2()
-                            .min_w_0()
-                            .child(
-                                div()
-                                    .truncate()
-                                    .text_size(px(theme.cell_px() + 2.0))
-                                    .text_color(theme.text)
-                                    .child("Queue"),
-                            )
-                            .when(self.total_secs > 0, |d| {
-                                d.child(
-                                    div()
-                                        .flex_none()
-                                        .text_size(px(theme.small_px()))
-                                        .text_color(theme.text_faint)
-                                        .child(format_duration(Duration::from_secs(self.total_secs))),
-                                )
-                            }),
-                    )
-                    .child(clear),
-            );
+            }));
 
         if queue_len == 0 {
             panel = panel.child(
@@ -532,60 +415,6 @@ impl Render for QueueView {
             ));
         }
 
-        // The dragged row, drawn on top of the list and following the pointer.
-        // `top` is in window coordinates; the panel spans the tabs container,
-        // whose top is the window's, so they coincide.
-        if let Some(info) = drag_info {
-            let (id, path) = self.queue_entries[info.grabbed].clone();
-            let (title, artist) = self.entry_labels(id, &path, cx);
-            let columns = self.list.rows().columns();
-            panel = panel.child(
-                div()
-                    .absolute()
-                    .left(px(0.0))
-                    .right(px(0.0))
-                    .top(px(info.top))
-                    .h(px(info.row_height))
-                    // Swallow the pointer while dragging: no row hover or
-                    // click underneath, and the move/up events still bubble
-                    // here to the panel root.
-                    .occlude()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .px_4()
-                    .rounded_md()
-                    .bg(theme.row_active)
-                    .border_1()
-                    .border_color(theme.border)
-                    .child(div().w(px(theme.num_col())).flex_none())
-                    .child(
-                        div()
-                            .flex_1()
-                            .min_w_0()
-                            .truncate()
-                            .text_size(px(theme.cell_px()))
-                            .text_color(theme.text)
-                            .child(title),
-                    )
-                    .child(
-                        div()
-                            .flex_none()
-                            .w(px(columns.artist))
-                            .truncate()
-                            .text_size(px(theme.cell_px()))
-                            .text_color(theme.text_muted)
-                            .child(artist),
-                    ),
-            );
-        }
-
         panel.into_any_element()
     }
-}
-
-/// Fast at the start, easing to a stop — the standard "settle" curve.
-fn ease_out_cubic(t: f32) -> f32 {
-    let inv = 1.0 - t;
-    1.0 - inv * inv * inv
 }

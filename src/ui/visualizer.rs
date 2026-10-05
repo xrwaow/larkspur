@@ -1,4 +1,5 @@
-//! The visualizer — a spectrum-style band of bars above the lyrics panel.
+//! The visualizer — a spectrum-style band of bars between the lyrics panel
+//! and the now-playing cover.
 //!
 //! The leftmost bar is the bass end, the rightmost the highs: each bar is one
 //! of [`BAND_COUNT`](crate::analysis::BAND_COUNT) log-spaced frequency bands.
@@ -162,7 +163,7 @@ impl Render for VisualizerView {
             .h(px(BAND_HEIGHT))
             .px_2()
             .py_2()
-            .bg(theme.panel_bg)
+            .bg(theme.rail_bg)
             .child(
                 canvas(
                     |_bounds, _window, _cx| (),

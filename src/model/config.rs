@@ -172,12 +172,6 @@ fn default_visualizer() -> bool {
     true
 }
 
-/// The serde default for [`Config::icon_view`] — same story: the field
-/// postdates the first configs, and an older file should keep the list view.
-fn default_icon_view() -> bool {
-    false
-}
-
 /// Runtime configuration, loaded from and saved to disk.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Config {
@@ -205,10 +199,6 @@ pub struct Config {
     /// Whether the spectrum-bar band above the lyrics is shown.
     #[serde(default = "default_visualizer")]
     pub visualizer: bool,
-    /// Whether the library containers (browse, artist, folder, search) draw
-    /// their albums as cover icons instead of track rows.
-    #[serde(default = "default_icon_view")]
-    pub icon_view: bool,
     /// Where the window was when the app last ran, so it reopens the same
     /// size and position.
     #[serde(default)]
@@ -225,7 +215,6 @@ impl Default for Config {
             roots: Vec::new(),
             waveform: WaveformStyle::default(),
             visualizer: default_visualizer(),
-            icon_view: default_icon_view(),
             window: None,
         }
     }
@@ -467,24 +456,6 @@ mod tests {
         let json = r#"{"theme":"Dark","font_sizes":{},"roots":[]}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.visualizer);
-    }
-
-    #[test]
-    fn icon_view_defaults_off_and_round_trips() {
-        assert!(!Config::default().icon_view);
-        let mut config = Config::default();
-        config.icon_view = true;
-        let bytes = serde_json::to_vec(&config).unwrap();
-        let back: Config = serde_json::from_slice(&bytes).unwrap();
-        assert!(back.icon_view);
-    }
-
-    #[test]
-    fn a_config_without_an_icon_view_field_defaults_to_list() {
-        // An older config predates the `icon_view` field.
-        let json = r#"{"theme":"Dark","font_sizes":{},"roots":[]}"#;
-        let config: Config = serde_json::from_str(json).unwrap();
-        assert!(!config.icon_view);
     }
 
     #[test]

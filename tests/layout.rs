@@ -35,38 +35,38 @@ fn touches(report: &LayoutReport, a: &str, b: &str) -> bool {
 fn every_module_in_the_layout_gets_a_region() {
     let report = report();
     let names = names(&report);
-    for id in ["tabs", "playlists", "visualizer", "lyrics", "cover", "playback", "view_toggle"] {
+    for id in ["tabs", "playlists", "visualizer", "lyrics", "cover", "playback"] {
         assert!(names.iter().any(|n| n == id), "no region for {id}: {names:?}");
     }
 }
 
-/// The rails stop at the view-toggle band — the thin strip docked below
-/// everything else — rather than reaching the window's bottom edge.
+/// The playback bar spans between the full-height rails, right down to the
+/// window's bottom edge - there is no bar below it anymore.
 #[test]
-fn the_toggle_band_is_the_bottom_of_the_window() {
+fn the_playback_bar_is_at_the_bottom_between_the_rails() {
     let report = report();
-    assert!(touches(&report, "view_toggle", "window.bottom"), "toggle band hugs the bottom");
-    assert!(touches(&report, "view_toggle", "playback"), "playback sits directly above it");
-    assert!(touches(&report, "view_toggle", "playlists"), "left rail stops at the band");
-    assert!(touches(&report, "view_toggle", "cover"), "right rail stops at the band");
+    assert!(touches(&report, "playback", "playlists"), "left rail reaches the bottom");
+    assert!(touches(&report, "playback", "cover"), "right rail reaches the bottom");
+    assert!(touches(&report, "playback", "window.bottom"), "playback hugs the bottom");
 }
 
 #[test]
 fn left_rail_spans_the_full_window_height() {
     let report = report();
     assert!(touches(&report, "playlists", "window.top"), "left rail reaches the top");
-    assert!(touches(&report, "playlists", "view_toggle"), "left rail reaches the toggle band");
+    assert!(touches(&report, "playlists", "window.bottom"), "left rail reaches the bottom");
 }
 
 #[test]
-fn right_rail_is_split_into_visualizer_lyrics_and_cover() {
+fn right_rail_is_split_into_lyrics_visualizer_and_cover() {
     let report = report();
-    // The visualizer band hugs the top of the rail, the cover the bottom,
-    // and the lyrics panel sits between them.
-    assert!(touches(&report, "visualizer", "window.top"));
-    assert!(touches(&report, "visualizer", "lyrics"));
-    assert!(touches(&report, "lyrics", "cover"));
-    assert!(touches(&report, "cover", "view_toggle"), "cover rides above the toggle band");
+    // The lyrics panel hugs the top of the rail, the cover the bottom,
+    // and the visualizer band sits between them.
+    assert!(touches(&report, "lyrics", "window.top"));
+    assert!(touches(&report, "lyrics", "visualizer"));
+    assert!(touches(&report, "visualizer", "cover"));
+    assert!(touches(&report, "visualizer", "window.right"));
+    assert!(touches(&report, "cover", "window.bottom"), "cover reaches the bottom of the window");
 }
 
 #[test]
@@ -74,7 +74,7 @@ fn turning_the_visualizer_off_removes_its_band() {
     let report = report_without_visualizer();
     let names = names(&report);
     assert!(!names.iter().any(|n| n == "visualizer"), "no region for the visualizer: {names:?}");
-    // With the band gone, the lyrics panel is the top of the rail again.
+    // With the band gone, the lyrics panel runs down to the cover.
     assert!(touches(&report, "lyrics", "window.top"));
     assert!(touches(&report, "lyrics", "cover"));
 }
@@ -85,10 +85,8 @@ fn playback_bar_sits_between_the_rails() {
     // The bar's ends meet the rails...
     assert!(touches(&report, "playback", "playlists"), "bar meets the left rail");
     assert!(touches(&report, "playback", "cover"), "bar meets the right rail");
-    // ...and it sits above the toggle band, without reaching the window's own
-    // bottom edge — the toggle strip is between them.
-    assert!(touches(&report, "playback", "view_toggle"));
-    assert!(!touches(&report, "playback", "window.bottom"));
+    // ...and it hugs the window's own bottom edge between the rails.
+    assert!(touches(&report, "playback", "window.bottom"));
     assert!(!touches(&report, "playback", "window.left"));
     assert!(!touches(&report, "playback", "window.right"));
 }
@@ -102,11 +100,11 @@ fn center_is_flanked_by_both_rails_and_the_bar() {
 }
 
 #[test]
-fn cover_is_bottom_right_with_the_lyrics_above_it() {
+fn cover_is_bottom_right_with_the_visualizer_above_it() {
     let report = report();
-    assert!(touches(&report, "cover", "view_toggle"), "cover is at the bottom");
+    assert!(touches(&report, "cover", "window.bottom"), "cover is at the bottom");
     assert!(touches(&report, "cover", "window.right"), "cover is at the right");
-    assert!(touches(&report, "lyrics", "cover"), "lyrics sit above cover");
+    assert!(touches(&report, "cover", "visualizer"), "visualizer sits above cover");
 }
 
 #[test]
@@ -117,15 +115,15 @@ fn docks_resolve_outermost_first() {
         .iter()
         .map(|dock| format!("{:?}", dock.edge))
         .collect();
-    // Higher z hugs the window edge, so the toggle band is outermost, then
-    // the right rail, then the left rail, then the bottom bar.
-    assert_eq!(edges, vec!["Bottom", "Right", "Left", "Bottom"]);
+    // Higher z hugs the window edge, so the rails are outermost, then the
+    // bottom bar.
+    assert_eq!(edges, vec!["Right", "Left", "Bottom"]);
 }
 
 #[test]
 fn describe_app_produces_a_readable_diagram() {
     let text = layout::describe_app();
-    for id in ["playlists", "visualizer", "lyrics", "cover", "playback", "tabs", "view_toggle"] {
+    for id in ["playlists", "visualizer", "lyrics", "cover", "playback", "tabs"] {
         assert!(text.contains(id), "diagram should mention {id}:\n{text}");
     }
     assert!(text.contains('┌') && text.contains('─') && text.contains('│'), "diagram should be box-drawn:\n{text}");

@@ -444,12 +444,14 @@ pub trait RowActions<V: Render>: 'static {
     );
 
     /// A row (or, in icon view, an album cover) was right-clicked. `songs` is
-    /// what the menu acts on — the clicked row's song, or the album's songs.
+    /// what the menu acts on — the clicked row's song, or the album's songs —
+    /// and `playlist` is the playlist the row or card belongs to.
     fn context(
         &self,
         view: &mut V,
         item_ix: usize,
         songs: Vec<SongId>,
+        playlist: PlaylistId,
         context: Option<PlaylistId>,
         event: &MouseDownEvent,
         window: &mut Window,
@@ -601,7 +603,7 @@ pub fn render_item<V: Render + 'static>(
     let on_right_click = {
         let actions = actions.clone();
         cx.listener(move |view, event: &MouseDownEvent, window, cx| {
-            actions.context(view, ix, vec![song], playlist_context, event, window, cx)
+            actions.context(view, ix, vec![song], playlist, playlist_context, event, window, cx)
         })
     };
     let on_hover = {
@@ -1255,9 +1257,10 @@ fn icon_card<V: Render + 'static>(
     let on_right_click = {
         let actions = actions.clone();
         let songs = songs.clone();
+        let playlist = section.playlist;
         let playlist_context = context.context;
         cx.listener(move |view, event: &MouseDownEvent, window, cx| {
-            actions.context(view, 0, songs.clone(), playlist_context, event, window, cx)
+            actions.context(view, 0, songs.clone(), playlist, playlist_context, event, window, cx)
         })
     };
 

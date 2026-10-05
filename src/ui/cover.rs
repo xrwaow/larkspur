@@ -1,12 +1,14 @@
 use gpui::{
-    div, img, prelude::*, px, AnyElement, Context, Entity, ObjectFit, Render, Rgba,
-    Subscription, Window,
+    div, img, prelude::*, px, AnyElement, App, Context, Entity, MouseButton, MouseDownEvent,
+    ObjectFit, Render, Rgba, Subscription, Window,
 };
 
 use crate::model::{SongId, ThemeKind};
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::cover_store::{CoverImage, CoverStore};
+use crate::ui::library_state::{LibraryState, Request};
+use crate::ui::menu::SongMenuRequest;
 use crate::ui::playback_state::PlaybackState;
 
 /// The now-playing cover square.
@@ -21,6 +23,9 @@ use crate::ui::playback_state::PlaybackState;
 /// time) into [`ConfigState`], which every view reads its palette from. The
 /// last colour is kept when a new track's art hasn't decoded yet.
 pub struct CoverView {
+    /// The library — the cover's right-click menu is raised through its
+    /// request queue, so the tab container renders it like any row's menu.
+    library: Entity<LibraryState>,
     state: Entity<PlaybackState>,
     covers: Entity<CoverStore>,
     config: Entity<ConfigState>,
@@ -39,6 +44,7 @@ impl CoverView {
     pub const SIZE: f32 = 240.0;
 
     pub fn new(
+        library: Entity<LibraryState>,
         state: Entity<PlaybackState>,
         covers: Entity<CoverStore>,
         config: Entity<ConfigState>,
@@ -62,6 +68,7 @@ impl CoverView {
         let themed = Themed::new(&config, cx);
 
         let mut this = Self {
+            library,
             state: state.clone(),
             covers,
             config,
@@ -127,10 +134,29 @@ impl Render for CoverView {
             Some(CoverImage::Missing) | None => placeholder(theme, "♪"),
         };
 
+        // Right-clicking the cover opens the current song's menu — the same
+        // one the list rows raise, via the library's request queue.
+        let on_right_click = {
+            let library = self.library.clone();
+            let state = self.state.clone();
+            move |event: &MouseDownEvent, _window: &mut Window, cx: &mut App| {
+                let Some(song) = state.read(cx).current_song() else { return };
+                let request = SongMenuRequest {
+                    songs: vec![song],
+                    position: event.position,
+                    playlist: None,
+                    queue: false,
+                    card: None,
+                };
+                library.update(cx, |state, cx| state.request(Request::SongMenu(request), cx));
+            }
+        };
+
         div()
             .size(px(Self::SIZE))
             .bg(theme.row_odd)
             .overflow_hidden()
+            .on_mouse_down(MouseButton::Right, on_right_click)
             .child(art)
     }
 }

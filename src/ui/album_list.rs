@@ -16,7 +16,7 @@ use std::rc::Rc;
 use gpui::{canvas, div, prelude::*, px, Context, Entity, KeyDownEvent, Render, ScrollWheelEvent, SharedString, Subscription, Window};
 
 use crate::model::select::{Order, Scope, Selection};
-use crate::model::{search, InputAction, Library, PlaylistId};
+use crate::model::{search, InputAction, Library, PlaylistId, SongId};
 use crate::ui::albums::{self, AlbumSection, RowActions};
 use crate::ui::animation::Animator;
 use crate::ui::cover_store::CoverStore;
@@ -26,7 +26,7 @@ use crate::ui::input::action_for_key;
 use crate::ui::library_state::{LibraryState, Request};
 use crate::ui::menu::SongMenuRequest;
 use crate::ui::playback_state::PlaybackState;
-use crate::ui::row_list::{Cell, RowAction, RowList};
+use crate::ui::row_list::{Cell, RowAction, RowList, SmoothScroll};
 use crate::ui::theme::Theme;
 use crate::ui::widgets::{scroll_area, wheel_pixels};
 
@@ -75,6 +75,16 @@ pub struct AlbumListView {
     /// native scroller to fight: the grid is translated by this amount and
     /// clipped), so wheel scrolling and the windowing can never disagree.
     icon_scroll_y: std::cell::Cell<f32>,
+    /// The eased wheel scroll driving `icon_scroll_y` — the same
+    /// accumulate-and-settle the list view scrolls with.
+    icon_scroll: SmoothScroll,
+    /// The icon grid's scrollable height, recorded by `render_icons` so the
+    /// eased scroll can clamp without re-packing the rows.
+    icon_max_scroll: std::cell::Cell<f32>,
+    /// Whether the icon grid is what's on screen — `dispatch` scrolls it
+    /// instead of driving the row list's selection. Set by the render
+    /// functions, which are the only ones that know which one is showing.
+    icon_focus: bool,
     /// The icon grid viewport's last measured size, in whole px. Measured by a
     /// canvas each frame; a change schedules one re-render so the columns
     /// re-pack against the new size (never trusting a previous-frame guess).
@@ -100,9 +110,23 @@ impl AlbumListView {
             play,
             rows: RowList::new(),
             icon_scroll_y: std::cell::Cell::new(0.0),
+            icon_scroll: SmoothScroll::default(),
+            icon_max_scroll: std::cell::Cell::new(0.0),
+            icon_focus: false,
             icon_viewport: std::rc::Rc::new(std::cell::Cell::new((0, 0))),
             seen_revision: 0,
         }
+    }
+
+    /// Advance the icon grid's eased scroll. Returns whether it moved.
+    pub fn tick_icon_scroll(&mut self, dt: f32) -> bool {
+        let step = self.icon_scroll.step(dt);
+        if step == 0.0 {
+            return false;
+        }
+        let next = (self.icon_scroll_y.get() + step).clamp(0.0, self.icon_max_scroll.get());
+        self.icon_scroll_y.set(next);
+        true
     }
 
     pub fn library(&self) -> &Entity<LibraryState> {
@@ -142,12 +166,39 @@ impl AlbumListView {
         true
     }
 
-    /// The row keyboard handler: navigation, selection, and play.
+    /// The keyboard handler.
+    ///
+    /// In list view this is the rows' navigation: selection, reveal, and play.
+    /// In icon view there are no rows to select, so the same actions scroll
+    /// instead — up/down step one card row, pgup/pgdn a page — eased like every
+    /// other scroll, and clamped to the laid-out height.
     pub fn dispatch<V: Render>(&mut self, action: InputAction, cx: &mut Context<V>) {
+        if self.icon_focus {
+            match action {
+                InputAction::SelectNext => self.icon_scroll.queue(albums::icon_card_height()),
+                InputAction::SelectPrev => self.icon_scroll.queue(-albums::icon_card_height()),
+                InputAction::PageDown => self.icon_scroll.queue(self.icon_viewport_height()),
+                InputAction::PageUp => self.icon_scroll.queue(-self.icon_viewport_height()),
+                _ => return,
+            }
+            cx.notify();
+            return;
+        }
         match self.rows.handle(action) {
             RowAction::Play(playlist, index) => self.play(playlist, index, cx),
             RowAction::Handled => cx.notify(),
             RowAction::Ignored => {}
+        }
+    }
+
+    /// The icon grid's viewport height, in px — 0 before the first layout, so
+    /// a page action waits until the panel is actually sized.
+    fn icon_viewport_height(&self) -> f32 {
+        let (_, height) = self.icon_viewport.get();
+        if height > 1 {
+            height as f32
+        } else {
+            0.0
         }
     }
 
@@ -206,6 +257,23 @@ struct Rows;
 /// plays straight away and a right-click opens the same song menu.
 struct Icons;
 
+/// The shared right-click: build the menu request from a row's songs and raise
+/// it through the library's request queue. `card` is the playlist an icon-grid
+/// card represents, if any — it turns on the card-only menu items.
+fn raise_menu<V: AlbumList>(
+    view: &mut V,
+    songs: Vec<SongId>,
+    context: Option<PlaylistId>,
+    event: &gpui::MouseDownEvent,
+    card: Option<PlaylistId>,
+    cx: &mut Context<V>,
+) {
+    let request =
+        SongMenuRequest { songs, position: event.position, playlist: context, queue: false, card };
+    let library = view.list().library.clone();
+    library.update(cx, |state, cx| state.request(Request::SongMenu(request), cx));
+}
+
 impl<V: AlbumList> RowActions<V> for Icons {
     fn activate(
         &self,
@@ -225,15 +293,15 @@ impl<V: AlbumList> RowActions<V> for Icons {
         view: &mut V,
         _item_ix: usize,
         songs: Vec<crate::model::SongId>,
+        playlist: PlaylistId,
         context: Option<PlaylistId>,
         event: &gpui::MouseDownEvent,
         _window: &mut Window,
         cx: &mut Context<V>,
     ) {
-        let request =
-            SongMenuRequest { songs, position: event.position, playlist: context, queue: false };
-        let library = view.list().library.clone();
-        library.update(cx, |state, cx| state.request(Request::SongMenu(request), cx));
+        // The card's playlist turns on the card-only items: "Go to {artist}"
+        // per credited artist and "Go to playlist".
+        raise_menu(view, songs, context, event, Some(playlist), cx);
     }
 
     fn hover(&self, _view: &mut V, _item_ix: usize, _hovered: bool, _cx: &mut Context<V>) {}
@@ -262,6 +330,7 @@ impl<V: AlbumList> RowActions<V> for Rows {
         view: &mut V,
         item_ix: usize,
         _songs: Vec<crate::model::SongId>,
+        _playlist: PlaylistId,
         context: Option<PlaylistId>,
         event: &gpui::MouseDownEvent,
         _window: &mut Window,
@@ -270,10 +339,7 @@ impl<V: AlbumList> RowActions<V> for Rows {
         // The row's selection-aware songs — a right-click on one row of a
         // multi-row selection menus them all.
         let songs = view.list_mut().rows.context_songs(item_ix);
-        let request =
-            SongMenuRequest { songs, position: event.position, playlist: context, queue: false };
-        let library = view.list().library.clone();
-        library.update(cx, |state, cx| state.request(Request::SongMenu(request), cx));
+        raise_menu(view, songs, context, event, None, cx);
     }
 
     fn hover(&self, view: &mut V, item_ix: usize, hovered: bool, cx: &mut Context<V>) {
@@ -326,9 +392,11 @@ pub fn observe<V: AlbumList>(
     let _animator = cx.observe(animator, |this, animator, cx| {
         let dt = animator.read(cx).dt();
         let moved = this.list_mut().rows.tick(dt);
+        // The icon grid's eased scroll advances on the same clock.
+        let scrolled = this.list_mut().tick_icon_scroll(dt);
         // Keep the playing row's equalizer moving even when nothing else is.
         let playing = this.list().playback().read(cx).is_playing();
-        if moved || playing {
+        if moved || scrolled || playing {
             cx.notify();
         }
     });
@@ -358,6 +426,7 @@ pub fn render_rows_with<V: AlbumList>(
     actions: Rc<dyn RowActions<V>>,
     cx: &mut Context<V>,
 ) -> gpui::AnyElement {
+    view.list_mut().icon_focus = false;
     let list = view.list();
     let current = list.playback.read(cx).current_song();
     let playing = list.playback.read(cx).is_playing();
@@ -415,8 +484,8 @@ pub fn render_icons<V: AlbumList>(
     _window: &mut Window,
     cx: &mut Context<V>,
 ) -> gpui::AnyElement {
-    let list = view.list();
-    let (viewport_w, viewport_h) = list.icon_viewport.get();
+    view.list_mut().icon_focus = true;
+    let (viewport_w, viewport_h) = view.list().icon_viewport.get();
     let (viewport_w, viewport_h) = if viewport_w > 1 && viewport_h > 1 {
         (viewport_w as f32, viewport_h as f32)
     } else {
@@ -424,11 +493,19 @@ pub fn render_icons<V: AlbumList>(
         // soon as the canvas reports the real size.
         (1400.0, 900.0)
     };
-    let scroll_y = list.icon_scroll_y.get();
 
-    let sections = list.rows.sections();
+    let sections = view.list().rows.sections().clone();
     let layout = albums::pack_rows(sections.len(), viewport_w);
     let max_scroll = (layout.height - viewport_h).max(0.0);
+    // Record for the eased scroll's clamp, and re-clamp the offset itself —
+    // the layout can shrink (a narrower viewport packs fewer rows).
+    view.list_mut().icon_max_scroll.set(max_scroll);
+    if view.list().icon_scroll_y.get() > max_scroll {
+        view.list_mut().icon_scroll_y.set(max_scroll);
+    }
+
+    let list = view.list();
+    let scroll_y = list.icon_scroll_y.get();
 
     let current = list.playback.read(cx).current_song();
     let eq_phase = list.animator.read(cx).elapsed();
@@ -491,16 +568,13 @@ pub fn render_icons<V: AlbumList>(
         .child(
             div().absolute().inset_0().on_scroll_wheel(
                 cx.listener(move |this, event: &ScrollWheelEvent, _window, cx| {
-                    // A positive delta scrolls up; scrolling down moves the
-                    // window toward the content's end. Clamped to the laid-out
-                    // height (which grows with the viewport's width, since
-                    // wider viewports pack taller columns).
-                    let scroll_y = this.list().icon_scroll_y.get();
-                    let next = (scroll_y - wheel_pixels(event)).clamp(0.0, max_scroll);
-                    if scroll_y != next {
-                        this.list_mut().icon_scroll_y.set(next);
-                        cx.notify();
-                    }
+                    // The same eased scroll the list view uses: a burst of
+                    // wheel events accumulates into a target distance that
+                    // decays toward zero, instead of stepping per event.
+                    // (Clamping happens in `tick_icon_scroll`, against the
+                    // laid-out height recorded by this render.)
+                    this.list_mut().icon_scroll.accumulate(-wheel_pixels(event));
+                    cx.notify();
                     cx.stop_propagation();
                 }),
             ),

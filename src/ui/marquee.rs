@@ -183,6 +183,26 @@ impl Marquee {
     pub fn offset(&self) -> f32 {
         self.slide.offset()
     }
+
+    /// Start over for new text in the same cell: any offset or slide in
+    /// flight drops to zero, so the new text begins at its start. The hover
+    /// flag is kept — the next render re-arms the slide against the new
+    /// text's travel (see [`Self::sync`]). Without this, a label that changes
+    /// under a resting pointer keeps the old offset, cropping the new text's
+    /// start.
+    pub fn reset(&mut self) {
+        let hovered = self.hovered;
+        self.slide = Slide::new();
+        self.hovered = hovered;
+    }
+
+    /// Re-arm the slide against the *current* text's travel. Called every
+    /// render, so a changed label or column width can never leave a stale
+    /// target: the slide always aims at where the *visible* text ends, and a
+    /// resting pointer across a track change still lands exactly at the end.
+    pub fn sync(&mut self, travel: f32) {
+        self.slide.aim(if self.hovered { -travel } else { 0.0 });
+    }
 }
 
 /// What a marquee's background is right now: the plain one, or the hover wash
@@ -211,6 +231,23 @@ pub fn char_advance(window: &Window, theme: Theme, text_px: f32) -> f32 {
 pub fn travel_for(text: &str, width: f32, max_chars: usize) -> f32 {
     let advance = width / max_chars.max(1) as f32;
     ((text.chars().count() as f32) - max_chars as f32).max(0.0) * advance
+}
+
+/// The exact rendered width of `text`, shaped in the theme's font at `text_px`.
+/// [`travel_for`]'s character-count math is only right for a monospace font;
+/// the selectable families include proportional ones, where per-character
+/// widths differ and the count overshoots or undershoots the real end.
+pub fn text_width(window: &Window, theme: Theme, text: &str, text_px: f32) -> f32 {
+    let run = gpui::TextRun {
+        len: text.len(),
+        font: gpui::font(theme.font),
+        color: gpui::black(),
+        background_color: None,
+        underline: None,
+        strikethrough: None,
+    };
+    let layout = window.text_system().layout_line(text, px(text_px), &[run], None);
+    f32::from(layout.width)
 }
 
 /// Render `text` in a fixed-width cell of `width` px, sized for `max_chars`

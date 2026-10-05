@@ -100,11 +100,6 @@ impl ConfigState {
         self.config.visualizer
     }
 
-    /// Whether the library containers draw cover icons instead of track rows.
-    pub fn icon_view(&self) -> bool {
-        self.config.icon_view
-    }
-
     // --- actions -------------------------------------------------------
 
     pub fn set_theme(&mut self, kind: ThemeKind, cx: &mut Context<Self>) {
@@ -120,16 +115,6 @@ impl ConfigState {
     pub fn set_waveform(&mut self, style: WaveformStyle, cx: &mut Context<Self>) {
         if self.config.waveform != style {
             self.config.waveform = style;
-            self.persist();
-            cx.notify();
-        }
-    }
-
-    /// Switch the library containers between the track-row list and the cover
-    /// icon grid. Persisted, so the next launch opens the same way.
-    pub fn set_icon_view(&mut self, on: bool, cx: &mut Context<Self>) {
-        if self.config.icon_view != on {
-            self.config.icon_view = on;
             self.persist();
             cx.notify();
         }

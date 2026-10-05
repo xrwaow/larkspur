@@ -17,32 +17,30 @@ pub const RAIL_PX: f32 = 240.0;
 /// The window's dock/center arrangement.
 ///
 /// Playback bar across the bottom, the playlist list docked left, and the
-/// right rail carrying the visualizer band (when enabled), the lyrics panel,
+/// right rail carrying the lyrics panel, the visualizer band (when enabled),
 /// and the cover square. The center is the tab container, which holds one
 /// active container per tab — browse, search, or an opened playlist. The
-/// rails carry z(2), so they hug their window edges from the top down to the
-/// view-toggle strip (also z(2)), which hugs the very bottom of the window;
-/// the playback bar (z=1) fits between the rails — keeping it centered in the
-/// window instead of shifted left by the cover.
+/// rails carry z(3), so they hug their window edges for the full height of
+/// the window; the playback bar (z=1) fits between the rails — keeping it
+/// centered in the window instead of shifted left by the cover.
 ///
 /// `show_visualizer` is the config's on/off switch: the band is only in the
 /// layout when it's on, and the workspace re-plans live when the setting
 /// flips (see `ui/main.rs`).
 pub fn app_layout(show_visualizer: bool) -> LayoutPlan {
     let mut rail = Vec::new();
+    rail.push(module("lyrics").fill());
     if show_visualizer {
         rail.push(module("visualizer").px(BAND_HEIGHT));
     }
-    rail.push(module("lyrics").fill());
     rail.push(module("cover"));
 
     let mut plan = LayoutPlan::new(module("tabs"));
-    // The view-mode toggle hugs the window edge (z=2), so the transport bar
-    // still sits between the rails, directly above it — nothing else moves.
-    plan.dock(Dock::bottom(module("view_toggle")).z(2));
+    // The rails run the full window height (z=3), so the transport bar
+    // (z=1) fits between them at the bottom.
     plan.dock(Dock::bottom(module("playback")));
-    plan.dock(Dock::right(col(rail).px(RAIL_PX)).z(2));
-    plan.dock(Dock::left(module("playlists").px(RAIL_PX)).z(2));
+    plan.dock(Dock::right(col(rail).px(RAIL_PX)).z(3));
+    plan.dock(Dock::left(module("playlists").px(RAIL_PX)).z(3));
     plan
 }
 
@@ -52,17 +50,12 @@ pub fn module_sizes() -> ModuleSizes {
     ModuleSizes::from([
         ("cover", CoverView::SIZE),
         ("playback", PLAYBACK_BAR_PX),
-        ("view_toggle", VIEW_TOGGLE_BAR_PX),
     ])
 }
 
 /// Nominal height of the transport bar. It's content-sized in the real
 /// layout, so this is an approximation used only for the diagram.
 const PLAYBACK_BAR_PX: f32 = 180.0;
-
-/// Nominal height of the view-mode toggle band — likewise an approximation
-/// used only for the diagram.
-const VIEW_TOGGLE_BAR_PX: f32 = 28.0;
 
 /// The current app layout rendered as text — the one call a test (or an
 /// LLM) needs to "see" the UI. See `tests/README.md`.

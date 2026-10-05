@@ -247,8 +247,8 @@ impl Render for PlaybackView {
             );
 
         // The waveform sits on top, flanked by the two times; below it the
-        // transport buttons on the left. The playing song's info and the live
-        // bitrate live in the bottom bar (ui::view_toggle), not here.
+        // transport buttons on the left. The live bitrate lives in the tab
+        // strip's right edge (ui::tabs), not here.
         div()
             .flex()
             .flex_col()

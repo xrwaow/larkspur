@@ -109,34 +109,34 @@ pub enum RowAction {
 /// jumping. The remaining distance decays exponentially toward zero, which
 /// reads as a fast settle rather than a linear glide.
 #[derive(Default)]
-struct SmoothScroll {
+pub struct SmoothScroll {
     /// Pixels still to travel; positive scrolls down.
     remaining: f32,
 }
 
 impl SmoothScroll {
     /// Aim at a scroll of `pixels` from where we are now.
-    fn queue(&mut self, pixels: f32) {
+    pub fn queue(&mut self, pixels: f32) {
         self.remaining = pixels;
     }
 
     /// Add to the target — for a continuous input like a wheel, where several
     /// events arrive in a burst and should build up rather than replace.
-    fn accumulate(&mut self, pixels: f32) {
+    pub fn accumulate(&mut self, pixels: f32) {
         self.remaining =
             (self.remaining + pixels).clamp(-SCROLL_MAX_MOMENTUM_PX, SCROLL_MAX_MOMENTUM_PX);
     }
 
-    fn cancel(&mut self) {
+    pub fn cancel(&mut self) {
         self.remaining = 0.0;
     }
 
-    fn is_active(&self) -> bool {
+    pub fn is_active(&self) -> bool {
         self.remaining.abs() > SCROLL_EPSILON
     }
 
     /// The pixels to scroll this frame.
-    fn step(&mut self, dt: f32) -> f32 {
+    pub fn step(&mut self, dt: f32) -> f32 {
         if !self.is_active() {
             self.remaining = 0.0;
             return 0.0;
