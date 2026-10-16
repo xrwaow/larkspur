@@ -4,8 +4,9 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use super::identity::SongId;
-use super::playlist::{Playlist, PlaylistId, PlaylistKind, PlaylistOrigin};
+use super::playlist::{Playlist, PlaylistId, PlaylistKind, PlaylistOrigin, SmartKind};
 use super::song::{ReleaseDate, SongMetadata};
+use super::stats::Stats;
 
 /// The single source of truth for static library state.
 ///
@@ -112,12 +113,13 @@ impl Library {
     /// Temporary playlists are deliberately left out — they must not surface
     /// in the library browse, the rail, or the persisted cache. They're
     /// reached through [`playlist`](Self::playlist) by whatever holds their id
-    /// (an open tab).
+    /// (an open tab). Smart playlists are left out too: they're views over
+    /// the stats, not content, and the sidebar lists them separately.
     pub fn playlists(&self) -> Vec<&Playlist> {
         let mut all: Vec<&Playlist> = self
             .playlists
             .values()
-            .filter(|p| !p.is_temporary())
+            .filter(|p| !p.is_temporary() && !p.is_smart())
             .collect();
         all.sort_by(|a, b| {
             (a.is_custom(), a.title(), a.id.0).cmp(&(b.is_custom(), b.title(), b.id.0))
@@ -251,10 +253,14 @@ impl Library {
     }
 
     /// Delete a playlist. Custom playlists are removed from the rail; temporary
-    /// ones are deleted when their tab closes. Autogen ones can't be removed —
-    /// they're rebuilt from tags.
+    /// ones are deleted when their tab closes. Autogen and smart playlists
+    /// can't be removed — both are rebuilt from their source of truth.
     pub fn remove_playlist(&mut self, playlist: PlaylistId) -> Option<Playlist> {
-        if self.playlists.get(&playlist).is_some_and(|p| !p.is_auto()) {
+        if self
+            .playlists
+            .get(&playlist)
+            .is_some_and(|p| !p.is_auto() && !p.is_smart())
+        {
             let removed = self.playlists.remove(&playlist);
             self.reindex();
             removed
@@ -273,6 +279,51 @@ impl Library {
             .collect();
         all.sort_by_key(|p| p.id.0);
         all
+    }
+
+    /// The built-in smart playlists, in [`SmartKind::ALL`] order — what the
+    /// sidebar pins at the top of the playlists section.
+    pub fn smart_playlists(&self) -> Vec<&Playlist> {
+        SmartKind::ALL
+            .iter()
+            .filter_map(|kind| {
+                self.playlists
+                    .values()
+                    .find(|p| p.kind == PlaylistKind::Smart(*kind))
+            })
+            .collect()
+    }
+
+    /// Recompute every smart playlist's song list from `stats`.
+    ///
+    /// An existing playlist for a kind keeps its [`PlaylistId`] — matched by
+    /// kind, like an autogen album matches on its origin — so open tabs and
+    /// the sidebar's selection survive a rebuild. Idempotent, and cheap
+    /// enough to run whenever the stats change; it never reindexes, since
+    /// smart playlists contribute nothing to the derived index.
+    pub fn rebuild_smart(&mut self, stats: &Stats) {
+        for kind in SmartKind::ALL {
+            let selected = kind.select(self.songs.values().map(Arc::as_ref), stats);
+            match self
+                .playlists
+                .values()
+                .find(|p| p.kind == PlaylistKind::Smart(kind))
+                .map(|p| p.id)
+            {
+                Some(id) => {
+                    if let Some(p) = self.playlists.get_mut(&id) {
+                        p.song_ids = selected;
+                    }
+                }
+                None => {
+                    let id = self.alloc_playlist_id();
+                    self.playlists.insert(
+                        id,
+                        Playlist { id, kind: PlaylistKind::Smart(kind), song_ids: selected },
+                    );
+                }
+            }
+        }
     }
 
     // --- derived groupings --------------------------------------------
@@ -440,6 +491,12 @@ impl Library {
         self.reindex();
     }
 
+    /// Hand the song map over so a test can drop songs (simulating deletion).
+    #[cfg(test)]
+    pub(crate) fn take_songs_for_test(&mut self) -> HashMap<SongId, Arc<SongMetadata>> {
+        std::mem::take(&mut self.songs)
+    }
+
     // --- internals -----------------------------------------------------
 
     /// Rebuild the derived index from the current songs and playlists.
@@ -462,9 +519,10 @@ impl Library {
                 if playlist.is_auto() {
                     index.song_album.insert(*song_id, playlist.id);
                 }
-                // Temporary playlists are ad-hoc views, not credits — an
+                // Temporary playlists are ad-hoc views, and smart playlists
+                // are stats-driven views — neither is a credit, so an
                 // artist's "appears in" grouping must not list them.
-                if !playlist.is_temporary() {
+                if !playlist.is_temporary() && !playlist.is_smart() {
                     for artist in &song.artists {
                         index
                             .artist_playlists
@@ -510,9 +568,12 @@ fn artist_set(library: &Library) -> std::collections::BTreeSet<String> {
 mod tests {
     use super::*;
     use crate::model::Lyrics;
+    use crate::model::stats::Stats;
     use std::collections::BTreeSet;
     use std::path::PathBuf;
-    use std::time::Duration;
+    use std::time::{Duration, SystemTime};
+
+    const EPOCH: SystemTime = SystemTime::UNIX_EPOCH;
 
     fn song(id: SongId, name: &str) -> SongMetadata {
         SongMetadata {
@@ -825,6 +886,172 @@ mod tests {
         lib.insert_song(tagged(2, "B", "Amy", "Album", 2));
         lib.insert_song(tagged(3, "C", "Zed", "Other", 1));
         assert_eq!(artist_set(&lib), BTreeSet::from(["Amy".to_string(), "Zed".to_string()]));
+    }
+
+    // --- smart playlists ---------------------------------------------
+
+    fn smart(lib: &Library, kind: SmartKind) -> PlaylistId {
+        lib.smart_playlists()
+            .iter()
+            .find(|p| p.title() == kind.title())
+            .expect("smart playlist exists")
+            .id
+    }
+
+    #[test]
+    fn rebuild_smart_is_idempotent_and_keeps_ids() {
+        let mut lib = Library::default();
+        lib.insert_song(tagged(1, "A", "X", "Album", 1));
+        let mut stats = Stats::default();
+        stats.record_play(1, EPOCH);
+        lib.rebuild_smart(&stats);
+        let before = lib.smart_playlists().iter().map(|p| p.id).collect::<Vec<_>>();
+        assert_eq!(before.len(), 3, "one per SmartKind::ALL");
+
+        lib.rebuild_smart(&stats);
+        let after = lib.smart_playlists().iter().map(|p| p.id).collect::<Vec<_>>();
+        assert_eq!(after, before, "a rebuild keeps every PlaylistId");
+        let most = smart(&lib, SmartKind::MostPlayed);
+        assert_eq!(lib.playlist(most).unwrap().song_ids, vec![1]);
+    }
+
+    #[test]
+    fn smart_playlists_are_absent_from_playlists_and_the_artist_index() {
+        let mut lib = Library::default();
+        lib.insert_song(tagged(1, "A", "Grimes", "Visions", 1));
+        let mut stats = Stats::default();
+        stats.record_play(1, EPOCH);
+        lib.rebuild_auto();
+        lib.rebuild_smart(&stats);
+
+        assert!(!lib.playlists().iter().any(|p| p.is_smart()), "not in the album grid");
+        assert_eq!(lib.smart_playlists().len(), 3, "but reachable separately");
+        // A smart playlist containing a Grimes song must not make "Most
+        // Played" appear in her "appears in".
+        assert_eq!(lib.artist_appears_in("Grimes").len(), 1);
+        // And not in the discography either.
+        assert_eq!(lib.discography("Grimes").len(), 1);
+    }
+
+    #[test]
+    fn smart_playlists_are_read_only() {
+        let mut lib = Library::default();
+        lib.insert_song(song(1, "One"));
+        lib.rebuild_smart(&Stats::default());
+        let id = smart(&lib, SmartKind::MostPlayed);
+
+        assert!(!lib.add_song(id, 1), "can't add to a smart playlist");
+        assert!(!lib.remove_song(id, 1), "can't remove from one either");
+        assert!(!lib.rename(id, "Nope"));
+        assert!(lib.remove_playlist(id).is_none(), "can't delete one");
+    }
+
+    #[test]
+    fn rebuild_smart_regenerates_from_current_stats() {
+        let mut lib = Library::default();
+        lib.insert_song(song(1, "One"));
+        lib.insert_song(song(2, "Two"));
+        lib.rebuild_smart(&Stats::default());
+        let most = smart(&lib, SmartKind::MostPlayed);
+        assert!(lib.playlist(most).unwrap().song_ids.is_empty());
+
+        let mut stats = Stats::default();
+        stats.record_play(2, EPOCH);
+        lib.rebuild_smart(&stats);
+        assert_eq!(lib.playlist(most).unwrap().song_ids, vec![2]);
+    }
+
+    #[test]
+    fn rebuild_smart_drops_deleted_songs() {
+        let mut lib = Library::default();
+        lib.insert_song(song(1, "One"));
+        let mut stats = Stats::default();
+        stats.record_play(1, EPOCH);
+        lib.rebuild_smart(&stats);
+
+        // The song leaves the library (file deleted); a rebuild must empty
+        // the smart playlists too.
+        let mut songs = lib.take_songs_for_test();
+        songs.remove(&1);
+        lib.replace_songs(songs);
+        lib.rebuild_smart(&stats);
+        let most = smart(&lib, SmartKind::MostPlayed);
+        assert!(lib.playlist(most).unwrap().song_ids.is_empty());
+    }
+
+    #[test]
+    fn prune_and_rebuild_drop_deleted_songs_from_smart_lists() {
+        let mut lib = Library::default();
+        lib.insert_song(song(1, "One"));
+        lib.insert_song(song(2, "Two"));
+        let mut stats = Stats::default();
+        stats.record_play(1, EPOCH);
+        stats.record_play(2, EPOCH);
+        lib.rebuild_smart(&stats);
+
+        // Song 1's file disappears: prune drops the dangling reference, and
+        // a rebuild re-derives the view from what's left.
+        let mut songs = lib.take_songs_for_test();
+        songs.remove(&1);
+        lib.replace_songs(songs);
+        lib.prune();
+        lib.rebuild_smart(&stats);
+        let most = smart(&lib, SmartKind::MostPlayed);
+        assert_eq!(lib.playlist(most).unwrap().song_ids, vec![2]);
+    }
+
+    #[test]
+    fn a_recorded_play_fills_both_played_lists() {
+        let mut lib = Library::default();
+        lib.insert_song(song(1, "One"));
+        let mut stats = Stats::default();
+        stats.record_play(1, EPOCH);
+        lib.rebuild_smart(&stats);
+
+        let recent = smart(&lib, SmartKind::RecentlyPlayed);
+        let most = smart(&lib, SmartKind::MostPlayed);
+        assert_eq!(lib.playlist(recent).unwrap().song_ids, vec![1], "recently played");
+        assert_eq!(lib.playlist(most).unwrap().song_ids, vec![1], "most played");
+    }
+
+    #[test]
+    fn plays_survive_a_stats_round_trip_and_rebuild() {
+        let mut lib = Library::default();
+        lib.insert_song(song(1, "One"));
+        let mut stats = Stats::default();
+        stats.record_play(1, EPOCH);
+
+        // Round-trip the stats through their serialized form — what
+        // stats.json holds — then rebuild a fresh library's views from them,
+        // the way a launch does.
+        let bytes = serde_json::to_vec(&stats).unwrap();
+        let reloaded_stats: Stats = serde_json::from_slice(&bytes).unwrap();
+        let mut reloaded = Library::default();
+        reloaded.insert_song(song(1, "One"));
+        reloaded.rebuild_smart(&reloaded_stats);
+
+        let recent = smart(&reloaded, SmartKind::RecentlyPlayed);
+        let most = smart(&reloaded, SmartKind::MostPlayed);
+        assert_eq!(reloaded.playlist(recent).unwrap().song_ids, vec![1]);
+        assert_eq!(reloaded.playlist(most).unwrap().song_ids, vec![1]);
+    }
+
+    #[test]
+    fn smart_playlists_are_never_persisted() {
+        let mut lib = Library::default();
+        lib.insert_song(song(1, "One"));
+        let mut stats = Stats::default();
+        stats.record_play(1, EPOCH);
+        lib.rebuild_smart(&stats);
+        // save_playlists writes only custom playlists — the same call a
+        // real save makes — so a reload carries no smart lists.
+        let persisted: Vec<&Playlist> = lib.custom_playlists();
+        let mut reloaded = Library::default();
+        reloaded.replace_playlists(
+            persisted.iter().map(|p| (p.id, (*p).clone())).collect(),
+            lib.next_playlist_id(),
+        );
+        assert!(reloaded.smart_playlists().is_empty());
     }
 
     #[test]

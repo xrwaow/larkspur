@@ -13,7 +13,7 @@ use rodio::Source;
 
 use larkspur::analysis::analyze_track;
 use larkspur::audio::build_source;
-use larkspur::model::{Library, LibraryCache, SongMetadata};
+use larkspur::model::{Library, LibraryCache, SongMetadata, Stats};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -169,7 +169,7 @@ fn library(roots: &[String]) -> anyhow::Result<()> {
         std::env::temp_dir().join(format!("larkspur-library-dump-{}.json", std::process::id()));
     let mut cache = LibraryCache::open(cache_path.clone());
     let mut library = Library::default();
-    let report = cache.sync(&mut library, &roots, true);
+    let report = cache.sync(&mut library, &roots, true, &mut Stats::default());
 
     println!("roots: {}", roots.len());
     println!(

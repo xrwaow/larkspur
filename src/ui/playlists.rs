@@ -32,7 +32,7 @@ use gpui::{
     Pixels, Point, Render, Subscription, Window,
 };
 
-use crate::model::{FolderMode, Playlist, PlaylistId};
+use crate::model::{FolderMode, Playlist, PlaylistId, PlaylistKind, SmartKind};
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::input::action_for_key;
@@ -288,25 +288,11 @@ impl PlaylistsView {
 
         let mut rows: Vec<RailRow> = Vec::new();
 
-        rows.push(RailRow::Header("Playlists"));
-        rows.push(RailRow::NewPlaylist);
-        let custom = lib.custom_playlists();
-        if custom.is_empty() {
-            rows.push(RailRow::NoCustom);
-        }
-        for playlist in custom {
-            // The row being renamed shows an editable field instead of a label.
-            if self.renaming.as_ref().is_some_and(|(id, _, _)| *id == playlist.id) {
-                rows.push(RailRow::Rename);
-            } else {
-                rows.push(RailRow::Custom(row_of(playlist)));
-            }
-        }
-
         // Each group has its own filter box, scoped to that group only —
         // custom playlists are few and deliberately always visible, and the
         // folder view ignores filters too. A filter overrides its group's
-        // collapse: searching must reveal what the fold is hiding.
+        // collapse: searching must reveal what the fold is hiding. An
+        // expanded tree renders directly under its own header.
         let (album_query, artist_query) = (self.album_filter.query(), self.artist_filter.query());
         let (album_matches, artist_matches) =
             (query_matches(&album_query), query_matches(&artist_query));
@@ -355,10 +341,36 @@ impl PlaylistsView {
         // The folder view mirrors the synced directories on disk. It ignores
         // the filter (that one is for albums and artists) and reads the
         // filesystem only for the subtrees actually expanded.
-        rows.push(RailRow::GroupHeader { label: "Folder View", open: self.folder_open });
+        rows.push(RailRow::GroupHeader { label: "Folders", open: self.folder_open });
         if self.folder_open {
             for root in self.config.read(cx).roots() {
                 push_folder_tree(&mut rows, root, 0, &self.open_dirs);
+            }
+        }
+
+        // Below the groups: the built-in smart playlists, then the user's.
+        // Smart lists are views over the song stats — no rename, no delete.
+        rows.push(RailRow::Header("Playlists"));
+        for (kind, glyph) in [
+            (SmartKind::RecentlyAdded, "✦"),
+            (SmartKind::RecentlyPlayed, "↻"),
+            (SmartKind::MostPlayed, "▲"),
+        ] {
+            if let Some(p) = lib.smart_playlists().iter().find(|p| p.kind == PlaylistKind::Smart(kind)) {
+                rows.push(RailRow::Smart { id: p.id, glyph, title: kind.title() });
+            }
+        }
+        rows.push(RailRow::NewPlaylist);
+        let custom = lib.custom_playlists();
+        if custom.is_empty() {
+            rows.push(RailRow::NoCustom);
+        }
+        for playlist in custom {
+            // The row being renamed shows an editable field instead of a label.
+            if self.renaming.as_ref().is_some_and(|(id, _, _)| *id == playlist.id) {
+                rows.push(RailRow::Rename);
+            } else {
+                rows.push(RailRow::Custom(row_of(playlist)));
             }
         }
 
@@ -414,7 +426,9 @@ impl PlaylistsView {
                         div()
                             .text_size(px(theme.small_px()))
                             .text_color(theme.text_faint)
-                            .child(toggled.to_string()),
+                            // Uppercase, so the group labels read like the
+                            // PLAYLISTS section header below them.
+                            .child(toggled.to_uppercase()),
                     )
                     .child(
                         div()
@@ -451,6 +465,28 @@ impl PlaylistsView {
                     .pb_1()
                     .child(field.render(theme, "Playlist name", focus, window))
                     .into_any_element()
+            }
+            RailRow::Smart { id, glyph, title } => {
+                // Like an album row, but the glyph leads the label and there
+                // is no right-click menu — smart lists are views, not content.
+                let id = *id;
+                let label = format!("{glyph} {title}");
+                let bits = self.label_bits(key, &label, advance, cx);
+                rail_row(
+                    theme,
+                    ("smart-row", id.0),
+                    key,
+                    label,
+                    bits,
+                    None,
+                    selected == Some(id),
+                    0,
+                    Branch::Plain,
+                    Some(cx.listener(move |this, _event, window, cx| {
+                        this.tabs.update(cx, |tabs, cx| tabs.open_playlist(id, window, cx));
+                    })),
+                )
+                .into_any_element()
             }
             RailRow::Custom(row) | RailRow::Album(row) | RailRow::Discography(row) => {
                 // All three open the playlist they stand for; a custom one
@@ -641,6 +677,9 @@ enum RailRow {
     /// The "no custom playlists" hint.
     NoCustom,
     Custom(Row),
+    /// A built-in smart playlist: opens like a custom one, but is a view over
+    /// the song stats — no right-click menu, marked with a small glyph.
+    Smart { id: PlaylistId, glyph: &'static str, title: &'static str },
     /// The inline rename field, shown in place of the custom row being renamed.
     Rename,
     Album(Row),
@@ -1057,6 +1096,10 @@ fn row_key(kind: &RailRow) -> Option<u64> {
         RailRow::Custom(row) => {
             "custom".hash(&mut hasher);
             row.id.hash(&mut hasher);
+        }
+        RailRow::Smart { id, .. } => {
+            "smart".hash(&mut hasher);
+            id.hash(&mut hasher);
         }
         RailRow::Album(row) => {
             "album".hash(&mut hasher);

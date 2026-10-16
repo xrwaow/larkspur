@@ -288,9 +288,12 @@ impl TabsView {
 
     /// Switch to a tab and hand it keyboard focus.
     fn activate(&mut self, id: TabId, window: &mut Window, cx: &mut Context<Self>) {
+        // The rail's highlight follows the active tab — lit only while a
+        // playlist tab is the one showing it, dropped otherwise.
         if let TabId::Playlist(playlist) = &id {
-            // The rail's highlight follows the active tab.
             self.library.update(cx, |state, cx| state.select(*playlist, cx));
+        } else {
+            self.library.update(cx, |state, cx| state.deselect(cx));
         }
         self.active = id;
         self.search_open = false;

@@ -18,10 +18,11 @@
 //! name for paths the library doesn't know (files queued from the command
 //! line before any scan).
 
+use std::cell::Cell as StdCell;
 use std::path::PathBuf;
 use std::rc::Rc;
 use gpui::{
-    div, prelude::*, App, ClickEvent, Context, Entity, MouseButton, MouseDownEvent,
+    canvas, div, prelude::*, px, App, ClickEvent, Context, Entity, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Render, Window,
 };
 
@@ -68,6 +69,11 @@ pub struct QueueView {
     /// A row to reveal once the panel has a viewport (the first render of a
     /// freshly opened panel has none yet).
     pending_reveal: Option<usize>,
+    /// The panel's top edge in window coordinates, last measured — the drag
+    /// ghost's window-coordinate `top` is drawn in the panel's own space, so
+    /// it's re-based by this. Measured only while a grab is held (the measurer
+    /// canvas exists just then); the value survives between drags.
+    panel_top: Rc<StdCell<f32>>,
     /// The row grab in flight — hold a row and move to reorder it.
     drag: Drag,
     _subs: AlbumListSubs,
@@ -112,6 +118,7 @@ impl QueueView {
             themed,
             list,
             queue_entries: Vec::new(),
+            panel_top: Rc::new(StdCell::new(0.0)),
             queue_generation: 0,
             total_secs: 0,
             open_last: false,
@@ -395,7 +402,23 @@ impl Render for QueueView {
             // drag too, so it can't be left hanging.
             .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _event: &MouseUpEvent, _window, cx| {
                 this.release_drag(cx);
-            }));
+            }))
+            // While a grab is held, measure the panel's window position — the
+            // ghost's `top` is a window coordinate but it's laid out inside
+            // this panel. The canvas exists only then; the value persists, and
+            // a drag's first ghost frame is always at least a frame after the
+            // grab, so the measurement is current by then.
+            .when(self.drag.is_active(), |d| {
+                d.child(canvas(
+                    {
+                        let measured = self.panel_top.clone();
+                        move |bounds, _, _| measured.set(f32::from(bounds.origin.y))
+                    },
+                    |_, _, _, _| {},
+                )
+                .absolute()
+                .inset_0())
+            });
 
         if queue_len == 0 {
             panel = panel.child(
@@ -413,6 +436,63 @@ impl Render for QueueView {
                 Rc::new(QueueRows),
                 cx,
             ));
+        }
+
+        // The dragged row, drawn on top of the list and following the pointer.
+        // `top` is in window coordinates; the panel spans the tabs container,
+        // whose top is the window's, so they coincide.
+        if let Some(info) = drag_info {
+            let library = self.library.read(cx).library();
+            let (title, artist) = match self.queue_entries.get(info.grabbed) {
+                Some((id, path)) => match library.get(*id) {
+                    Some(song) => (song.display_title(), song.artists.join(", ")),
+                    None => (
+                        path.file_stem().unwrap_or(path.as_os_str()).to_string_lossy().into_owned(),
+                        "Unknown Artist".to_string(),
+                    ),
+                },
+                None => (String::new(), String::new()),
+            };
+            let columns = self.list.rows().columns();
+            panel = panel.child(
+                div()
+                    .absolute()
+                    .left(px(0.0))
+                    .right(px(0.0))
+                    .top(px(info.top - self.panel_top.get()))
+                    .h(px(info.row_height))
+                    // Swallow the pointer while dragging: no row hover or
+                    // click underneath, and the move/up events still bubble
+                    // here to the panel root.
+                    .occlude()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .px_4()
+                    .rounded_md()
+                    .bg(theme.row_active)
+                    .border_1()
+                    .border_color(theme.border)
+                    .child(div().w(px(theme.num_col())).flex_none())
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .truncate()
+                            .text_size(px(theme.cell_px()))
+                            .text_color(theme.text)
+                            .child(title),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .w(px(columns.artist))
+                            .truncate()
+                            .text_size(px(theme.cell_px()))
+                            .text_color(theme.text_muted)
+                            .child(artist),
+                    ),
+            );
         }
 
         panel.into_any_element()

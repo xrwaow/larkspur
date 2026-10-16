@@ -20,13 +20,14 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 use gpui::{Context, Entity, Subscription};
 
 use crate::model::search::Query;
 use crate::model::{
     generate_song_id, shuffle, FolderMode, Library, LibraryCache, Order, PlaylistId, Scope,
-    Selection, SongId, SongMetadata,
+    Selection, SongId, SongMetadata, Stats,
 };
 use crate::ui::config_state::ConfigState;
 use crate::ui::menu::SongMenuRequest;
@@ -51,6 +52,10 @@ pub enum Request {
 
 pub struct LibraryState {
     library: Library,
+    /// Per-user song statistics (plays, added stamps). Kept beside
+    /// the library, not in it: it's user state with the playlists' lifetime,
+    /// not the scan's.
+    stats: Stats,
     /// Taken out while a scan is in flight, restored when it completes.
     cache: Option<LibraryCache>,
     /// The synced-path list, mirrored from the config so the scan and the
@@ -86,6 +91,13 @@ impl LibraryState {
         // Playlists live in their own file, so they're loaded separately.
         let (playlists, next_playlist_id) = cache.load_playlists();
         library.replace_playlists(playlists, next_playlist_id);
+        // Stats too — a sibling file with the same lifetime.
+        let mut stats = cache.load_stats();
+        stats.prune(&library);
+        // Smart playlists are views over the stats, so they exist as soon as
+        // the cached library does — the sidebar can list them before any
+        // scan finishes.
+        library.rebuild_smart(&stats);
 
         let observe_config = cx.observe(&config, |this, config, cx| {
             let roots = config.read(cx).roots().to_vec();
@@ -94,6 +106,7 @@ impl LibraryState {
 
         let mut this = Self {
             library,
+            stats,
             cache: Some(cache),
             roots,
             selected: None,
@@ -153,6 +166,15 @@ impl LibraryState {
     pub fn select(&mut self, id: PlaylistId, cx: &mut Context<Self>) {
         if self.selected != Some(id) {
             self.selected = Some(id);
+            cx.notify();
+        }
+    }
+
+    /// Clear the active playlist — no tab is showing one, so the rail drops
+    /// its highlight (the highlight follows the tab container's active tab).
+    pub fn deselect(&mut self, cx: &mut Context<Self>) {
+        if self.selected.is_some() {
+            self.selected = None;
             cx.notify();
         }
     }
@@ -279,6 +301,23 @@ impl LibraryState {
             self.persist();
             cx.notify();
         }
+    }
+
+    /// Count one play of `song`, regenerate the smart playlists, and save the
+    /// stats. Called once per playback — the caller owns the 30-seconds-or-
+    /// half-duration rule — never per tick.
+    pub fn record_play(&mut self, song: SongId, cx: &mut Context<Self>) {
+        self.stats.record_play(song, SystemTime::now());
+        self.library.rebuild_smart(&self.stats);
+        self.revision += 1;
+        self.persist_stats();
+        cx.notify();
+    }
+
+    /// Save the stats — also called on app exit, so a play counted in the
+    /// last seconds still lands on disk.
+    pub fn save_stats(&mut self) {
+        self.persist_stats();
     }
 
     /// Replace the play queue with a playlist's songs, starting at `start`.
@@ -410,8 +449,11 @@ impl LibraryState {
         self.library = scanned;
         self.library.adopt_custom_from(&previous);
         // The adopted custom playlists may reference songs the scan dropped
-        // (e.g. a removed root), so drop those references too.
+        // (e.g. a removed root), so drop those references too. The scanned
+        // library has no smart playlists (they're never persisted), so the
+        // views are regenerated from the live stats rather than carried over.
         self.library.prune();
+        self.library.rebuild_smart(&self.stats);
     }
 
     fn rescan(&mut self, cx: &mut Context<Self>) {
@@ -421,6 +463,7 @@ impl LibraryState {
         };
         self.scanning = true;
         let roots = self.roots.clone();
+        let stats = self.stats.clone();
 
         cx.spawn(async move |this, cx| {
             let scanned = cx
@@ -428,15 +471,17 @@ impl LibraryState {
                 .spawn(async move {
                     let mut cache = cache;
                     let mut library = Library::default();
-                    cache.install(&mut library);
-                    let report = cache.sync(&mut library, &roots, false);
-                    (cache, library, report)
+                    let mut stats = stats;
+                    let report = cache.sync(&mut library, &roots, false, &mut stats);
+                    stats.prune(&library);
+                    (cache, library, stats, report)
                 })
                 .await;
 
             this.update(cx, |state, cx| {
-                let (cache, library, report) = scanned;
+                let (cache, library, stats, report) = scanned;
                 state.cache = Some(cache);
+                state.stats = stats;
                 state.merge_scanned(library);
                 state.scanning = false;
                 state.revision += 1;
@@ -478,6 +523,17 @@ impl LibraryState {
         if let Some(cache) = self.cache.as_ref() {
             if let Err(e) = cache.save() {
                 eprintln!("failed to save library cache: {e}");
+            }
+        }
+    }
+
+    /// Persist the per-user song stats — written when a play is counted,
+    /// never per tick.
+    pub fn persist_stats(&mut self) {
+        let Self { cache, stats, .. } = self;
+        if let Some(cache) = cache.as_ref() {
+            if let Err(e) = cache.save_stats(stats) {
+                eprintln!("failed to save stats: {e}");
             }
         }
     }

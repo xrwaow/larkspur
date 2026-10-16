@@ -19,6 +19,7 @@ pub mod scan;
 pub mod search;
 pub mod select;
 pub mod song;
+pub mod stats;
 pub mod view;
 
 pub use config::{Config, DynamicBase, FontKind, ThemeKind, WindowPlacement};
@@ -27,8 +28,9 @@ pub use identity::{generate_song_id, SongId};
 pub use input::InputAction;
 pub use library::{shuffle, Library};
 pub use lyrics::{parse_lrc, LyricLine, Lyrics};
-pub use playlist::{Playlist, PlaylistId, PlaylistKind, PlaylistOrigin};
+pub use playlist::{Playlist, PlaylistId, PlaylistKind, PlaylistOrigin, SmartKind};
 pub use scan::{LibraryCache, SyncReport};
 pub use select::{Order, Scope, Selection};
 pub use song::{ReleaseDate, SongMetadata};
+pub use stats::{SongStats, Stats};
 pub use view::{FolderMode, TabId};

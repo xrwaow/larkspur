@@ -47,6 +47,10 @@ anyhow = "1"
 
 [profile.dev]
 opt-level = 1 # keep our own crate fast to compile
+# Trim debug info: full debug info on an opt-level-3 dep tree made the final
+# binary ~664 MB, so every save paid a huge link step. Line tables keep
+# backtraces readable while shrinking the link to a fraction of that.
+debug = "line-tables-only"
 # GPUI compiles its element inspector and a pile of per-frame debug checks
 # behind `debug_assertions`. Leaving them on in a dev build is a large chunk of
 # frame time, so a debug `cargo run` turns them off.

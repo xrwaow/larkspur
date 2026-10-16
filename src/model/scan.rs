@@ -22,6 +22,7 @@ use super::library::Library;
 use super::lyrics;
 use super::playlist::{Playlist, PlaylistId};
 use super::song::SongMetadata;
+use super::stats::Stats;
 
 /// What a sync pass did.
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
@@ -80,6 +81,14 @@ struct PlaylistsFile {
     version: u32,
     playlists: Vec<Playlist>,
     next_playlist_id: u64,
+}
+
+/// The on-disk shape of the per-user song stats — a separate file, like the
+/// playlists, because its lifetime is the user's, not the scan's.
+#[derive(Serialize, Deserialize)]
+struct StatsFile {
+    version: u32,
+    stats: Stats,
 }
 
 /// Bumped whenever the cached shape changes. v2: `nominal_bitrate` moved from
@@ -151,7 +160,12 @@ impl LibraryCache {
     /// `force` skips the fast path, re-reading every file — the escape hatch
     /// for in-place tag edits, which change a file's mtime but not its
     /// directory's, so the fast path can't see them.
-    pub fn sync(&mut self, library: &mut Library, roots: &[PathBuf], force: bool) -> SyncReport {
+    ///
+    /// `stats` is seeded with `added` stamps for songs the library gains: on
+    /// the very first run (empty stats file) from the file's mtime, later
+    /// from "now" — a copy preserves the old mtime, which would bury a newly
+    /// added song at the bottom of "Recently Added".
+    pub fn sync(&mut self, library: &mut Library, roots: &[PathBuf], force: bool, stats: &mut Stats) -> SyncReport {
         let mut report = SyncReport::default();
 
         for root in normalize_roots(roots) {
@@ -214,6 +228,7 @@ impl LibraryCache {
         library.replace_songs(self.entries.values().map(|e| (e.song.id, e.to_song())).collect());
         library.prune();
         library.rebuild_auto();
+        seed_added(library, stats);
 
         report
     }
@@ -261,6 +276,31 @@ impl LibraryCache {
         write_json(&self.playlists_path(), &file)
     }
 
+    /// Persist the per-user song stats. Tiny — a few bytes per song the user
+    /// has actually played.
+    pub fn save_stats(&self, stats: &Stats) -> anyhow::Result<()> {
+        let file = StatsFile { version: CACHE_VERSION, stats: stats.clone() };
+        write_json(&self.stats_path(), &file)
+    }
+
+    /// The file the per-user song stats are persisted to — a sibling of the
+    /// song cache, like the playlists file.
+    fn stats_path(&self) -> PathBuf {
+        self.path.with_file_name("stats.json")
+    }
+
+    /// Load the per-user song stats, or empty on a first run / version
+    /// mismatch. Never an error: stats are user state a broken file must not
+    /// take down the library with.
+    pub fn load_stats(&self) -> Stats {
+        fs::read(self.stats_path())
+            .ok()
+            .and_then(|bytes| serde_json::from_slice::<StatsFile>(&bytes).ok())
+            .filter(|file| file.version == CACHE_VERSION)
+            .map(|file| file.stats)
+            .unwrap_or_default()
+    }
+
     /// Forget cached songs and directory stamps that no longer fall under any
     /// of `roots`.
     ///
@@ -273,6 +313,27 @@ impl LibraryCache {
         let covered = |path: &Path| normalized.iter().any(|root| path.starts_with(root));
         self.entries.retain(|path, _| covered(path));
         self.dirs.retain(|dir, _| covered(dir));
+    }
+}
+
+/// Stamp `added` for every song `stats` doesn't know yet.
+///
+/// On the very first run (no stats at all) the song file's mtime is the best
+/// guess at when it entered the library. Later arrivals get "now": a copy
+/// carries the original's mtime, so trusting it there would sort a newly
+/// added song as if it had always been present.
+fn seed_added(library: &Library, stats: &mut Stats) {
+    let first_run = stats.is_empty();
+    for song in library.songs() {
+        if stats.contains(song.id) {
+            continue;
+        }
+        let stamp = if first_run {
+            fs::metadata(&song.path).ok().and_then(|m| m.modified().ok()).unwrap_or_else(SystemTime::now)
+        } else {
+            SystemTime::now()
+        };
+        stats.ensure_added(song.id, stamp);
     }
 }
 
@@ -372,7 +433,7 @@ fn source_stamp(path: &Path) -> Option<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Lyrics, ReleaseDate};
+    use crate::model::{Lyrics, ReleaseDate, SongStats};
     use std::time::Duration;
 
     /// A unique temp directory per test, cleaned up by the caller's drop.
@@ -464,11 +525,11 @@ mod tests {
         let mut cache = LibraryCache::open(tmp.path().join("cache.json"));
         let mut library = Library::default();
 
-        let first = cache.sync(&mut library, &[tmp.path().to_path_buf()], false);
+        let first = cache.sync(&mut library, &[tmp.path().to_path_buf()], false, &mut Stats::default());
         assert_eq!(first.skipped_roots, 0);
         assert_eq!(first.errors.len(), 1, "the fake file can't be parsed");
 
-        let second = cache.sync(&mut library, &[tmp.path().to_path_buf()], false);
+        let second = cache.sync(&mut library, &[tmp.path().to_path_buf()], false, &mut Stats::default());
         assert_eq!(second.skipped_roots, 1, "nothing changed, so nothing walked");
     }
 
@@ -479,8 +540,8 @@ mod tests {
         let mut cache = LibraryCache::open(tmp.path().join("cache.json"));
         let mut library = Library::default();
 
-        cache.sync(&mut library, &[tmp.path().to_path_buf()], false);
-        let forced = cache.sync(&mut library, &[tmp.path().to_path_buf()], true);
+        cache.sync(&mut library, &[tmp.path().to_path_buf()], false, &mut Stats::default());
+        let forced = cache.sync(&mut library, &[tmp.path().to_path_buf()], true, &mut Stats::default());
         assert_eq!(forced.skipped_roots, 0);
         assert_eq!(forced.errors.len(), 1, "re-read, and failed again");
     }
@@ -617,6 +678,59 @@ mod tests {
     }
 
     #[test]
+    fn stats_round_trip_in_their_own_file() {
+        let tmp = TempDir::new("stats");
+        let cache_path = tmp.path().join("cache.json");
+        let cache = LibraryCache::open(cache_path.clone());
+
+        let mut stats = Stats::default();
+        stats.record_play(42, UNIX_EPOCH);
+        stats.ensure_added(42, UNIX_EPOCH);
+        cache.save_stats(&stats).unwrap();
+
+        let loaded = LibraryCache::open(cache_path).load_stats();
+        assert_eq!(loaded.get(42).plays, 1);
+        assert_eq!(loaded.get(42).added, Some(UNIX_EPOCH));
+        assert_eq!(loaded.get(7), SongStats::default(), "unknown songs stay default");
+    }
+
+    #[test]
+    fn stats_version_mismatch_is_treated_as_empty() {
+        let tmp = TempDir::new("stats-version");
+        let path = tmp.path().join("stats.json");
+        fs::write(&path, r#"{"version":999,"stats":{}}"#).unwrap();
+        assert!(LibraryCache::open(tmp.path().join("cache.json")).load_stats().is_empty());
+    }
+
+    #[test]
+    fn missing_stats_file_is_empty_not_an_error() {
+        let tmp = TempDir::new("stats-missing");
+        assert!(LibraryCache::open(tmp.path().join("cache.json")).load_stats().is_empty());
+    }
+
+    #[test]
+    fn sync_seeds_added_from_mtime_on_first_run_and_now_later() {
+        let tmp = TempDir::new("seed");
+        let path = tmp.touch("track.flac");
+        let mtime = source_stamp(&path).unwrap();
+        let mut library = Library::default();
+        library.insert_song(song(1, &path));
+
+        // First run: the stats are empty, so the file's mtime is the best
+        // guess at when the song entered the library.
+        let mut stats = Stats::default();
+        seed_added(&library, &mut stats);
+        assert_eq!(stats.get(1).added, Some(mtime));
+
+        // A song that arrives when stats already exist is stamped "now", not
+        // with its (old) mtime — otherwise a copied file would look ancient.
+        let mut stats = Stats::default();
+        stats.record_play(999, UNIX_EPOCH); // non-empty => not the first run
+        seed_added(&library, &mut stats);
+        assert!(stats.get(1).added.is_some_and(|t| t > mtime), "later arrivals stamp now");
+    }
+
+    #[test]
     fn sync_rebuilds_autogen_playlists() {
         let tmp = TempDir::new("autogen");
         let mut cache = LibraryCache::open(tmp.path().join("cache.json"));
@@ -642,7 +756,7 @@ mod tests {
         );
 
         // A sync with no roots still rebuilds from whatever is cached.
-        cache.sync(&mut library, &[], false);
+        cache.sync(&mut library, &[], false, &mut Stats::default());
         let auto = library.playlists();
         assert_eq!(auto.len(), 1);
         assert_eq!(auto[0].title(), "Visions");

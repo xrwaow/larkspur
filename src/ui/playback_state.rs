@@ -49,6 +49,11 @@ const WAVEFORM_CHUNK: Duration = Duration::from_secs(256);
 /// smoothing between its updates.
 const MAX_EXTRAPOLATION: Duration = Duration::from_millis(256);
 
+/// A play counts once the track has been listened to for this long — or for
+/// half of a shorter track, whichever comes first. Not "on start": pressing
+/// next immediately must not pad the play counts.
+const PLAY_COUNT_AFTER: Duration = Duration::from_secs(30);
+
 /// How often the state samples the player. Fast enough to notice a track
 /// draining promptly; the *notify* rate is separate — the transport re-renders
 /// on the slow clock ([`SLOW_FPS`]), not every sample.
@@ -112,6 +117,9 @@ pub struct PlaybackState {
     /// a view) because both the transport's toggle button and the tab
     /// container that hosts the panel observe this state.
     queue_open: bool,
+    /// The per-playback play counter. One play per playback, counted at the
+    /// listen threshold — never on start, never per tick.
+    play_counter: PlayCounter,
 }
 
 impl PlaybackState {
@@ -135,6 +143,7 @@ impl PlaybackState {
             display_position: position,
             anchor: None,
             queue_open: false,
+            play_counter: PlayCounter::default(),
         };
         this.reload_track();
         this.start_ticker(cx);
@@ -203,6 +212,12 @@ impl PlaybackState {
     /// playing or the analysis isn't ready yet.
     pub fn live_bitrate(&self) -> Option<u32> {
         self.live_bitrate_bps
+    }
+
+    /// The library state, for views that need to act on the current track
+    /// rather than just read its metadata.
+    pub fn library(&self) -> &Entity<LibraryState> {
+        &self.library
     }
 
     pub fn status(&self) -> SongStatus {
@@ -430,7 +445,7 @@ impl PlaybackState {
 
     /// Advance the queue if it drained, and report whether anything the UI
     /// renders has changed since the last tick.
-    fn tick(&mut self, _cx: &mut Context<Self>) -> bool {
+    fn tick(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
 
         if self.controller.tick_advance() {
@@ -475,6 +490,19 @@ impl PlaybackState {
                 self.live_bitrate_bps = bitrate_at;
                 changed = true;
             }
+        }
+
+        // Count a play once per playback, at the listen threshold — not on
+        // start, and not per tick. Seeks across the threshold count;
+        // skipping past the track before it doesn't.
+        if let Some(id) = self.play_counter.poll(
+            self.controller.current_id(),
+            self.controller.is_playing(),
+            position,
+            self.controller.duration,
+        ) {
+            self.library.update(cx, |state, cx| state.record_play(id, cx));
+            changed = true;
         }
 
         let status = self.controller.status();
@@ -549,6 +577,9 @@ impl PlaybackState {
         self.last_coarse = -1;
         self.anchor = None;
         self.display_position = self.controller.position();
+        // A new track (or a replay of this one) is a fresh playback: the
+        // listen threshold starts over.
+        self.play_counter.reset();
 
         let Some(path) = self.controller.current_path().map(PathBuf::from) else {
             return;
@@ -588,5 +619,140 @@ impl PlaybackState {
                 }
             }
         });
+    }
+}
+
+/// The per-playback play counter: pure state, so the threshold rule is unit-
+/// testable without an audio device.
+///
+/// A play counts the first time a *playing* track's position passes the
+/// threshold — 30 seconds, or half of a shorter track, whichever comes first.
+/// One count per playback: [`PlayCounter::reset`] on a track change starts a
+/// fresh one, and polls after the count report nothing.
+#[derive(Default)]
+struct PlayCounter {
+    counted: Option<SongId>,
+}
+
+impl PlayCounter {
+    fn reset(&mut self) {
+        self.counted = None;
+    }
+
+    /// Report the song whose play just crossed the threshold, if any.
+    fn poll(
+        &mut self,
+        current: Option<SongId>,
+        playing: bool,
+        position: Duration,
+        duration: Duration,
+    ) -> Option<SongId> {
+        if !playing || self.counted.is_some() {
+            return None;
+        }
+        let id = current?;
+        // Half of a zero duration is zero — a stream with unknown length
+        // would count instantly — so a zero duration falls back to the full
+        // listen threshold.
+        let half = duration / 2;
+        let threshold = if half.is_zero() || half > PLAY_COUNT_AFTER {
+            PLAY_COUNT_AFTER
+        } else {
+            half
+        };
+        if position >= threshold {
+            self.counted = Some(id);
+            Some(id)
+        } else {
+            None
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const SONG: SongId = 42;
+
+    #[test]
+    fn no_play_before_the_threshold() {
+        let mut counter = PlayCounter::default();
+        assert_eq!(
+            counter.poll(Some(SONG), true, Duration::from_secs(10), Duration::from_secs(200)),
+            None,
+            "under 30s on a long track: nothing yet"
+        );
+    }
+
+    #[test]
+    fn a_play_counts_once_at_the_threshold() {
+        let mut counter = PlayCounter::default();
+        assert_eq!(
+            counter.poll(Some(SONG), true, Duration::from_secs(30), Duration::from_secs(200)),
+            Some(SONG),
+            "30s on a long track: the play counts"
+        );
+        // Further polls in the same playback must not pad the count.
+        assert_eq!(
+            counter.poll(Some(SONG), true, Duration::from_secs(60), Duration::from_secs(200)),
+            None
+        );
+    }
+
+    #[test]
+    fn a_short_track_counts_at_half_duration() {
+        let mut counter = PlayCounter::default();
+        // 20s track: half is 10s, so 10s in is a play.
+        assert_eq!(
+            counter.poll(Some(SONG), true, Duration::from_secs(10), Duration::from_secs(20)),
+            Some(SONG)
+        );
+    }
+
+    #[test]
+    fn an_unknown_duration_does_not_count_instantly() {
+        let mut counter = PlayCounter::default();
+        assert_eq!(
+            counter.poll(Some(SONG), true, Duration::from_secs(1), Duration::ZERO),
+            None,
+            "a zero duration must not make the threshold zero"
+        );
+        assert_eq!(
+            counter.poll(Some(SONG), true, Duration::from_secs(30), Duration::ZERO),
+            Some(SONG)
+        );
+    }
+
+    #[test]
+    fn paused_or_songless_polls_count_nothing() {
+        let mut counter = PlayCounter::default();
+        assert_eq!(
+            counter.poll(Some(SONG), false, Duration::from_secs(60), Duration::from_secs(200)),
+            None,
+            "paused: not a listen"
+        );
+        assert_eq!(
+            counter.poll(None, true, Duration::from_secs(60), Duration::from_secs(200)),
+            None,
+            "no current song: nothing to credit"
+        );
+    }
+
+    #[test]
+    fn reset_starts_a_fresh_playback() {
+        let mut counter = PlayCounter::default();
+        counter.poll(Some(SONG), true, Duration::from_secs(30), Duration::from_secs(200));
+        counter.reset();
+        // The next playback must count its own play — but only when the
+        // threshold passes again.
+        assert_eq!(
+            counter.poll(Some(SONG), true, Duration::from_secs(5), Duration::from_secs(200)),
+            None
+        );
+        assert_eq!(
+            counter.poll(Some(SONG), true, Duration::from_secs(35), Duration::from_secs(200)),
+            Some(SONG)
+        );
     }
 }

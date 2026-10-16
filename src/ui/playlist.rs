@@ -25,7 +25,7 @@ use gpui::{
 };
 
 use crate::model::search;
-use crate::model::{PlaylistId, SongId};
+use crate::model::{PlaylistId, PlaylistKind, SmartKind, SongId};
 use crate::ui::album_list::{
     self, AlbumList, AlbumListSubs, AlbumListView, Play,
 };
@@ -176,6 +176,18 @@ impl Render for PlaylistView {
 
         let sections = self.list.rows().sections();
         let is_custom = self.is_custom;
+        // A smart list's empty state hints at how songs get into it — it has
+        // no "search below" affordance to point at.
+        let smart_kind = self
+            .list
+            .library()
+            .read(cx)
+            .library()
+            .playlist(playlist)
+            .and_then(|p| match p.kind {
+                PlaylistKind::Smart(kind) => Some(kind),
+                _ => None,
+            });
         let Some(section) = sections.first() else {
             return div()
                 .size_full()
@@ -235,7 +247,13 @@ impl Render for PlaylistView {
                     .child(header)
                     .child(empty_hint(
                         theme,
-                        if is_custom {
+                        if let Some(kind) = smart_kind {
+                            match kind {
+                                SmartKind::RecentlyAdded => "Add music — new songs land here.",
+                                SmartKind::RecentlyPlayed => "Play something to fill this in.",
+                                SmartKind::MostPlayed => "Play something to fill this in.",
+                            }
+                        } else if is_custom {
                             "Empty playlist — search below to add songs."
                         } else {
                             "No songs."

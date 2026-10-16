@@ -130,6 +130,17 @@ fn main() {
                 let playback_state =
                     cx.new(|cx| PlaybackState::new(controller, library_state.clone(), cx));
 
+                // Stats are saved eagerly on every change, but a last-second
+                // toggle still gets a flush at quit.
+                cx.on_app_quit({
+                    let library_state = library_state.clone();
+                    move |cx| {
+                        library_state.update(cx, |state, _cx| state.save_stats());
+                        async {}
+                    }
+                })
+                .detach();
+
                 // Command-line files are queued now that the library exists, so
                 // each is loaded into it and resolvable to metadata.
                 if !files.is_empty() {

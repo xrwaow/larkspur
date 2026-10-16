@@ -163,15 +163,12 @@ fn section(library: &Library, group: AlbumGroup) -> Option<AlbumSection> {
             (
                 // A custom playlist lists whatever the user put in it: the one
                 // shared artist when every track agrees, else "Various Artists".
-                // An autogen playlist records its album artist; fall back to the
-                // first track's for anything else.
+                // An album lists every artist credited on its tracks; when more
+                // than a handful share the bill, that collapses to a phrase.
                 if custom {
                     custom_artist(&songs)
                 } else {
-                    playlist
-                        .artist()
-                        .map(str::to_string)
-                        .unwrap_or_else(|| first.album_artist().to_string())
+                    album_artists(&songs)
                 },
                 album_meta(songs.len(), total_secs),
                 // An explicit cover wins; otherwise the first song's — so a
@@ -197,6 +194,26 @@ fn section(library: &Library, group: AlbumGroup) -> Option<AlbumSection> {
         cover_song,
         tracks,
     })
+}
+
+/// The artist line for an album: every artist credited on its tracks, deduped
+/// and in credit order — or "Several Artists" once more than a handful share
+/// the bill, so the line stays a line.
+fn album_artists(songs: &[&SongMetadata]) -> String {
+    let mut seen = std::collections::BTreeSet::new();
+    let mut artists: Vec<&str> = Vec::new();
+    for song in songs {
+        for artist in &song.artists {
+            if seen.insert(artist.clone()) {
+                artists.push(artist);
+            }
+        }
+    }
+    if artists.len() > 5 {
+        "Several Artists".to_string()
+    } else {
+        artists.join(", ")
+    }
 }
 
 /// The artist line for a custom playlist: the one artist every track credits,
