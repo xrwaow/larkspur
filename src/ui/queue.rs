@@ -172,6 +172,7 @@ impl QueueView {
             year: String::new(),
             date: None,
             cover_song: None,
+            row_covers: false,
             tracks,
         }
     }

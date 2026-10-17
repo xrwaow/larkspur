@@ -120,6 +120,10 @@ pub struct AlbumSection {
     pub date: Option<ReleaseDate>,
     /// The song whose cover represents the album.
     pub cover_song: Option<SongId>,
+    /// Rows carry their own song's cover — the playlists whose tracks can
+    /// each have different art (custom and smart playlists). Albums draw one
+    /// cover in the header instead.
+    pub row_covers: bool,
     pub tracks: Vec<TrackRow>,
 }
 
@@ -138,12 +142,21 @@ fn section(library: &Library, group: AlbumGroup) -> Option<AlbumSection> {
     let playlist = library.playlist(group.playlist)?;
     let songs: Vec<&SongMetadata> = group.songs.iter().filter_map(|id| library.get(*id)).collect();
 
+    // An album's row keeps the song's own track number (its position in the
+    // album, falling back to the row order); a custom or smart playlist
+    // numbers by position in the playlist — the song's album number would
+    // jump around.
+    let album_numbering = playlist.is_auto();
     let tracks = songs
         .iter()
         .enumerate()
         .map(|(index, song)| TrackRow {
             song: song.id,
-            number: song.track_position.map(usize::from).unwrap_or(index + 1),
+            number: if album_numbering {
+                song.track_position.map(usize::from).unwrap_or(index + 1)
+            } else {
+                index + 1
+            },
             title: song.display_title(),
             artist: song.artists.join(", "),
             duration: format_duration(song.duration).into(),
@@ -192,6 +205,9 @@ fn section(library: &Library, group: AlbumGroup) -> Option<AlbumSection> {
         year: date.map(|date| date.year().to_string()).unwrap_or_default(),
         date,
         cover_song,
+        // Anything that isn't an autogen album — custom and smart playlists —
+        // can hold songs with different covers, so its rows carry their own.
+        row_covers: !playlist.is_auto(),
         tracks,
     })
 }
@@ -594,8 +610,7 @@ pub fn render_item<V: Render + 'static>(
         ListItem::Compact(_) => Some((&section.tracks[0], 0)),
         ListItem::Track { index, .. } => Some((&section.tracks[index], index)),
     }) else {
-        request_cover(context.covers, context.library, section.cover_song, cx);
-        let cover = context.covers.read(cx).cover_of(section.cover_song);
+        let cover = header_cover(context, section, cx);
         return album_header(context.theme, section, cover);
     };
 
@@ -678,11 +693,18 @@ pub fn render_item<V: Render + 'static>(
             on_press,
         )
     } else {
+        // A custom or smart playlist's row carries its own song's cover; a
+        // track of an album doesn't (the header holds the cover).
+        let row_cover = (section.row_covers && !context.slim).then(|| {
+            request_cover(context.covers, context.library, Some(song), cx);
+            context.covers.read(cx).cover_of(Some(song))
+        }).flatten();
         track_row(
             &paint,
             track,
             index,
             columns,
+            row_cover,
             on_click,
             on_right_click,
             on_hover,
@@ -711,9 +733,55 @@ fn request_cover<V: Render + 'static>(
     }
 }
 
+/// The cover an album header draws: a single cover for an album, or — for a
+/// custom or smart playlist — a 2×2 mosaic of its first four songs' covers,
+/// with the default placeholder in any slot left over.
+fn header_cover<V: Render + 'static>(
+    context: &RowContext,
+    section: &AlbumSection,
+    cx: &mut Context<V>,
+) -> AnyElement {
+    if !section.row_covers {
+        request_cover(context.covers, context.library, section.cover_song, cx);
+        let cover = context.covers.read(cx).cover_of(section.cover_song);
+        return thumbnail(context.theme, cover, THUMB_PX);
+    }
+    let mut cells: Vec<Option<SongId>> =
+        section.tracks.iter().take(4).map(|track| Some(track.song)).collect();
+    cells.resize(4, None);
+    for song in cells.iter().flatten() {
+        request_cover(context.covers, context.library, Some(*song), cx);
+    }
+    let covers: Vec<Option<CoverImage>> = cells
+        .into_iter()
+        .map(|song| context.covers.read(cx).cover_of(song))
+        .collect();
+    cover_mosaic(context.theme, &covers, THUMB_PX)
+}
+
+/// A 2×2 mosaic of covers at `size`, empty slots showing the default
+/// placeholder — the same one a missing single cover shows.
+fn cover_mosaic(theme: Theme, covers: &[Option<CoverImage>], size: f32) -> AnyElement {
+    let cell = size / 2.0;
+    div()
+        .size(px(size))
+        .flex_none()
+        .flex()
+        .flex_wrap()
+        .children(
+            covers
+                .iter()
+                .take(4)
+                .chain(std::iter::repeat(&None))
+                .take(4)
+                .map(|cover| thumbnail(theme, cover.clone(), cell)),
+        )
+        .into_any_element()
+}
+
 /// An album's header: thumbnail, artist, title with the year right-aligned on
 /// the same line (same size and colour as the title), meta line.
-pub fn album_header(theme: Theme, section: &AlbumSection, cover: Option<CoverImage>) -> AnyElement {
+pub fn album_header(theme: Theme, section: &AlbumSection, cover: AnyElement) -> AnyElement {
     div()
         .w_full()
         .flex()
@@ -722,7 +790,7 @@ pub fn album_header(theme: Theme, section: &AlbumSection, cover: Option<CoverIma
         .px_4()
         .pt_4()
         .pb_2()
-        .child(thumbnail(theme, cover, THUMB_PX))
+        .child(cover)
         .child(
             div()
                 .flex_1()
@@ -834,14 +902,16 @@ fn compact_row(
         .into_any_element()
 }
 
-/// One track row: number (or the playing row's equalizer), title, artist,
-/// bitrate, duration. The playing row is drawn in the accent colour.
+/// One track row: number (or the playing row's equalizer), then — when the
+/// section sets `cover` — the song's cover, then title, artist, bitrate,
+/// duration. The playing row is drawn in the accent colour.
 #[allow(clippy::too_many_arguments)]
 fn track_row(
     paint: &RowPaint,
     track: &TrackRow,
     index: usize,
     columns: &Columns,
+    cover: Option<CoverImage>,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
     on_right_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
     on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
@@ -881,6 +951,7 @@ fn track_row(
         } else {
             number_cell(theme, track.number)
         })
+        .children(cover.map(|cover| thumbnail(theme, Some(cover), theme.num_col())))
         .child(title_cell(
             theme,
             track,
@@ -1418,6 +1489,7 @@ mod tests {
             playlist: PlaylistId(0),
             artist: String::new(),
             album: String::new(),
+            row_covers: false,
             meta: String::new(),
             year: String::new(),
             date: None,

@@ -227,13 +227,19 @@ impl PlaylistsView {
     /// same way, with no per-caller patching.
     fn label_bits(
         &mut self,
+        theme: Theme,
+        window: &Window,
         key: u64,
         label: &str,
         advance: f32,
         cx: &mut Context<Self>,
     ) -> LabelBits {
         let chars = label.chars().count().min(RAIL_MAX_CHARS);
-        let width = advance * chars.max(1) as f32;
+        // The count-based width assumes a monospace font; a proportional one
+        // (or a leading glyph) renders the label wider and would clip its
+        // last letter, so the cell is at least as wide as the shaped text.
+        let width = (advance * chars.max(1) as f32)
+            .max(marquee::text_width(window, theme, label, theme.cell_px()));
         let travel = marquee::travel_for(label, width, chars);
         let state = *self.marquees.entry(key).or_default();
         let on_region = cx.listener(move |this, hovered: &bool, _window, cx| {
@@ -440,7 +446,7 @@ impl PlaylistsView {
                     .into_any_element()
             }
             RailRow::NewPlaylist => {
-                let bits = self.label_bits(key, "+  New Playlist", advance, cx);
+                let bits = self.label_bits(theme, window, key, "+  New Playlist", advance, cx);
                 rail_row(
                     theme,
                     ("new-playlist", 0u64),
@@ -471,7 +477,7 @@ impl PlaylistsView {
                 // is no right-click menu — smart lists are views, not content.
                 let id = *id;
                 let label = format!("{glyph} {title}");
-                let bits = self.label_bits(key, &label, advance, cx);
+                let bits = self.label_bits(theme, window, key, &label, advance, cx);
                 rail_row(
                     theme,
                     ("smart-row", id.0),
@@ -498,7 +504,7 @@ impl PlaylistsView {
                     RailRow::Album(_) => ("album", 0),
                     _ => ("discography", 1),
                 };
-                let bits = self.label_bits(key, &row.title, advance, cx);
+                let bits = self.label_bits(theme, window, key, &row.title, advance, cx);
                 let row_el = rail_row(
                     theme,
                     (name, id.0),
@@ -553,7 +559,7 @@ impl PlaylistsView {
             }
             RailRow::Artist { index, name, expanded } => {
                 let toggled = name.clone();
-                let bits = self.label_bits(key, name, advance, cx);
+                let bits = self.label_bits(theme, window, key, name, advance, cx);
                 rail_row(
                     theme,
                     ("artist", *index as u64),
@@ -583,7 +589,7 @@ impl PlaylistsView {
                     Some(name) if *depth > 0 => name.to_string_lossy().to_string(),
                     _ => path.display().to_string(),
                 };
-                let bits = self.label_bits(key, &label, advance, cx);
+                let bits = self.label_bits(theme, window, key, &label, advance, cx);
                 let row_el = rail_row(
                     theme,
                     ("folder", path_hash(path)),
