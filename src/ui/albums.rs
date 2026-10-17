@@ -24,7 +24,7 @@ use crate::model::search::AlbumGroup;
 use crate::model::{Library, PlaylistId, ReleaseDate, SongId, SongMetadata};
 use crate::ui::cover_store::{CoverImage, CoverStore};
 use crate::ui::drag::{self, DragInfo};
-use crate::ui::format::{format_bitrate, format_duration};
+use crate::ui::format::{format_bitrate, format_duration, format_secs};
 use crate::ui::library_state::LibraryState;
 use crate::ui::marquee;
 use crate::ui::row_list::{Cell, Highlight};
@@ -157,31 +157,31 @@ fn section(library: &Library, group: AlbumGroup) -> Option<AlbumSection> {
     // custom playlist spans arbitrary tracks, so one would mislead.
     let custom = playlist.is_custom();
     let date = if custom { None } else { songs.iter().find_map(|song| song.date) };
-    let (artist, meta, cover_song) = match songs.first() {
-        Some(first) => {
-            let total_secs: u64 = songs.iter().map(|song| song.duration.as_secs()).sum();
-            (
-                // A custom playlist lists whatever the user put in it: the one
-                // shared artist when every track agrees, else "Various Artists".
-                // An album lists every artist credited on its tracks; when more
-                // than a handful share the bill, that collapses to a phrase.
-                if custom {
-                    custom_artist(&songs)
-                } else {
-                    album_artists(&songs)
-                },
-                album_meta(songs.len(), total_secs),
-                // An explicit cover wins; otherwise the first song's — so a
-                // custom playlist borrows its first track's art until custom
-                // covers land.
-                playlist.cover().or(Some(first.id)),
-            )
-        }
-        None => (
-            playlist.artist().unwrap_or_default().to_string(),
-            "0 Tracks".to_string(),
-            playlist.cover(),
+
+    // The meta line describes the playlist as a whole — every song in it, not
+    // just the ones a search section lists.
+    let all: Vec<&SongMetadata> =
+        playlist.song_ids.iter().filter_map(|id| library.get(*id)).collect();
+    let total_secs: u64 = all.iter().map(|song| song.duration.as_secs()).sum();
+    let meta = album_meta(all.len(), total_secs);
+
+    let (artist, cover_song) = match songs.first() {
+        Some(first) => (
+            // A custom playlist lists whatever the user put in it: the one
+            // shared artist when every track agrees, else "Various Artists".
+            // An album lists every artist credited on its tracks; when more
+            // than a handful share the bill, that collapses to a phrase.
+            if custom {
+                custom_artist(&songs)
+            } else {
+                album_artists(&songs)
+            },
+            // An explicit cover wins; otherwise the first song's — so a
+            // custom playlist borrows its first track's art until custom
+            // covers land.
+            playlist.cover().or(Some(first.id)),
         ),
+        None => (playlist.artist().unwrap_or_default().to_string(), playlist.cover()),
     };
 
     Some(AlbumSection {
@@ -228,22 +228,23 @@ fn custom_artist(songs: &[&SongMetadata]) -> String {
     }
 }
 
-/// The `N Tracks | …min` line under an album title.
+/// The `N Tracks | m:ss` line under an album title.
 ///
 /// The file format and the album-level bitrate are deliberately left out: the
 /// bitrate that matters is per *song* (and live while it plays), and it's shown
 /// on each row in the same format either way.
 fn album_meta(tracks: usize, total_secs: u64) -> String {
-    // Total minutes only: an hour-plus album reads `61min`, not `1:01:02min`.
-    format!("{tracks} Tracks | {}min", total_secs / 60)
+    let tracks = if tracks == 1 { "1 Track".to_string() } else { format!("{tracks} Tracks") };
+    format!("{tracks} | {}", format_secs(total_secs))
 }
 
 /// One drawable row of an album list.
 #[derive(Clone, Copy)]
 pub enum ListItem {
-    /// An album header (a section with more than one track).
+    /// An album header.
     Header(usize),
-    /// A one-track section, collapsed into a single row.
+    /// A one-track section, collapsed into a single row — the search panel's
+    /// rendering of a single.
     Compact(usize),
     /// Track `index` of section `section`.
     Track { section: usize, index: usize },
@@ -259,13 +260,26 @@ impl ListItem {
     }
 }
 
-/// Flatten sections into drawable rows, preserving album structure.
+/// Flatten sections into drawable rows, preserving album structure. A
+/// one-track album — a single — draws like any other album: a header plus its
+/// one track row.
 pub fn flatten(sections: &[AlbumSection]) -> Vec<ListItem> {
+    flatten_with(sections, false)
+}
+
+/// Flatten sections the search panel's way: a one-track section — an album
+/// whose one song matched, or a true single — collapses into a single row
+/// carrying its cover.
+pub fn flatten_search(sections: &[AlbumSection]) -> Vec<ListItem> {
+    flatten_with(sections, true)
+}
+
+fn flatten_with(sections: &[AlbumSection], compact_singles: bool) -> Vec<ListItem> {
     let mut items = Vec::new();
     for (section, data) in sections.iter().enumerate() {
         if data.tracks.is_empty() {
             items.push(ListItem::Header(section));
-        } else if data.tracks.len() == 1 {
+        } else if compact_singles && data.tracks.len() == 1 {
             items.push(ListItem::Compact(section));
         } else {
             items.push(ListItem::Header(section));
@@ -1428,7 +1442,25 @@ mod tests {
         let items = flatten(&sections);
 
         // A 2-track album is a header plus two rows; an empty one is just a
-        // header; a one-track album collapses to a single compact row.
+        // header; a one-track album — a single — draws like any other album:
+        // a header plus its one row.
+        assert_eq!(items.len(), 6);
+        assert!(matches!(items[0], ListItem::Header(0)));
+        assert!(matches!(items[1], ListItem::Track { section: 0, index: 0 }));
+        assert!(matches!(items[2], ListItem::Track { section: 0, index: 1 }));
+        assert!(matches!(items[3], ListItem::Header(1)));
+        assert!(matches!(items[4], ListItem::Header(2)));
+        assert!(matches!(items[5], ListItem::Track { section: 2, index: 0 }));
+    }
+
+    #[test]
+    fn flatten_search_collapses_singles() {
+        let sections =
+            vec![section_with_tracks(2), section_with_tracks(0), section_with_tracks(1)];
+        let items = flatten_search(&sections);
+
+        // Search keeps the compact single: the one-track section collapses
+        // into a single row carrying its cover.
         assert_eq!(items.len(), 5);
         assert!(matches!(items[0], ListItem::Header(0)));
         assert!(matches!(items[1], ListItem::Track { section: 0, index: 0 }));
@@ -1453,7 +1485,7 @@ mod tests {
     #[test]
     fn row_of_song_finds_the_playing_row() {
         let sections = vec![section_with_tracks(2), section_with_tracks(1)];
-        let items = flatten(&sections); // Header, T0, T1, Compact
+        let items = flatten_search(&sections); // Header, T0, T1, Compact
         assert_eq!(row_of_song(&items, &sections, 1), Some(2));
         assert_eq!(row_of_song(&items, &sections, 0), Some(1), "first match wins");
         assert_eq!(row_of_song(&items, &sections, 9), None);

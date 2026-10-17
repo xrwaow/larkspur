@@ -226,6 +226,9 @@ pub struct RowList {
     /// Flat mode: sections flatten to track rows only, no album headers — the
     /// queue panel's list, where every entry is a song.
     flat: bool,
+    /// Collapse one-track sections into single compact rows — the search
+    /// panel's singles. Off by default: a single draws like any other album.
+    compact_singles: bool,
     /// The title/artist column character counts a flat list was asked to size
     /// to (its panel's width, not the tables' fixed 48).
     title_chars: usize,
@@ -261,6 +264,7 @@ impl RowList {
             dirty: true,
             measured_at: 0.0,
             flat: false,
+            compact_singles: false,
             title_chars: MAX_TITLE_CHARS,
             artist_chars: MAX_ARTIST_CHARS,
             columns_stale: false,
@@ -280,6 +284,13 @@ impl RowList {
     /// Flatten to track rows only — no album headers. The queue panel's list.
     pub fn set_flat(&mut self) {
         self.flat = true;
+        self.mark_dirty();
+    }
+
+    /// Collapse one-track sections into single compact rows — the search
+    /// panel's rendering of a single.
+    pub fn set_compact_singles(&mut self) {
+        self.compact_singles = true;
         self.mark_dirty();
     }
 
@@ -336,6 +347,8 @@ impl RowList {
     fn rebuild_rows(&mut self, theme: Theme, window: &Window) {
         let items = if self.flat {
             albums::flatten_tracks(&self.sections)
+        } else if self.compact_singles {
+            albums::flatten_search(&self.sections)
         } else {
             albums::flatten(&self.sections)
         };

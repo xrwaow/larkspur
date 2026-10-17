@@ -8,14 +8,11 @@ pub fn format_bitrate(bps: u32) -> String {
     format!("{} kb/s", (bps as f64 / 1000.0).round() as u32)
 }
 
-/// `m:ss`, or `h:mm:ss` past an hour.
+/// `m:ss` — minutes run past 59 rather than switching to hours, so two hours
+/// reads `119:21`.
 pub fn format_secs(secs: u64) -> String {
-    let (hours, minutes, seconds) = (secs / 3600, (secs % 3600) / 60, secs % 60);
-    if hours > 0 {
-        format!("{hours}:{minutes:02}:{seconds:02}")
-    } else {
-        format!("{minutes}:{seconds:02}")
-    }
+    let (minutes, seconds) = (secs / 60, secs % 60);
+    format!("{minutes}:{seconds:02}")
 }
 
 pub fn format_duration(duration: Duration) -> String {
