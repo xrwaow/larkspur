@@ -78,6 +78,14 @@ pub fn blend(from: Rgba, to: Rgba, t: f32) -> Rgba {
     }
 }
 
+/// Dim `color` by `amount` (`0.0` unchanged, `1.0` fully `background`) by
+/// blending it toward the surface behind it. Used to fade lyrics lines into the
+/// panel as they get further from the one being sung, in either theme (dark text
+/// on light surfaces gets lighter as it dims, light on dark gets darker).
+pub fn dim(color: Rgba, background: Rgba, amount: f32) -> Rgba {
+    blend(color, background, amount)
+}
+
 /// Which edge of a container an [`edge_fade`] sits against.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Side {

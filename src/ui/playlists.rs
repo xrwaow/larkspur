@@ -37,14 +37,15 @@ use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::input::action_for_key;
 use crate::ui::library_state::{subdirs, LibraryState, Request};
+use crate::ui::animation::Animator;
 use crate::ui::menu::{context_menu, MenuHandler};
 use crate::ui::marquee::{self, Marquee};
+use crate::ui::playback::icon;
 use crate::ui::row_list::OVERDRAW_PX;
 use crate::ui::tabs::TabsView;
 use crate::ui::text_field::TextField;
 use crate::ui::theme::Theme;
-use crate::ui::animation::Animator;
-use crate::ui::widgets::{empty_hint, panel_header, search_box, section_header};
+use crate::ui::widgets::{empty_hint, panel_header, search_box};
 
 /// The most characters a rail label shows before its text fades and slides.
 const RAIL_MAX_CHARS: usize = 24;
@@ -84,6 +85,39 @@ enum MenuTarget {
 enum RailFilter {
     Albums,
     Artists,
+}
+
+/// The rail's collapsible sections. `Library` wraps Albums, Artists and
+/// Folders; `Playlists` wraps the smart and custom playlists.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Group {
+    Library,
+    Albums,
+    Artists,
+    Folders,
+    Playlists,
+}
+
+impl Group {
+    fn label(self) -> &'static str {
+        match self {
+            Group::Library => "Your Library",
+            Group::Albums => "Albums",
+            Group::Artists => "Artists",
+            Group::Folders => "Folders",
+            Group::Playlists => "Playlists",
+        }
+    }
+
+    fn hash_key(self) -> u64 {
+        match self {
+            Group::Library => 0,
+            Group::Albums => 1,
+            Group::Artists => 2,
+            Group::Folders => 3,
+            Group::Playlists => 4,
+        }
+    }
 }
 
 /// One filterable group's search box: the field, its focus handle, whether the
@@ -127,6 +161,11 @@ pub struct PlaylistsView {
     /// The synced-path list for the folder view lives here.
     config: Entity<ConfigState>,
     themed: Themed,
+    /// Whether "Your Library" (the Albums/Artists/Folders wrapper) and the
+    /// "Playlists" section are unfolded. Both start open so the rail's
+    /// contents are visible at launch.
+    library_open: bool,
+    playlists_open: bool,
     /// Whether the Folder View group is expanded (folded shut at launch). The
     /// Albums and Artists groups' folds live in their [`GroupFilter`]s — a
     /// filter overrides the fold, so a search reveals what it's hiding.
@@ -187,6 +226,8 @@ impl PlaylistsView {
             tabs,
             config,
             themed,
+            library_open: true,
+            playlists_open: true,
             folder_open: false,
             open_dirs: HashSet::new(),
             album_filter: GroupFilter::new("Filter albums…", None, cx),
@@ -308,75 +349,100 @@ impl PlaylistsView {
             .filter(|p| !p.is_custom() && album_matches(p.title()))
             .map(|p| row_of(p))
             .collect();
-        rows.push(RailRow::GroupHeader { label: "Albums", open: self.album_filter.showing() });
-        if self.album_filter.showing() {
-            rows.push(RailRow::FilterBox(RailFilter::Albums));
-            if !album_query.is_empty() && albums.is_empty() {
-                rows.push(RailRow::NoMatches);
+        // "Your Library" wraps the three library groups; folding it hides
+        // them all. Its children are indented one level under the header.
+        rows.push(RailRow::GroupHeader { group: Group::Library, open: self.library_open, depth: 0 });
+        if self.library_open {
+            rows.push(RailRow::GroupHeader {
+                group: Group::Albums,
+                open: self.album_filter.showing(),
+                depth: 1,
+            });
+            if self.album_filter.showing() {
+                rows.push(RailRow::FilterBox(RailFilter::Albums));
+                if !album_query.is_empty() && albums.is_empty() {
+                    rows.push(RailRow::NoMatches);
+                }
+                rows.extend(albums.into_iter().map(RailRow::Album));
             }
-            rows.extend(albums.into_iter().map(RailRow::Album));
-        }
 
-        rows.push(RailRow::GroupHeader { label: "Artists", open: self.artist_filter.showing() });
-        if self.artist_filter.showing() {
-            rows.push(RailRow::FilterBox(RailFilter::Artists));
-            let all_artists = lib.artists();
-            let artists: Vec<&str> = all_artists
-                .iter()
-                .map(String::as_str)
-                .filter(|name| artist_matches(name))
-                .collect();
-            if !artist_query.is_empty() && artists.is_empty() {
-                rows.push(RailRow::NoMatches);
+            rows.push(RailRow::GroupHeader {
+                group: Group::Artists,
+                open: self.artist_filter.showing(),
+                depth: 1,
+            });
+            if self.artist_filter.showing() {
+                rows.push(RailRow::FilterBox(RailFilter::Artists));
+                let all_artists = lib.artists();
+                let artists: Vec<&str> = all_artists
+                    .iter()
+                    .map(String::as_str)
+                    .filter(|name| artist_matches(name))
+                    .collect();
+                if !artist_query.is_empty() && artists.is_empty() {
+                    rows.push(RailRow::NoMatches);
+                }
+                for (index, artist) in artists.into_iter().enumerate() {
+                    let expanded = self.expanded_artists.contains(artist);
+                    rows.push(RailRow::Artist { index, name: artist.to_string(), expanded });
+                    if expanded {
+                        rows.extend(
+                            lib.discography(artist)
+                                .into_iter()
+                                .filter_map(|id| lib.playlist(id))
+                                .filter(|p| artist_matches(p.title()))
+                                .map(|p| RailRow::Discography(row_of(p))),
+                        );
+                    }
+                }
             }
-            for (index, artist) in artists.into_iter().enumerate() {
-                let expanded = self.expanded_artists.contains(artist);
-                rows.push(RailRow::Artist { index, name: artist.to_string(), expanded });
-                if expanded {
-                    rows.extend(
-                        lib.discography(artist)
-                            .into_iter()
-                            .filter_map(|id| lib.playlist(id))
-                            .filter(|p| artist_matches(p.title()))
-                            .map(|p| RailRow::Discography(row_of(p))),
-                    );
+
+            // The folder view mirrors the synced directories on disk. It
+            // ignores the filter (that one is for albums and artists) and
+            // reads the filesystem only for the subtrees actually expanded.
+            rows.push(RailRow::GroupHeader {
+                group: Group::Folders,
+                open: self.folder_open,
+                depth: 1,
+            });
+            if self.folder_open {
+                for root in self.config.read(cx).roots() {
+                    push_folder_tree(&mut rows, root, 0, &self.open_dirs);
                 }
             }
         }
 
-        // The folder view mirrors the synced directories on disk. It ignores
-        // the filter (that one is for albums and artists) and reads the
-        // filesystem only for the subtrees actually expanded.
-        rows.push(RailRow::GroupHeader { label: "Folders", open: self.folder_open });
-        if self.folder_open {
-            for root in self.config.read(cx).roots() {
-                push_folder_tree(&mut rows, root, 0, &self.open_dirs);
+        // The Playlists section: the built-in smart lists (views over the song
+        // stats — no rename, no delete), then the user's custom playlists.
+        rows.push(RailRow::GroupHeader {
+            group: Group::Playlists,
+            open: self.playlists_open,
+            depth: 0,
+        });
+        if self.playlists_open {
+            for (kind, glyph) in [
+                (SmartKind::RecentlyAdded, "✦"),
+                (SmartKind::RecentlyPlayed, "↻"),
+                (SmartKind::MostPlayed, "▲"),
+            ] {
+                if let Some(p) =
+                    lib.smart_playlists().iter().find(|p| p.kind == PlaylistKind::Smart(kind))
+                {
+                    rows.push(RailRow::Smart { id: p.id, glyph, title: kind.title() });
+                }
             }
-        }
-
-        // Below the groups: the built-in smart playlists, then the user's.
-        // Smart lists are views over the song stats — no rename, no delete.
-        rows.push(RailRow::Header("Playlists"));
-        for (kind, glyph) in [
-            (SmartKind::RecentlyAdded, "✦"),
-            (SmartKind::RecentlyPlayed, "↻"),
-            (SmartKind::MostPlayed, "▲"),
-        ] {
-            if let Some(p) = lib.smart_playlists().iter().find(|p| p.kind == PlaylistKind::Smart(kind)) {
-                rows.push(RailRow::Smart { id: p.id, glyph, title: kind.title() });
+            rows.push(RailRow::NewPlaylist);
+            let custom = lib.custom_playlists();
+            if custom.is_empty() {
+                rows.push(RailRow::NoCustom);
             }
-        }
-        rows.push(RailRow::NewPlaylist);
-        let custom = lib.custom_playlists();
-        if custom.is_empty() {
-            rows.push(RailRow::NoCustom);
-        }
-        for playlist in custom {
-            // The row being renamed shows an editable field instead of a label.
-            if self.renaming.as_ref().is_some_and(|(id, _, _)| *id == playlist.id) {
-                rows.push(RailRow::Rename);
-            } else {
-                rows.push(RailRow::Custom(row_of(playlist)));
+            for playlist in custom {
+                // The row being renamed shows an editable field instead of a label.
+                if self.renaming.as_ref().is_some_and(|(id, _, _)| *id == playlist.id) {
+                    rows.push(RailRow::Rename);
+                } else {
+                    rows.push(RailRow::Custom(row_of(playlist)));
+                }
             }
         }
 
@@ -400,49 +466,46 @@ impl PlaylistsView {
         // all have a key.
         let key = row_key(kind).unwrap_or(0);
         match kind {
-            RailRow::Header(label) => section_header(theme, label),
-            RailRow::GroupHeader { label, open } => {
-                let toggled = *label;
-                let group = match toggled {
-                    "Albums" => 0u64,
-                    "Artists" => 1u64,
-                    _ => 2u64,
-                };
+            RailRow::GroupHeader { group, open, depth } => {
+                let group = *group;
+                let open = *open;
+                let depth = *depth;
                 div()
-                    .id(("group-header", group))
+                    .id(("group-header", group.hash_key()))
                     .flex()
                     .items_center()
-                    .gap_1()
-                    .px_2()
-                    .pt_2()
-                    .pb_1()
+                    .justify_between()
+                    .w_full()
+                    .h(px(32.0))
+                    .mt(px(if depth == 0 { 8.0 } else { 0.0 }))
+                    .pl(px(8.0 + depth as f32 * 14.0))
+                    .pr_2()
                     .rounded_md()
                     .cursor_pointer()
                     .hover(|d| d.bg(theme.row_hover))
                     .on_click(cx.listener(move |this, _event, _window, cx| {
-                        match toggled {
-                            "Albums" => this.album_filter.open = !this.album_filter.open,
-                            "Artists" => this.artist_filter.open = !this.artist_filter.open,
-                            _ => this.folder_open = !this.folder_open,
+                        match group {
+                            Group::Library => this.library_open = !this.library_open,
+                            Group::Albums => this.album_filter.open = !this.album_filter.open,
+                            Group::Artists => this.artist_filter.open = !this.artist_filter.open,
+                            Group::Folders => this.folder_open = !this.folder_open,
+                            Group::Playlists => this.playlists_open = !this.playlists_open,
                         }
                         this.dirty = true;
                         cx.notify();
                     }))
                     .child(
                         div()
-                            .text_size(px(theme.small_px()))
-                            .text_color(theme.text_faint)
-                            // Uppercase, so the group labels read like the
-                            // PLAYLISTS section header below them.
-                            .child(toggled.to_uppercase()),
+                            .text_size(px(theme.cell_px()))
+                            .text_color(if depth == 0 { theme.text } else { theme.text_muted })
+                            .child(group.label()),
                     )
-                    .child(
-                        div()
-                            .flex_none()
-                            .text_size(px(theme.small_px()))
-                            .text_color(theme.text_faint)
-                            .child(if *open { "▾" } else { "▸" }),
-                    )
+                    .child(icon(
+                        14.0,
+                        14.0,
+                        if open { CHEVRON_DOWN_POLYGONS } else { CHEVRON_RIGHT_POLYGONS },
+                        theme.text_faint,
+                    ))
                     .into_any_element()
             }
             RailRow::NewPlaylist => {
@@ -675,10 +738,9 @@ struct Row {
 /// rebuilds happening elsewhere.
 #[derive(PartialEq)]
 enum RailRow {
-    Header(&'static str),
-    /// A collapsible group header (Albums, Artists, Folder View): `open` draws
-    /// the arrow.
-    GroupHeader { label: &'static str, open: bool },
+    /// A collapsible section header. `group` decides what it folds and
+    /// `depth` indents the nested library groups under "Your Library".
+    GroupHeader { group: Group, open: bool, depth: usize },
     NewPlaylist,
     /// The "no custom playlists" hint.
     NoCustom,
@@ -964,7 +1026,8 @@ fn rail_row(
     // The fade dissolves the text into whatever the row's background is, so
     // both come from the same `wash`: the plain rail, or the hover wash while
     // the pointer is over the row.
-    let background = marquee::wash(theme.rail_bg, theme.row_hover, bits.state.is_region_hovered());
+    let base = if active { theme.row_active } else { theme.rail_bg };
+    let background = marquee::wash(base, theme.row_hover, bits.state.is_region_hovered());
     div()
         .id(id.into())
         .flex()
@@ -991,7 +1054,7 @@ fn rail_row(
                 .flex()
                 .items_center()
                 .justify_between()
-                .py_1()
+                .h(px(30.0))
                 .child(
                     div()
                         .flex_1()
@@ -1013,6 +1076,7 @@ fn rail_row(
                     d.child(
                         div()
                             .flex_none()
+                            .ml_2()
                             .text_size(px(theme.small_px()))
                             .text_color(theme.text_faint)
                             .child(count.to_string()),
@@ -1030,6 +1094,26 @@ enum Branch {
     Line,
     Toggle(bool),
 }
+
+/// The section chevrons, painted from unit-square polygons (the same way the
+/// transport icons are) so they stay crisp and identical whatever the font
+/// does. A down caret when a section is open, a right caret when folded.
+const CHEVRON_DOWN_POLYGONS: &[&[(f32, f32)]] = &[&[
+    (0.0, 0.28),
+    (0.5, 0.78),
+    (1.0, 0.28),
+    (1.0, 0.44),
+    (0.5, 0.94),
+    (0.0, 0.44),
+]];
+const CHEVRON_RIGHT_POLYGONS: &[&[(f32, f32)]] = &[&[
+    (0.28, 0.0),
+    (0.78, 0.5),
+    (0.28, 1.0),
+    (0.44, 1.0),
+    (0.94, 0.5),
+    (0.44, 0.0),
+]];
 
 /// The expand chevron: a small triangle painted over its guide line — right
 /// when folded, down when open — instead of a text glyph, so it stays glued

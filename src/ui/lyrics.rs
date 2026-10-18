@@ -27,8 +27,8 @@
 use std::time::Duration;
 
 use gpui::{
-    div, prelude::*, px, relative, AnyElement, ClickEvent, Context, Entity, Render, Subscription,
-    Window,
+    div, prelude::*, px, relative, AnyElement, ClickEvent, Context, Entity, Render, Rgba,
+    Subscription, Window,
 };
 
 use crate::model::{LyricLine, Lyrics, SongId};
@@ -41,11 +41,20 @@ use crate::ui::queue::QueueView;
 use crate::ui::cover_store::CoverStore;
 use crate::ui::library_state::LibraryState;
 use crate::ui::theme::Theme;
-use crate::ui::widgets::{blend, edge_fade, empty_hint, Side};
+use crate::ui::widgets::{blend, dim, edge_fade, empty_hint, Side};
 
 /// How long the lyric stack takes to slide to a new line — and therefore how
 /// far *before* a line's timestamp the slide starts, so it lands on time.
 const TRANSITION_SECS: f32 = 0.20;
+
+/// How much each line further from the sung one dims toward the panel
+/// background. The line right next to the sung one keeps full colour, then each
+/// line out drops 20%, 40%, ... of its colour.
+const DIM_STEP: f32 = 0.20;
+
+/// Far lines stop dimming here so they never bleed completely into the panel —
+/// their shape still reads as text, just barely.
+const DIM_MAX: f32 = 0.80;
 
 /// A slide further than this many lines (a seek) snaps instead of scrolling.
 const SNAP_LINES: f32 = 5.0;
@@ -244,13 +253,31 @@ impl Render for LyricsView {
                 }))
                 .into_any_element(),
             Some(Lyrics::Synced(lines)) if !lines.is_empty() => {
+                // Dim relative to the line actually being sung, not the anchor:
+                // the anchor leads the slide, but the highlighted line is what
+                // the eye calls "current". `progress` carries that line toward
+                // the next one over the same window the highlight crossfades, so
+                // the whole stack breathes in and out rather than snapping dim
+                // levels on each stamp.
+                let current = current_line(lines, position);
+                let progress = transition_progress(lines, current, position, transition);
                 let line = |index: usize, cx: &Context<Self>| -> AnyElement {
                     let timestamp = lines[index].timestamp;
+                    let resting = dim(
+                        theme.text_faint,
+                        theme.rail_bg,
+                        dim_amount(index, current, progress),
+                    );
+                    let color = blend(
+                        resting,
+                        theme.accent,
+                        highlight_amount(lines, index, position, transition),
+                    );
                     synced_line(
                         theme,
                         index,
                         &lines[index].text,
-                        highlight_amount(lines, index, position, transition),
+                        color,
                         cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                             this.state.update(cx, |state, cx| {
                                 state.seek_to(timestamp);
@@ -412,6 +439,46 @@ fn anchor_at(lines: &[LyricLine], position: Duration, transition: Duration) -> u
         .unwrap_or(0)
 }
 
+/// The line being sung at `position` — the last one whose stamp has passed.
+/// Unlike [`anchor_at`] this does **not** lead the slide: it tracks the actual
+/// highlight, which is what the dimming is measured outward from.
+fn current_line(lines: &[LyricLine], position: Duration) -> usize {
+    lines
+        .iter()
+        .rposition(|line| line.timestamp <= position)
+        .unwrap_or(0)
+}
+
+/// How far the sung line has travelled toward the next one at `position`, as
+/// 0..1 over the same second-half window [`highlight_amount`] uses. This is what
+/// lets the dim levels change gradually instead of stepping on each timestamp:
+/// `current + progress` is the continuously moving "now" the dimming measures
+/// distance from.
+fn transition_progress(
+    lines: &[LyricLine],
+    current: usize,
+    position: Duration,
+    transition: Duration,
+) -> f32 {
+    let half = transition / 2;
+    lines
+        .get(current + 1)
+        .map(|next| ramp(position, next.timestamp.saturating_sub(half), next.timestamp))
+        .unwrap_or(0.0)
+}
+
+/// How far to dim the line at `index`, given the sung line at `current` and how
+/// far it has moved toward the next (`progress`, 0..1), as a fraction of its
+/// colour toward the background. The sung line and its immediate neighbours are
+/// undimmed; from there each line out dims another [`DIM_STEP`], capped at
+/// [`DIM_MAX`] so far lines don't disappear entirely.
+fn dim_amount(index: usize, current: usize, progress: f32) -> f32 {
+    let now = current as f32 + progress.clamp(0.0, 1.0);
+    let distance = (index as f32 - now).abs();
+    let steps = (distance - 1.0).max(0.0);
+    (steps * DIM_STEP).min(DIM_MAX)
+}
+
 /// How strongly the line at `index` is highlighted at `position`, as 0..1.
 ///
 /// The colour **fades in over the second half of the slide** — the next line
@@ -461,7 +528,7 @@ fn synced_line(
     theme: Theme,
     index: usize,
     text: &str,
-    highlight: f32,
+    color: Rgba,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> AnyElement {
     div()
@@ -479,7 +546,7 @@ fn synced_line(
         // character — the fallback for a line with no spaces at all.
         .whitespace_normal()
         .text_size(px(theme.cell_px()))
-        .text_color(blend(theme.text_faint, theme.accent, highlight))
+        .text_color(color)
         .hover(|d| d.bg(theme.row_hover).text_color(theme.text_muted))
         .on_click(on_click)
         .child(text.to_string())
@@ -576,5 +643,63 @@ mod tests {
         assert!(!is_fading(&lines, Duration::from_secs(5), transition), "idle between lines");
         assert!(is_fading(&lines, Duration::from_secs(10) - half / 2, transition), "mid-cross");
         assert!(!is_fading(&lines, Duration::from_secs(10), transition), "settled on the stamp");
+    }
+
+    #[test]
+    fn the_sung_line_tracks_the_stamp_without_leading_it() {
+        let lines = lines(&[0, 10, 20]);
+        assert_eq!(current_line(&lines, Duration::from_secs(5)), 0);
+        assert_eq!(current_line(&lines, Duration::from_secs(10)), 1);
+        assert_eq!(current_line(&lines, Duration::from_secs(19)), 1);
+        // Before the first stamp it stays on the first line rather than underflowing.
+        assert_eq!(current_line(&lines, Duration::ZERO), 0);
+    }
+
+    #[test]
+    fn lines_dim_by_twenty_percent_for_each_step_away() {
+        // At rest (`progress == 0`) the sung line and its immediate neighbours
+        // keep full colour, then each line out drops another 20%, capped so far
+        // lines stay legible.
+        assert_eq!(dim_amount(4, 4, 0.0), 0.0);
+        assert_eq!(dim_amount(3, 4, 0.0), 0.0);
+        assert_eq!(dim_amount(5, 4, 0.0), 0.0);
+        assert!((dim_amount(2, 4, 0.0) - 0.20).abs() < 1e-6);
+        assert!((dim_amount(1, 4, 0.0) - 0.40).abs() < 1e-6);
+        assert!((dim_amount(0, 4, 0.0) - 0.60).abs() < 1e-6);
+        // Eight-plus lines out clamps at DIM_MAX instead of vanishing.
+        assert_eq!(dim_amount(20, 4, 0.0), DIM_MAX);
+    }
+
+    #[test]
+    fn dim_levels_crossfade_with_the_highlight() {
+        // Halfway between lines 4 and 5 the dimming is measured from 4.5, so the
+        // levels either side are partway to their next value — no snap on the
+        // stamp.
+        assert!((dim_amount(3, 4, 0.5) - 0.10).abs() < 1e-6);
+        assert!((dim_amount(2, 4, 0.5) - 0.30).abs() < 1e-6);
+        assert!((dim_amount(6, 4, 0.5) - 0.10).abs() < 1e-6);
+        assert!((dim_amount(7, 4, 0.5) - 0.30).abs() < 1e-6);
+        // At the end of the window the values match the next line being current.
+        assert!((dim_amount(3, 4, 1.0) - dim_amount(3, 5, 0.0)).abs() < 1e-6);
+    }
+
+    #[test]
+    fn dimming_progress_follows_the_highlight_window() {
+        let lines = lines(&[0, 10, 20]);
+        let transition = Duration::from_secs_f32(TRANSITION_SECS);
+        let half = transition / 2;
+        let start = Duration::from_secs(10);
+
+        // Long before the next line there's no movement toward it.
+        assert_eq!(transition_progress(&lines, 1, start - half - Duration::from_millis(10), transition), 0.0);
+        // It starts exactly halfway into the slide...
+        assert_eq!(transition_progress(&lines, 1, start - half, transition), 0.0);
+        // ...is half done a quarter before the stamp...
+        let mid = transition_progress(&lines, 1, start - half / 2, transition);
+        assert!((mid - 0.5).abs() < 0.02, "progress {mid}");
+        // ...and reaches the next line on its stamp.
+        assert_eq!(transition_progress(&lines, 1, start, transition), 1.0);
+        // The last line has nowhere to move to.
+        assert_eq!(transition_progress(&lines, 2, start + half, transition), 0.0);
     }
 }
