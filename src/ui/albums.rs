@@ -13,11 +13,12 @@
 
 use std::collections::BTreeSet;
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{
     canvas, div, fill, img, point, prelude::*, px, size, AnyElement, App, Bounds, ClickEvent,
-    Context, ElementId, Entity, MouseButton, MouseDownEvent, ObjectFit, Pixels, Rgba, SharedString,
-    Window,
+    Context, ElementId, Entity, MouseButton, MouseDownEvent, ObjectFit, Pixels, RenderImage, Rgba,
+    SharedString, Window,
 };
 
 use crate::model::search::AlbumGroup;
@@ -759,6 +760,54 @@ fn header_cover<V: Render + 'static>(
     cover_mosaic(context.theme, &covers, THUMB_PX)
 }
 
+/// Slice two covers along the square's anti-diagonal: `a` fills the upper-left
+/// triangle, `b` the lower-right one. The result is a new GPU image, so it can
+/// be handed straight to `img()`; callers should cache it by the pair's ids
+/// rather than recomposing every frame.
+pub(crate) fn compose_diagonal(
+    a: &Arc<RenderImage>,
+    b: &Arc<RenderImage>,
+) -> Option<Arc<RenderImage>> {
+    let a_size = a.size(0);
+    let b_size = b.size(0);
+    let w = usize::try_from(a_size.width.0).ok()?;
+    let h = usize::try_from(a_size.height.0).ok()?;
+    let bw = usize::try_from(b_size.width.0).ok()?;
+    let bh = usize::try_from(b_size.height.0).ok()?;
+    if w == 0 || h == 0 || bw == 0 || bh == 0 {
+        return None;
+    }
+    let a_bytes = a.as_bytes(0)?;
+    let b_bytes = b.as_bytes(0)?;
+    if a_bytes.len() < w * h * 4 || b_bytes.len() < bw * bh * 4 {
+        return None;
+    }
+
+    // RenderImage pixels are BGRA; copying them straight through keeps the
+    // channels as both sources and the GPU already expect them.
+    let mut out = vec![0u8; w * h * 4];
+    for y in 0..h {
+        for x in 0..w {
+            let source = if x * h + y * w < w * h {
+                // Above the anti-diagonal: `a`.
+                let i = (y * w + x) * 4;
+                &a_bytes[i..i + 4]
+            } else {
+                // Below it: `b`, sampled into the output grid.
+                let sx = x * bw / w;
+                let sy = y * bh / h;
+                let i = (sy * bw + sx) * 4;
+                &b_bytes[i..i + 4]
+            };
+            let o = (y * w + x) * 4;
+            out[o..o + 4].copy_from_slice(source);
+        }
+    }
+
+    let buffer = image::RgbaImage::from_raw(w as u32, h as u32, out)?;
+    Some(Arc::new(RenderImage::new(vec![image::Frame::new(buffer)])))
+}
+
 /// A 2×2 mosaic of covers at `size`, empty slots showing the default
 /// placeholder — the same one a missing single cover shows.
 fn cover_mosaic(theme: Theme, covers: &[Option<CoverImage>], size: f32) -> AnyElement {
@@ -876,7 +925,7 @@ fn compact_row(
         .on_click(on_click)
         .on_mouse_down(MouseButton::Right, on_right_click)
         .on_mouse_down(MouseButton::Left, on_press)
-        .child(thumbnail(theme, cover, theme.num_col()))
+        .child(thumbnail(theme, cover, theme.cover_col()))
         .child(title_cell(
             theme,
             track,
@@ -926,8 +975,6 @@ fn track_row(
     // The song-entry convention: regular rows are square; the selected and
     // currently-playing ones carry the slight rounding.
     let rounded = playing || paint.selection.is_some();
-    // One monospace character, to nudge the equalizer left of the column edge.
-    let advance = columns.title / columns.title_chars.max(1) as f32;
 
     div()
         .id(id)
@@ -947,11 +994,11 @@ fn track_row(
         .on_mouse_down(MouseButton::Right, on_right_click)
         .on_mouse_down(MouseButton::Left, on_press)
         .child(if playing {
-            eq_icon(theme, paint.eq_phase, paint.audio_playing, advance)
+            eq_icon(theme, paint.eq_phase, paint.audio_playing)
         } else {
             number_cell(theme, track.number)
         })
-        .children(cover.map(|cover| thumbnail(theme, Some(cover), theme.num_col())))
+        .children(cover.map(|cover| thumbnail(theme, Some(cover), theme.cover_col())))
         .child(title_cell(
             theme,
             track,
@@ -1028,12 +1075,14 @@ fn artist_cell(
     )
 }
 
-/// The track-number cell, right-aligned in the number column.
+/// The track-number cell. Left-aligned in a column just wide enough for the
+/// number, so it starts on the album cover's left edge while the title keeps
+/// the same gap after it.
 fn number_cell(theme: Theme, number: usize) -> AnyElement {
     div()
-        .w(px(theme.num_col()))
+        .w(px(theme.number_col()))
         .flex_none()
-        .text_right()
+        .text_left()
         .text_size(px(theme.small_px()))
         .text_color(theme.text_faint)
         .child(format!("{number:02}."))
@@ -1051,18 +1100,17 @@ const EQ_GAP_PX: f32 = 2.0;
 /// while the track plays and resting when it's paused. It takes the number
 /// column's place, so the row still lines up. Shared with the queue panel's
 /// rows, which use the same row anatomy.
-pub fn eq_icon(theme: Theme, phase: f32, playing: bool, advance: f32) -> AnyElement {
+pub fn eq_icon(theme: Theme, phase: f32, playing: bool) -> AnyElement {
     let height = theme.font_size * 0.95;
     let levels = eq_levels(phase, playing);
     let width = EQ_BARS as f32 * EQ_BAR_PX + (EQ_BARS - 1) as f32 * EQ_GAP_PX;
     div()
-        .w(px(theme.num_col()))
+        .w(px(theme.number_col()))
         .flex_none()
         .h(px(height))
         .flex()
-        .justify_end()
-        // Sit one character left of the number column's right edge.
-        .pr(px(advance))
+        // Start on the same vertical line as the numbers it replaces.
+        .justify_start()
         .child(
             canvas(
                 |_bounds, _window, _cx| (),
@@ -1181,7 +1229,7 @@ fn row_bitrate(playing: bool, nominal: &SharedString, live: Option<&SharedString
 /// `thumbnail_rounded` for the one that carries the radius on the image
 /// element itself (gpui's `overflow_hidden` clips to a rectangular mask that
 /// knows nothing of corner radii, so a rounded wrapper shows no rounding).
-fn thumbnail(theme: Theme, cover: Option<CoverImage>, size: f32) -> AnyElement {
+pub(crate) fn thumbnail(theme: Theme, cover: Option<CoverImage>, size: f32) -> AnyElement {
     match cover {
         Some(CoverImage::Ready(image)) => img(image)
             .size(px(size))
@@ -1599,6 +1647,21 @@ mod tests {
         // Deselecting a middle pick keeps the rest in pick order.
         selection.toggle(1);
         assert_eq!(selection.songs(&items, &sections), vec![2, 3]);
+    }
+
+    #[test]
+    fn compose_diagonal_slices_a_over_b() {
+        let solid = |pixel: [u8; 4]| {
+            let buffer = image::RgbaImage::from_pixel(4, 4, image::Rgba(pixel));
+            Arc::new(RenderImage::new(vec![image::Frame::new(buffer)]))
+        };
+        let a = solid([255, 0, 0, 255]);
+        let b = solid([0, 0, 255, 255]);
+        let out = compose_diagonal(&a, &b).expect("same-sized images compose");
+        let bytes = out.as_bytes(0).unwrap();
+        let at = |x: usize, y: usize| &bytes[(y * 4 + x) * 4..(y * 4 + x) * 4 + 4];
+        assert_eq!(at(0, 0), [255, 0, 0, 255], "upper-left comes from a");
+        assert_eq!(at(3, 3), [0, 0, 255, 255], "lower-right comes from b");
     }
 
     #[test]

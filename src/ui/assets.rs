@@ -18,6 +18,14 @@ impl Assets {
         ("assets/repeat.svg", include_bytes!("../../assets/repeat.svg")),
         ("assets/repeat_one.svg", include_bytes!("../../assets/repeat_one.svg")),
         ("assets/shuffle.svg", include_bytes!("../../assets/shuffle.svg")),
+        ("assets/expand-left.svg", include_bytes!("../../assets/expand-left.svg")),
+        ("assets/expand-right.svg", include_bytes!("../../assets/expand-right.svg")),
+        ("assets/settings.svg", include_bytes!("../../assets/settings.svg")),
+        ("assets/undo.svg", include_bytes!("../../assets/undo.svg")),
+        ("assets/albums.svg", include_bytes!("../../assets/albums.svg")),
+        ("assets/artists.svg", include_bytes!("../../assets/artists.svg")),
+        ("assets/folders.svg", include_bytes!("../../assets/folders.svg")),
+        ("assets/clear_queue.svg", include_bytes!("../../assets/clear_queue.svg")),
     ];
 }
 

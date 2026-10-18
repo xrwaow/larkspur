@@ -1,8 +1,16 @@
 use std::collections::HashMap;
 
-use gpui::{div, prelude::*, px, relative, AnyElement, AnyView, Context, Entity, Render, Window};
+use gpui::{
+    div, prelude::*, px, relative, AnyElement, AnyView, Context, Entity, Render, Subscription,
+    Window,
+};
 
+use crate::ui::animation::{Animator, Tween};
 use crate::ui::config_state::{ConfigState, Themed};
+
+/// Seconds the left rail takes to slide between its open and collapsed
+/// widths. Short enough to feel immediate, long enough to read as motion.
+pub const RAIL_ANIM_SECS: f32 = 0.22;
 
 /// Base "class" for a UI module/panel. A Container is just a Render
 /// impl with a stable identity, so the workspace can hold a
@@ -226,6 +234,13 @@ pub struct Workspace {
     plan: LayoutPlan,
     modules: HashMap<&'static str, AnyView>,
     themed: Themed,
+    /// The left rail's animated width. The dock's size is overwritten from
+    /// this every frame while it's moving, so collapse/expand slides instead
+    /// of snapping.
+    rail: Tween,
+    /// Where the rail is heading, so a repeated request is a no-op.
+    rail_target: f32,
+    _observe_animator: Option<Subscription>,
 }
 
 impl Workspace {
@@ -246,7 +261,47 @@ impl Workspace {
         cx: &mut Context<Self>,
     ) -> Self {
         let themed = Themed::new(config, cx);
-        Self { plan, modules: HashMap::new(), themed }
+        let rail_px = module_px(&plan, "playlists").unwrap_or(0.0);
+        Self {
+            plan,
+            modules: HashMap::new(),
+            themed,
+            rail: Tween::new(rail_px),
+            rail_target: rail_px,
+            _observe_animator: None,
+        }
+    }
+
+    /// Drive the rail's width animation from the shared frame clock. Call once
+    /// after construction; an idle workspace costs nothing because a settled
+    /// tween asks for no frames.
+    pub fn attach_animator(&mut self, animator: Entity<Animator>, cx: &mut Context<Self>) {
+        let observe = cx.observe(&animator, |this, animator, cx| {
+            let dt = animator.read(cx).dt();
+            if this.rail.tick(dt) {
+                set_module_px(&mut this.plan, "playlists", this.rail.value());
+                cx.notify();
+            }
+        });
+        self._observe_animator = Some(observe);
+    }
+
+    /// The left rail's width right now — mid-slide it's between the open and
+    /// collapsed widths, so a re-plan (e.g. toggling the visualizer) can keep
+    /// the rail where it is on screen.
+    pub fn rail_width(&self) -> f32 {
+        self.rail.value()
+    }
+
+    /// Slide the left rail toward `target` px. No-op while already headed
+    /// somewhere within a third of a pixel.
+    pub fn animate_rail_to(&mut self, target: f32, cx: &mut Context<Self>) {
+        if (self.rail_target - target).abs() < 0.33 {
+            return;
+        }
+        self.rail_target = target;
+        self.rail.to(target, RAIL_ANIM_SECS);
+        cx.notify();
     }
 
     /// Add an edge-docked band.
@@ -286,6 +341,44 @@ impl Render for Workspace {
             .size_full()
             .bg(self.themed.theme().window_bg)
             .child(render_dock_stack(&self.plan.docks, &self.plan.center, &self.modules))
+    }
+}
+
+/// The fixed main-axis size of the module `id` anywhere in `plan`, if it has
+/// one. Used to seed the rail's animation from the initial layout.
+fn module_px(plan: &LayoutPlan, id: &str) -> Option<f32> {
+    plan.docks.iter().find_map(|dock| child_module_px(&dock.child, id))
+}
+
+fn child_module_px(child: &Child, id: &str) -> Option<f32> {
+    match &child.layout {
+        Layout::Module(module) if *module == id => match child.size {
+            Size::Px(px) => Some(px),
+            _ => None,
+        },
+        Layout::Row(children) | Layout::Col(children) => {
+            children.iter().find_map(|child| child_module_px(child, id))
+        }
+        _ => None,
+    }
+}
+
+/// Set a module's fixed main-axis size wherever it sits in `plan`. Returns
+/// whether the module was found.
+fn set_module_px(plan: &mut LayoutPlan, id: &str, width: f32) -> bool {
+    plan.docks.iter_mut().any(|dock| set_child_module_px(&mut dock.child, id, width))
+}
+
+fn set_child_module_px(child: &mut Child, id: &str, width: f32) -> bool {
+    match &mut child.layout {
+        Layout::Module(module) if *module == id => {
+            child.size = Size::Px(width);
+            true
+        }
+        Layout::Row(children) | Layout::Col(children) => {
+            children.iter_mut().any(|child| set_child_module_px(child, id, width))
+        }
+        _ => false,
     }
 }
 

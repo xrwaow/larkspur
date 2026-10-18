@@ -243,8 +243,16 @@ impl Theme {
         (self.font_size - 2.0).max(6.0)
     }
 
-    /// The track-number column.
-    pub fn num_col(&self) -> f32 {
+    /// The track-number column. Narrow — just the three monospace characters
+    /// of `00.` — so the number can start on the album cover's left edge while
+    /// the title keeps the same gap after it.
+    pub fn number_col(&self) -> f32 {
+        self.small_px() * 1.8
+    }
+
+    /// The album-cover thumbnail in a row: the compact row's cover, or the
+    /// per-track cover a custom/smart playlist draws.
+    pub fn cover_col(&self) -> f32 {
         self.font_size * 2.9
     }
 

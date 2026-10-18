@@ -37,8 +37,10 @@ use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::format::format_duration;
 use crate::ui::playback_state::PlaybackState;
+use crate::ui::playback::svg_icon;
 use crate::ui::queue::QueueView;
 use crate::ui::cover_store::CoverStore;
+use crate::ui::tabs::{strip_height_px, TabsView};
 use crate::ui::library_state::LibraryState;
 use crate::ui::theme::Theme;
 use crate::ui::widgets::{blend, dim, edge_fade, empty_hint, Side};
@@ -61,6 +63,9 @@ const SNAP_LINES: f32 = 5.0;
 
 pub struct LyricsView {
     state: Entity<PlaybackState>,
+    /// The shared config, read for the tab strip's height so this panel's
+    /// header rule lines up with it.
+    config: Entity<ConfigState>,
     /// Read for song durations, to total the queue time in the header.
     library: Entity<LibraryState>,
     /// The queue, embedded in this rail behind the Queue tab. Shares the same
@@ -119,6 +124,7 @@ impl LyricsView {
         let themed = Themed::new(&config, cx);
         let mut this = Self {
             state,
+            config,
             library,
             queue,
             themed,
@@ -216,6 +222,11 @@ impl Container for LyricsView {
 impl Render for LyricsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.themed.theme();
+        let tabs_font = self
+            .config
+            .read(cx)
+            .font_size(TabsView::container_id(), TabsView::default_font_size());
+        let header_h = strip_height_px(tabs_font, theme.cell_px() + 2.0);
         let offset = self.offset.value();
         let anchor = self.anchor.unwrap_or(0);
         let position = self.position;
@@ -350,11 +361,14 @@ impl Render for LyricsView {
             .font_family(theme.font)
             .child(if queue_open {
                 div()
+                    .h(px(header_h))
+                    .pt_1()
                     .flex()
                     .items_center()
                     .justify_between()
                     .px_4()
-                    .py_3()
+                    .border_b_1()
+                    .border_color(theme.border)
                     .child(
                         div()
                             .text_size(px(theme.small_px()))
@@ -370,37 +384,39 @@ impl Render for LyricsView {
                                 d.child(
                                     div()
                                         .text_size(px(theme.small_px()))
-                                        .text_color(theme.text_faint)
+                                        .text_color(theme.text)
                                         .child(format_duration(Duration::from_secs(self.total_secs))),
                                 )
                             })
                             .child(
                                 div()
                                     .id("queue-clear")
-                                    .px_3()
-                                    .py_1()
-                                    .rounded_md()
+                                    .flex_none()
                                     .cursor_pointer()
-                                    .text_size(px(theme.small_px()))
-                                    .text_color(theme.text)
-                                    .bg(theme.row_active)
-                                    .hover(|d| d.bg(theme.row_hover))
                                     .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                                         this.state.update(cx, |state, cx| state.clear_queue(cx));
                                     }))
-                                    .child("CLEAR"),
+                                    .child(svg_icon(
+                                        theme.small_px(),
+                                        theme.small_px(),
+                                        "assets/clear_queue.svg",
+                                        theme.text,
+                                    )),
                             ),
                     )
             } else {
                 div()
+                    .h(px(header_h))
+                    .pt_1()
                     .flex()
                     .items_center()
                     .px_4()
-                    .py_3()
+                    .border_b_1()
+                    .border_color(theme.border)
                     .child(
                         div()
                             .text_size(px(theme.small_px()))
-                            .text_color(theme.text_faint)
+                            .text_color(theme.text)
                             .child("Lyrics"),
                     )
             })

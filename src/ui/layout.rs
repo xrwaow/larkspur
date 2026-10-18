@@ -14,6 +14,19 @@ use super::visualizer::BAND_HEIGHT;
 /// `ui::tabs`), so the two can't drift apart.
 pub const RAIL_PX: f32 = 240.0;
 
+/// Width of the collapsed left rail — just enough for the expand button in
+/// its header.
+pub const MIN_RAIL_PX: f32 = 44.0;
+
+/// The left rail's current width: collapsed or expanded.
+pub fn rail_px(minimized: bool) -> f32 {
+    if minimized {
+        MIN_RAIL_PX
+    } else {
+        RAIL_PX
+    }
+}
+
 /// The window's dock/center arrangement.
 ///
 /// Playback bar across the bottom, the playlist list docked left, and the
@@ -28,6 +41,12 @@ pub const RAIL_PX: f32 = 240.0;
 /// layout when it's on, and the workspace re-plans live when the setting
 /// flips (see `ui/main.rs`).
 pub fn app_layout(show_visualizer: bool) -> LayoutPlan {
+    app_layout_with_rail(show_visualizer, RAIL_PX)
+}
+
+/// [`app_layout`] with an explicit left-rail width — the rail is minimizable,
+/// and the workspace re-plans at [`rail_px`] when that setting flips.
+pub fn app_layout_with_rail(show_visualizer: bool, left_rail_px: f32) -> LayoutPlan {
     let mut rail = Vec::new();
     rail.push(module("lyrics").fill());
     if show_visualizer {
@@ -40,7 +59,7 @@ pub fn app_layout(show_visualizer: bool) -> LayoutPlan {
     // (z=1) fits between them at the bottom.
     plan.dock(Dock::bottom(module("playback")));
     plan.dock(Dock::right(col(rail).px(RAIL_PX)).z(3));
-    plan.dock(Dock::left(module("playlists").px(RAIL_PX)).z(3));
+    plan.dock(Dock::left(module("playlists").px(left_rail_px)).z(3));
     plan
 }
 

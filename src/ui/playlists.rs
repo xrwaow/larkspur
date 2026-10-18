@@ -11,7 +11,8 @@
 //! Custom playlists are edited here: right-clicking one opens a menu to rename
 //! or delete it, and renaming happens inline. Right-clicking a folder opens a
 //! menu to open it — the full subtree, or just the folder's own songs. The
-//! settings button in the header opens the settings overlay in the center.
+//! settings button at the rail's bottom opens the settings overlay in the
+//! center, and stays reachable while the rail is collapsed.
 //!
 //! A library produces *thousands* of rows (one per autogen album playlist, plus
 //! one per artist), and GPUI re-renders and re-lays-out every visible view on
@@ -25,30 +26,37 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::sync::Arc;
 
 use gpui::{
-    canvas, div, list, point, prelude::*, px, AnyElement, App, ClickEvent, Context, ElementId,
+    canvas, div, img, list, point, prelude::*, px, AnyElement, App, ClickEvent, Context, ElementId,
     Entity, FocusHandle, KeyDownEvent, ListAlignment, ListState, MouseButton, MouseDownEvent,
-    Pixels, Point, Render, Subscription, Window,
+    Pixels, Point, Render, RenderImage, Subscription, Window,
 };
 
-use crate::model::{FolderMode, Playlist, PlaylistId, PlaylistKind, SmartKind};
+use crate::model::{FolderMode, Playlist, PlaylistId, PlaylistKind, SmartKind, SongId};
+use crate::ui::albums;
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
+use crate::ui::cover_store::{CoverImage, CoverStore};
 use crate::ui::input::action_for_key;
 use crate::ui::library_state::{subdirs, LibraryState, Request};
 use crate::ui::animation::Animator;
 use crate::ui::menu::{context_menu, MenuHandler};
 use crate::ui::marquee::{self, Marquee};
-use crate::ui::playback::icon;
+use crate::ui::playback::{icon, svg_icon};
 use crate::ui::row_list::OVERDRAW_PX;
-use crate::ui::tabs::TabsView;
+use crate::ui::tabs::{strip_height_px, TabsView};
 use crate::ui::text_field::TextField;
 use crate::ui::theme::Theme;
-use crate::ui::widgets::{empty_hint, panel_header, search_box};
+use crate::ui::widgets::{empty_hint, search_box};
 
 /// The most characters a rail label shows before its text fades and slides.
 const RAIL_MAX_CHARS: usize = 24;
+
+/// The cover thumbnail in the collapsed rail. The rail is 44 px wide; this
+/// leaves 4 px of air on each side.
+const COLLAPSED_COVER_PX: f32 = 36.0;
 
 /// Everything a rail row's marquee label needs, from [`PlaylistsView::label_bits`].
 struct LabelBits {
@@ -118,6 +126,17 @@ impl Group {
             Group::Playlists => 4,
         }
     }
+
+    /// The library groups that carry an icon (and that stay visible as icons
+    /// when the rail is collapsed).
+    fn icon_path(self) -> Option<&'static str> {
+        match self {
+            Group::Albums => Some("assets/albums.svg"),
+            Group::Artists => Some("assets/artists.svg"),
+            Group::Folders => Some("assets/folders.svg"),
+            Group::Library | Group::Playlists => None,
+        }
+    }
 }
 
 /// One filterable group's search box: the field, its focus handle, whether the
@@ -160,12 +179,9 @@ pub struct PlaylistsView {
     tabs: Entity<TabsView>,
     /// The synced-path list for the folder view lives here.
     config: Entity<ConfigState>,
+    /// Album art for the collapsed rail's playlist covers.
+    covers: Entity<CoverStore>,
     themed: Themed,
-    /// Whether "Your Library" (the Albums/Artists/Folders wrapper) and the
-    /// "Playlists" section are unfolded. Both start open so the rail's
-    /// contents are visible at launch.
-    library_open: bool,
-    playlists_open: bool,
     /// Whether the Folder View group is expanded (folded shut at launch). The
     /// Albums and Artists groups' folds live in their [`GroupFilter`]s — a
     /// filter overrides the fold, so a search reveals what it's hiding.
@@ -189,6 +205,13 @@ pub struct PlaylistsView {
     /// rename state changes — never per frame.
     rows: Rc<Vec<RailRow>>,
     list_state: ListState,
+    /// The playlists' covers shown while the rail is collapsed, and their
+    /// virtualized list state. Rebuilt only when the library changes.
+    cover_rows: Rc<Vec<CoverRow>>,
+    cover_list: ListState,
+    cover_dirty: bool,
+    /// Cached diagonal slices, keyed by the two songs' ids.
+    pair_covers: HashMap<(SongId, SongId), Arc<RenderImage>>,
     /// Per-row marquee, keyed by the row's element id — the same
     /// fade/slide/spring-back the list rows and tabs use, so a long artist,
     /// album, or folder name slides on hover. The region hover also carries
@@ -199,6 +222,7 @@ pub struct PlaylistsView {
     dirty: bool,
     _observe: Subscription,
     _observe_animator: Subscription,
+    _observe_covers: Subscription,
 }
 
 impl PlaylistsView {
@@ -206,13 +230,16 @@ impl PlaylistsView {
         library: Entity<LibraryState>,
         tabs: Entity<TabsView>,
         config: Entity<ConfigState>,
+        covers: Entity<CoverStore>,
         animator: Entity<Animator>,
         cx: &mut Context<Self>,
     ) -> Self {
         let observe = cx.observe(&library, |this, _state, cx| {
             this.dirty = true;
+            this.cover_dirty = true;
             cx.notify();
         });
+        let observe_covers = cx.observe(&covers, |_this, _covers, cx| cx.notify());
         let observe_animator = cx.observe(&animator, |this, animator, cx| {
             let dt = animator.read(cx).dt();
             let moved = this.marquees.values_mut().any(|marquee| marquee.tick(dt));
@@ -225,9 +252,8 @@ impl PlaylistsView {
             library,
             tabs,
             config,
+            covers,
             themed,
-            library_open: true,
-            playlists_open: true,
             folder_open: false,
             open_dirs: HashSet::new(),
             album_filter: GroupFilter::new("Filter albums…", None, cx),
@@ -238,10 +264,15 @@ impl PlaylistsView {
             focus_handle: cx.focus_handle(),
             rows: Rc::new(Vec::new()),
             list_state: ListState::new(0, ListAlignment::Top, px(OVERDRAW_PX)),
+            cover_rows: Rc::new(Vec::new()),
+            cover_list: ListState::new(0, ListAlignment::Top, px(OVERDRAW_PX)),
+            cover_dirty: true,
+            pair_covers: HashMap::new(),
             marquees: HashMap::new(),
             dirty: true,
             _observe: observe,
             _observe_animator: observe_animator,
+            _observe_covers: observe_covers,
         }
     }
 
@@ -349,10 +380,10 @@ impl PlaylistsView {
             .filter(|p| !p.is_custom() && album_matches(p.title()))
             .map(|p| row_of(p))
             .collect();
-        // "Your Library" wraps the three library groups; folding it hides
-        // them all. Its children are indented one level under the header.
-        rows.push(RailRow::GroupHeader { group: Group::Library, open: self.library_open, depth: 0 });
-        if self.library_open {
+        // "Your Library" and "Playlists" are plain titles; only the groups
+        // inside them fold.
+        rows.push(RailRow::GroupHeader { group: Group::Library, open: true, depth: 0 });
+        {
             rows.push(RailRow::GroupHeader {
                 group: Group::Albums,
                 open: self.album_filter.showing(),
@@ -416,10 +447,10 @@ impl PlaylistsView {
         // stats — no rename, no delete), then the user's custom playlists.
         rows.push(RailRow::GroupHeader {
             group: Group::Playlists,
-            open: self.playlists_open,
+            open: true,
             depth: 0,
         });
-        if self.playlists_open {
+        {
             for (kind, glyph) in [
                 (SmartKind::RecentlyAdded, "✦"),
                 (SmartKind::RecentlyPlayed, "↻"),
@@ -449,6 +480,38 @@ impl PlaylistsView {
         rows
     }
 
+    /// Snapshot the playlists whose art the collapsed rail shows: the smart
+    /// and custom playlists (the user's own views), in rail order. Album
+    /// playlists are deliberately left out — there can be thousands.
+    fn build_cover_rows(&self, cx: &Context<Self>) -> Vec<CoverRow> {
+        let state = self.library.read(cx);
+        let lib = state.library();
+        // `playlists()` excludes smart lists (the library keeps them in their
+        // own list), so gather both here in the rail's order.
+        let smart = lib.smart_playlists();
+        let custom = lib.playlists().into_iter().filter(|playlist| playlist.is_custom());
+        smart
+            .into_iter()
+            .chain(custom)
+            .filter_map(|playlist| {
+                let songs: Vec<CoverSong> = playlist
+                    .song_ids
+                    .iter()
+                    .take(2)
+                    .filter_map(|song| {
+                        let metadata = lib.get(*song)?;
+                        Some(CoverSong {
+                            song: *song,
+                            path: metadata.path.clone(),
+                            has_art: metadata.has_art,
+                        })
+                    })
+                    .collect();
+                (!songs.is_empty()).then(|| CoverRow { id: playlist.id, songs })
+            })
+            .collect()
+    }
+
     /// Render one row of the flattened rail. Called by the virtualized list
     /// only for rows near the viewport.
     fn render_row(
@@ -470,6 +533,13 @@ impl PlaylistsView {
                 let group = *group;
                 let open = *open;
                 let depth = *depth;
+                // "Your Library" and "Playlists" are plain titles: no fold,
+                // no chevron. Only the groups nested under them collapse.
+                let collapsible = matches!(group, Group::Albums | Group::Artists | Group::Folders);
+                // The glyph occupies the same guide-wide slot the tree rows
+                // below use for their chevron, so a group's icon, its guide
+                // line, and its children all share one column.
+                let guide = theme.cell_px() * 1.1;
                 div()
                     .id(("group-header", group.hash_key()))
                     .flex()
@@ -478,34 +548,70 @@ impl PlaylistsView {
                     .w_full()
                     .h(px(32.0))
                     .mt(px(if depth == 0 { 8.0 } else { 0.0 }))
-                    .pl(px(8.0 + depth as f32 * 14.0))
+                    // Top-level titles line up with the left edge of the group
+                    // glyphs: the icon slot starts at 8 px and the glyph
+                    // overhangs it by 7 px, so its left edge is at 1 px.
+                    .pl(px(if depth == 0 { 1.0 } else { 8.0 }))
                     .pr_2()
                     .rounded_md()
-                    .cursor_pointer()
-                    .hover(|d| d.bg(theme.row_hover))
-                    .on_click(cx.listener(move |this, _event, _window, cx| {
-                        match group {
-                            Group::Library => this.library_open = !this.library_open,
-                            Group::Albums => this.album_filter.open = !this.album_filter.open,
-                            Group::Artists => this.artist_filter.open = !this.artist_filter.open,
-                            Group::Folders => this.folder_open = !this.folder_open,
-                            Group::Playlists => this.playlists_open = !this.playlists_open,
+                    .when(collapsible, |d| {
+                        d.cursor_pointer()
+                            .hover(|d| d.bg(theme.row_hover))
+                            .on_click(cx.listener(move |this, _event, _window, cx| {
+                                match group {
+                                    Group::Albums => {
+                                        this.album_filter.open = !this.album_filter.open
+                                    }
+                                    Group::Artists => {
+                                        this.artist_filter.open = !this.artist_filter.open
+                                    }
+                                    Group::Folders => this.folder_open = !this.folder_open,
+                                    Group::Library | Group::Playlists => {}
+                                }
+                                this.dirty = true;
+                                cx.notify();
+                            }))
+                    })
+                    .child({
+                        // A glyph fills the guide-wide slot for the groups that
+                        // have one. Top-level section titles ("Your Library",
+                        // "Playlists") carry no slot, so they sit at the rail's
+                        // left edge together.
+                        let mut label_row = div().flex().flex_1().min_w_0().items_center();
+                        if let Some(path) = group.icon_path() {
+                            label_row = label_row.child(
+                                div()
+                                    .flex_none()
+                                    .w(px(guide))
+                                    .flex()
+                                    .items_center()
+                                    // Center the glyph on the guide line at the
+                                    // slot's left edge; the overhang also leaves
+                                    // a little air before the label.
+                                    .child(div().ml(px(-7.0)).child(svg_icon(
+                                        14.0,
+                                        14.0,
+                                        path,
+                                        if depth == 0 { theme.text_muted } else { theme.text_faint },
+                                    ))),
+                            );
                         }
-                        this.dirty = true;
-                        cx.notify();
-                    }))
-                    .child(
-                        div()
-                            .text_size(px(theme.cell_px()))
-                            .text_color(if depth == 0 { theme.text } else { theme.text_muted })
-                            .child(group.label()),
-                    )
-                    .child(icon(
-                        14.0,
-                        14.0,
-                        if open { CHEVRON_DOWN_POLYGONS } else { CHEVRON_RIGHT_POLYGONS },
-                        theme.text_faint,
-                    ))
+                        label_row.child(
+                            div()
+                                .truncate()
+                                .text_size(px(theme.cell_px()))
+                                .text_color(if depth == 0 { theme.text } else { theme.text_muted })
+                                .child(group.label()),
+                        )
+                    })
+                    .when(collapsible, |d| {
+                        d.child(icon(
+                            14.0,
+                            14.0,
+                            if open { CHEVRON_DOWN_POLYGONS } else { CHEVRON_RIGHT_POLYGONS },
+                            theme.text_faint,
+                        ))
+                    })
                     .into_any_element()
             }
             RailRow::NewPlaylist => {
@@ -519,7 +625,7 @@ impl PlaylistsView {
                     None,
                     false,
                     0,
-                    Branch::Plain,
+                    Branch::Flush,
                     Some(cx.listener(|this, _event, window, cx| {
                         let id = this.library.update(cx, |state, cx| state.new_playlist(cx));
                         this.tabs.update(cx, |tabs, cx| tabs.open_playlist(id, window, cx));
@@ -531,6 +637,7 @@ impl PlaylistsView {
                 let (_, field, focus) =
                     self.renaming.as_ref().expect("rename row without a rename");
                 div()
+                    .pl(px(1.0))
                     .pb_1()
                     .child(field.render(theme, "Playlist name", focus, window))
                     .into_any_element()
@@ -550,7 +657,7 @@ impl PlaylistsView {
                     None,
                     selected == Some(id),
                     0,
-                    Branch::Plain,
+                    Branch::Flush,
                     Some(cx.listener(move |this, _event, window, cx| {
                         this.tabs.update(cx, |tabs, cx| tabs.open_playlist(id, window, cx));
                     })),
@@ -568,6 +675,11 @@ impl PlaylistsView {
                     _ => ("discography", 1),
                 };
                 let bits = self.label_bits(theme, window, key, &row.title, advance, cx);
+                let branch = if matches!(kind, RailRow::Custom(_)) {
+                    Branch::Flush
+                } else {
+                    Branch::Plain
+                };
                 let row_el = rail_row(
                     theme,
                     (name, id.0),
@@ -577,7 +689,7 @@ impl PlaylistsView {
                     Some(row.count),
                     selected == Some(id),
                     depth,
-                    Branch::Plain,
+                    branch,
                     Some(cx.listener(move |this, _event, window, cx| {
                         this.tabs.update(cx, |tabs, cx| tabs.open_playlist(id, window, cx));
                     })),
@@ -732,6 +844,23 @@ struct Row {
     count: usize,
 }
 
+/// One cover in the collapsed rail: the playlist it opens and up to two songs
+/// whose art is sliced along the diagonal.
+#[derive(Clone)]
+struct CoverRow {
+    id: PlaylistId,
+    songs: Vec<CoverSong>,
+}
+
+/// A song in a collapsed-rail slice, snapshotted so rendering doesn't need to
+/// touch the library again.
+#[derive(Clone)]
+struct CoverSong {
+    song: SongId,
+    path: PathBuf,
+    has_art: bool,
+}
+
 /// One flattened row of the rail — the unit the virtualized list renders.
 /// `PartialEq` drives the minimal splice: only the stretch of rows that
 /// actually changed is handed to the list, so the scroll position survives
@@ -762,11 +891,281 @@ enum RailRow {
     NoMatches,
 }
 
+/// The header button that collapses or expands the rail. It carries the
+/// expand-left glyph while the rail is open (pointing the way it will shrink)
+/// and expand-right while minimized.
+fn rail_toggle_button(
+    theme: Theme,
+    minimized: bool,
+    cx: &mut Context<PlaylistsView>,
+) -> AnyElement {
+    let icon_path = if minimized {
+        "assets/expand-right.svg"
+    } else {
+        "assets/expand-left.svg"
+    };
+    div()
+        .id("toggle-sidebar")
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .p_1()
+        .rounded_md()
+        .cursor_pointer()
+        .hover(|d| d.bg(theme.row_hover))
+        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+            let minimized = this.config.read(cx).sidebar_minimized();
+            this.config
+                .update(cx, |config, cx| config.set_sidebar_minimized(!minimized, cx));
+        }))
+        // The same 14 px box a group header's chevron uses, so the expand
+        // glyph sits in the same vertical column as the chevrons below.
+        .child(svg_icon(14.0, 14.0, icon_path, theme.text_muted))
+        .into_any_element()
+}
+
+/// The rail's header band, sized to the tab strip beside it so the title and
+/// the expand/collapse icon sit on the same horizontal line as the tab labels.
+fn library_header(
+    theme: Theme,
+    header_h: f32,
+    scanning: bool,
+    cx: &mut Context<PlaylistsView>,
+) -> AnyElement {
+    div()
+        .h(px(header_h))
+        .pt_1()
+        .pl_4()
+        // The list has `px_2` and each group header `pr_2`, so its chevron's
+        // centre sits 23 px from the rail's right edge (8 + 8 + half of 14).
+        // `pr_3` + the toggle's `p_1` + the same 14 px box lands on it.
+        .pr_3()
+        .flex()
+        .items_center()
+        .justify_between()
+        .gap_2()
+        .border_b_1()
+        .border_color(theme.border)
+        .child(
+            div()
+                .min_w_0()
+                .truncate()
+                .text_size(px(theme.cell_px()))
+                .text_color(theme.text)
+                .child("Library"),
+        )
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_2()
+                .when(scanning, |d| {
+                    d.child(
+                        div()
+                            .flex_none()
+                            .text_size(px(theme.small_px()))
+                            .text_color(theme.text_muted)
+                            .child("scanning…"),
+                    )
+                })
+                .child(rail_toggle_button(theme, false, cx)),
+        )
+        .into_any_element()
+}
+
+/// The Albums / Artists / Folders glyphs in the collapsed rail. The rail is
+/// too narrow for the group labels, so each group keeps a single icon button
+/// here; clicking one re-opens the rail on that group.
+fn collapsed_group_icons(theme: Theme, cx: &mut Context<PlaylistsView>) -> AnyElement {
+    div()
+        .flex_none()
+        .flex()
+        .flex_col()
+        .items_center()
+        .gap_1()
+        .py_1()
+        .border_b_1()
+        .border_color(theme.border)
+        .children([Group::Albums, Group::Artists, Group::Folders].map(|group| {
+            let path = group.icon_path().expect("library group without an icon");
+            div()
+                .id(("collapsed-group", group.hash_key()))
+                .flex_none()
+                .flex()
+                .items_center()
+                .justify_center()
+                .p_1()
+                .rounded_md()
+                .cursor_pointer()
+                .hover(|d| d.bg(theme.row_hover))
+                .on_click(cx.listener(move |this, _event, _window, cx| {
+                    // Expanding the rail alone would land on whatever folds
+                    // happened to be open, so open the group the icon names.
+                    match group {
+                        Group::Albums => this.album_filter.open = true,
+                        Group::Artists => this.artist_filter.open = true,
+                        Group::Folders => this.folder_open = true,
+                        Group::Library | Group::Playlists => {}
+                    }
+                    this.dirty = true;
+                    this.config.update(cx, |config, cx| {
+                        config.set_sidebar_minimized(false, cx);
+                    });
+                    cx.notify();
+                }))
+                .child(svg_icon(20.0, 20.0, path, theme.text_muted))
+        }))
+        .into_any_element()
+}
+
+/// The rail's settings button, pinned to the bottom: `⚙ Settings` when the
+/// rail is open, the gear alone when it's collapsed to its narrow strip.
+fn settings_button(
+    theme: Theme,
+    compact: bool,
+    cx: &mut Context<PlaylistsView>,
+) -> AnyElement {
+    div()
+        .id("open-settings")
+        .flex_none()
+        .w_full()
+        .flex()
+        .items_center()
+        .when(compact, |d| d.justify_center())
+        .when(!compact, |d| d.justify_start())
+        .gap_2()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .cursor_pointer()
+        .hover(|d| d.bg(theme.row_hover))
+        .on_click(cx.listener(|this, _event, window, cx| {
+            this.tabs.update(cx, |tabs, cx| tabs.open_settings(window, cx));
+        }))
+        .child(svg_icon(
+            theme.cell_px(),
+            theme.cell_px(),
+            "assets/settings.svg",
+            theme.text_muted,
+        ))
+        .when(!compact, |d| {
+            d.child(
+                div()
+                    .min_w_0()
+                    .truncate()
+                    .text_size(px(theme.cell_px()))
+                    .text_color(theme.text_muted)
+                    .child("Settings"),
+            )
+        })
+        .into_any_element()
+}
+
 impl Render for PlaylistsView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.themed.theme();
         let scanning = self.library.read(cx).is_scanning();
         let selected = self.library.read(cx).selected();
+        // Match the tab strip beside the rail, using the tabs' own font size —
+        // the rail and tabs can be set to different sizes.
+        let tabs_font = self
+            .config
+            .read(cx)
+            .font_size(TabsView::container_id(), TabsView::default_font_size());
+        let header_h = strip_height_px(tabs_font, theme.cell_px() + 2.0);
+
+        // Collapsed: the header strip with the expand button, plus the
+        // settings button pinned to the bottom. The list and its rows aren't
+        // built at all while it's shut.
+        if self.config.read(cx).sidebar_minimized() {
+            if self.cover_dirty {
+                self.cover_dirty = false;
+                let new_rows = self.build_cover_rows(cx);
+                self.cover_list.reset(new_rows.len());
+                self.cover_rows = Rc::new(new_rows);
+                self.pair_covers.clear();
+            }
+            let cover_rows = self.cover_rows.clone();
+            let covers = self.covers.clone();
+            let render_cover = cx.processor(move |this, ix, _window, cx| {
+                let row: &CoverRow = &cover_rows[ix];
+                for cover in &row.songs {
+                    if covers.read(cx).cover(cover.song).is_none() {
+                        covers.update(cx, |store, cx| {
+                            store.request(cover.song, cover.path.clone(), cover.has_art, cx);
+                        });
+                    }
+                }
+                let first = covers.read(cx).cover(row.songs[0].song);
+                // Two covers sliced along the diagonal; a one-song playlist
+                // just draws its one cover full.
+                let pair = row.songs.get(1).and_then(|second| {
+                    let key = (row.songs[0].song, second.song);
+                    if let Some(pair) = this.pair_covers.get(&key) {
+                        return Some(pair.clone());
+                    }
+                    let b = covers.read(cx).cover(second.song);
+                    let (Some(CoverImage::Ready(a)), Some(CoverImage::Ready(b))) = (&first, &b) else {
+                        return None;
+                    };
+                    let pair = albums::compose_diagonal(a, b)?;
+                    this.pair_covers.insert(key, pair.clone());
+                    Some(pair)
+                });
+                let art = match pair {
+                    Some(pair) => img(pair).size(px(COLLAPSED_COVER_PX)).into_any_element(),
+                    None => albums::thumbnail(theme, first, COLLAPSED_COVER_PX),
+                };
+                let id = row.id;
+                div()
+                    .id(("rail-cover", id.0))
+                    .w_full()
+                    .flex()
+                    .justify_center()
+                    .py(px(3.0))
+                    .cursor_pointer()
+                    .on_click(cx.listener(move |this, _event, window, cx| {
+                        this.tabs.update(cx, |tabs, cx| tabs.open_playlist(id, window, cx));
+                    }))
+                    .child(art)
+                    .into_any_element()
+            });
+            let cover_list = self.cover_list.clone();
+            return div()
+                .size_full()
+                .flex()
+                .flex_col()
+                .bg(theme.rail_bg)
+                .font_family(theme.font)
+                .child(
+                    div()
+                        .h(px(header_h))
+                        .pt_1()
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .border_b_1()
+                        .border_color(theme.border)
+                        .child(rail_toggle_button(theme, true, cx)),
+                )
+                .child(collapsed_group_icons(theme, cx))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_h_0()
+                        .child(list(cover_list, render_cover).size_full()),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .justify_center()
+                        .px_2()
+                        .pb_2()
+                        .child(settings_button(theme, true, cx)),
+                )
+                .into_any_element();
+        }
 
         if self.dirty {
             self.dirty = false;
@@ -869,31 +1268,7 @@ impl Render for PlaylistsView {
             .flex_col()
             .bg(theme.rail_bg)
             .font_family(theme.font)
-            .child(panel_header(
-                theme,
-                "Library",
-                theme.cell_px(),
-                Some(
-                    div()
-                        .id("open-settings")
-                        .flex_none()
-                        .px_1()
-                        .rounded_md()
-                        .cursor_pointer()
-                        .text_size(px(theme.cell_px()))
-                        .text_color(theme.text_muted)
-                        .hover(|d| d.bg(theme.row_hover).text_color(theme.text))
-                        .on_click(cx.listener(|this, _event, window, cx| {
-                            this.tabs.update(cx, |tabs, cx| tabs.open_settings(window, cx));
-                        }))
-                        .child("⚙")
-                        .into_any_element(),
-                ),
-                None,
-                if scanning { Some(("scanning…", theme.text_muted)) } else { None },
-                None,
-                None,
-            ))
+            .child(library_header(theme, header_h, scanning, cx))
             .child(
                 div()
                     .flex_1()
@@ -901,6 +1276,15 @@ impl Render for PlaylistsView {
                     .w_full()
                     .px_2()
                     .child(list(self.list_state.clone(), render).size_full()),
+            )
+            .child(
+                div()
+                    .pt_1()
+                    .px_2()
+                    .pb_2()
+                    .border_t_1()
+                    .border_color(theme.border)
+                    .child(settings_button(theme, false, cx)),
             );
 
         if let Some(menu) = &self.menu {
@@ -983,7 +1367,7 @@ impl Render for PlaylistsView {
             }
         }
 
-        root
+        root.into_any_element()
     }
 }
 
@@ -1013,16 +1397,23 @@ fn rail_row(
     // that can't expand — so labels line up down the rail, and a parent's
     // arrow sits exactly on the line its children hang from.
     let guide = theme.cell_px() * 1.1;
-    let slot = match branch {
-        Branch::Plain => div().flex_none().w(px(guide)),
-        Branch::Line => div().flex_none().w(px(guide)).border_l_1().border_color(theme.border),
-        Branch::Toggle(expanded) => div()
-            .flex_none()
-            .relative()
-            .w(px(guide))
-            .border_l_1()
-            .border_color(theme.border)
-            .child(expand_triangle(theme, expanded)),
+    let (pad_left, slot) = match branch {
+        Branch::Flush => (1.0, div().flex_none().w(px(0.0))),
+        Branch::Plain => (8.0, div().flex_none().w(px(guide))),
+        Branch::Line => (
+            8.0,
+            div().flex_none().w(px(guide)).border_l_1().border_color(theme.border),
+        ),
+        Branch::Toggle(expanded) => (
+            8.0,
+            div()
+                .flex_none()
+                .relative()
+                .w(px(guide))
+                .border_l_1()
+                .border_color(theme.border)
+                .child(expand_triangle(theme, expanded)),
+        ),
     };
     // The fade dissolves the text into whatever the row's background is, so
     // both come from the same `wash`: the plain rail, or the hover wash while
@@ -1033,7 +1424,7 @@ fn rail_row(
         .id(id.into())
         .flex()
         .w_full()
-        .pl_2()
+        .pl(px(pad_left))
         .pr_2()
         .rounded_md()
         .cursor_pointer()
@@ -1094,6 +1485,10 @@ enum Branch {
     Plain,
     Line,
     Toggle(bool),
+    /// A row with no chevron column of its own: its label starts at the same
+    /// x as a group glyph's left edge. Used for the Playlists section rows so
+    /// the title and its playlists line up with each other.
+    Flush,
 }
 
 /// The section chevrons, painted from unit-square polygons (the same way the

@@ -343,7 +343,7 @@ impl Render for QueueView {
         // advance turns a width into the character count the marquee's travel
         // math wants.
         let advance = marquee::char_advance(window, theme, theme.cell_px());
-        let text_w = (width - ROW_H_PAD_PX - ROW_GAPS_PX - theme.num_col()).max(0.0);
+        let text_w = (width - ROW_H_PAD_PX - ROW_GAPS_PX - theme.number_col()).max(0.0);
         let title_chars = ((text_w * 0.58 / advance) as usize).max(8);
         let artist_chars = ((text_w * 0.42 / advance) as usize).max(8);
         self.list.rows_mut().set_columns_chars(title_chars, artist_chars);
@@ -474,7 +474,7 @@ impl Render for QueueView {
                     .bg(theme.row_active)
                     .border_1()
                     .border_color(theme.border)
-                    .child(div().w(px(theme.num_col())).flex_none())
+                    .child(div().w(px(theme.number_col())).flex_none())
                     .child(
                         div()
                             .flex_1()

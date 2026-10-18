@@ -199,6 +199,9 @@ pub struct Config {
     /// Whether the spectrum-bar band above the lyrics is shown.
     #[serde(default = "default_visualizer")]
     pub visualizer: bool,
+    /// Whether the left library rail is collapsed to its header button.
+    #[serde(default)]
+    pub sidebar_minimized: bool,
     /// Where the window was when the app last ran, so it reopens the same
     /// size and position.
     #[serde(default)]
@@ -215,6 +218,7 @@ impl Default for Config {
             roots: Vec::new(),
             waveform: WaveformStyle::default(),
             visualizer: default_visualizer(),
+            sidebar_minimized: false,
             window: None,
         }
     }
@@ -456,6 +460,19 @@ mod tests {
         let json = r#"{"theme":"Dark","font_sizes":{},"roots":[]}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.visualizer);
+    }
+
+    #[test]
+    fn sidebar_minimized_defaults_off_and_round_trips() {
+        let json = r#"{"theme":"Dark","font_sizes":{},"roots":[]}"#;
+        let old: Config = serde_json::from_str(json).unwrap();
+        assert!(!old.sidebar_minimized, "old config leaves the sidebar open");
+
+        let mut config = Config::default();
+        config.sidebar_minimized = true;
+        let bytes = serde_json::to_vec(&config).unwrap();
+        let back: Config = serde_json::from_slice(&bytes).unwrap();
+        assert!(back.sidebar_minimized);
     }
 
     #[test]

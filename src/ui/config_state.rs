@@ -100,6 +100,11 @@ impl ConfigState {
         self.config.visualizer
     }
 
+    /// Whether the left library rail is collapsed to its header button.
+    pub fn sidebar_minimized(&self) -> bool {
+        self.config.sidebar_minimized
+    }
+
     // --- actions -------------------------------------------------------
 
     pub fn set_theme(&mut self, kind: ThemeKind, cx: &mut Context<Self>) {
@@ -110,7 +115,6 @@ impl ConfigState {
         }
     }
 
-    /// Set the waveform style the transport bar draws with.
     /// Set the waveform style the transport bar draws with.
     pub fn set_waveform(&mut self, style: WaveformStyle, cx: &mut Context<Self>) {
         if self.config.waveform != style {
@@ -125,6 +129,16 @@ impl ConfigState {
     pub fn set_visualizer(&mut self, on: bool, cx: &mut Context<Self>) {
         if self.config.visualizer != on {
             self.config.visualizer = on;
+            self.persist();
+            cx.notify();
+        }
+    }
+
+    /// Collapse or expand the left library rail. The workspace observes this
+    /// and slides the rail to its new width.
+    pub fn set_sidebar_minimized(&mut self, minimized: bool, cx: &mut Context<Self>) {
+        if self.config.sidebar_minimized != minimized {
+            self.config.sidebar_minimized = minimized;
             self.persist();
             cx.notify();
         }

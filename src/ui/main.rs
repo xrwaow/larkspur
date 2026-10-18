@@ -64,6 +64,7 @@ fn main() {
     }
     // Read before `config` moves into the state: the layout is built from it.
     let visualizer_on = config.visualizer;
+    let sidebar_minimized = config.sidebar_minimized;
 
     Application::new().with_assets(Assets).run(move |cx: &mut App| {
         // Reopen where the window was last closed; a first run opens at half
@@ -179,6 +180,7 @@ fn main() {
                         library_state.clone(),
                         tabs.clone(),
                         config_state.clone(),
+                        cover_store.clone(),
                         animator.clone(),
                         cx,
                     )
@@ -224,26 +226,49 @@ fn main() {
                 // it's shared with the text-introspection tooling. Here we
                 // only bind live views to its module ids.
                 let workspace = cx.new(|cx| {
-                    let mut workspace = Workspace::from_plan(layout::app_layout(visualizer_on), &config_state, cx);
+                    let mut workspace = Workspace::from_plan(
+                        layout::app_layout_with_rail(
+                            visualizer_on,
+                            layout::rail_px(sidebar_minimized),
+                        ),
+                        &config_state,
+                        cx,
+                    );
                     workspace.push(playlists);
                     workspace.push(visualizer);
                     workspace.push(lyrics);
                     workspace.push(cover);
                     workspace.push(playback);
                     workspace.push(tabs);
+                    // The rail's collapse/expand slides on the shared frame
+                    // clock rather than snapping between widths.
+                    workspace.attach_animator(animator.clone(), cx);
 
                     // The visualizer band is added/removed from the rail live
-                    // when its setting flips. The flag guards against re-planning
-                    // (and re-rendering the whole workspace) on unrelated config
-                    // changes.
+                    // when its setting flips, and the left rail slides to its
+                    // collapsed width when it's minimized. The flags guard
+                    // against re-planning (and re-rendering the whole
+                    // workspace) on unrelated config changes.
                     let shown = Rc::new(Cell::new(visualizer_on));
+                    let minimized = Rc::new(Cell::new(sidebar_minimized));
                     let shown = shown.clone();
+                    let minimized = minimized.clone();
                     cx.observe(&config_state, move |workspace: &mut Workspace, config, cx| {
                         let on = config.read(cx).visualizer();
+                        let mini = config.read(cx).sidebar_minimized();
                         if on != shown.get() {
                             shown.set(on);
-                            workspace.set_plan(layout::app_layout(on));
+                            // Keep the rail where it is on screen (it may be
+                            // mid-slide) while the visualizer band changes.
+                            workspace.set_plan(layout::app_layout_with_rail(
+                                on,
+                                workspace.rail_width(),
+                            ));
                             cx.notify();
+                        }
+                        if mini != minimized.get() {
+                            minimized.set(mini);
+                            workspace.animate_rail_to(layout::rail_px(mini), cx);
                         }
                     })
                     .detach();
