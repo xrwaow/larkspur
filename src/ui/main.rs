@@ -10,6 +10,7 @@ use gpui::{
 use larkspur::audio::PlaybackController;
 use larkspur::model::{Config, LibraryCache, WindowPlacement};
 use larkspur::ui::animation::Animator;
+use larkspur::ui::assets::Assets;
 use larkspur::ui::config_state::ConfigState;
 use larkspur::ui::container::Workspace;
 use larkspur::ui::cover::CoverView;
@@ -64,7 +65,7 @@ fn main() {
     // Read before `config` moves into the state: the layout is built from it.
     let visualizer_on = config.visualizer;
 
-    Application::new().run(move |cx: &mut App| {
+    Application::new().with_assets(Assets).run(move |cx: &mut App| {
         // Reopen where the window was last closed; a first run opens at half
         // the monitor's size, centered.
         let bounds = config.window.map(|placement| {

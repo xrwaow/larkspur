@@ -30,7 +30,7 @@ use crate::ui::cover_store::CoverStore;
 use crate::ui::input::action_for_key;
 use crate::ui::library_state::LibraryState;
 use crate::ui::playback_state::PlaybackState;
-use crate::ui::playback::icon;
+use crate::ui::playback::svg_icon;
 use crate::ui::text_field::TextField;
 use crate::ui::widgets::{empty_hint, panel_header, search_box};
 
@@ -234,59 +234,54 @@ impl Render for BrowseView {
                 // right now.
                 matches!(self.scope, Scope::Library | Scope::Artist(_) | Scope::Folder { .. })
                     .then(|| {
-                    // Fixed-width and pushed to the right edge: the albums·songs
-                    // readout changes with the filter, and a flexed box would
-                    // resize on every keystroke.
+                    // Fixed-width: the albums·songs readout changes with the
+                    // filter, and a flexed box would resize on every keystroke.
                     div()
-                        .flex()
-                        .items_center()
-                        .flex_1()
-                        .min_w_0()
-                        .justify_end()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex_none()
-                                .w(px(theme.cell_px() * 22.0))
-                                .child(search_box(
-                                    theme,
-                                    &self.search,
-                                    &self.search_focus,
-                                    Some(placeholder),
-                                    false,
-                                    Some("ctrl+f"),
-                                    Some(Box::new(cx.listener(|this, _event, _window, cx| {
-                                        this.search.clear();
-                                        this.list.rows_mut().mark_dirty();
-                                        cx.notify();
-                                    }))),
-                                    None,
-                                    window,
-                                )),
-                        )
-                        .child(
-                            div()
-                                .id("shuffle")
-                                .flex_none()
-                                .px_2()
-                                .py_1()
-                                .rounded_md()
-                                .cursor_pointer()
-                                .hover(|d| d.bg(theme.row_hover))
-                                .on_click(cx.listener(|this, _event, _window, cx| {
-                                    let playback = this.list.playback().clone();
-                                    let scope = this.scope.clone();
-                                    this.list.library().clone().update(cx, |state, cx| {
-                                        state.play_shuffled(scope, &playback, cx)
-                                    });
-                                }))
-                                .child(icon(
-                                    theme.cell_px() * 1.6,
-                                    theme.cell_px() * 1.6,
-                                    SHUFFLE_POLYGONS,
-                                    theme.text_muted,
-                                )),
-                        )
+                        .flex_none()
+                        .w(px(theme.cell_px() * 22.0))
+                        .child(search_box(
+                            theme,
+                            &self.search,
+                            &self.search_focus,
+                            Some(placeholder),
+                            false,
+                            Some("ctrl+f"),
+                            Some(Box::new(cx.listener(|this, _event, _window, cx| {
+                                this.search.clear();
+                                this.list.rows_mut().mark_dirty();
+                                cx.notify();
+                            }))),
+                            None,
+                            window,
+                        ))
+                        .into_any_element()
+                }),
+                matches!(self.scope, Scope::Library | Scope::Artist(_) | Scope::Folder { .. })
+                    .then(|| {
+                    div()
+                        .id("shuffle")
+                        .flex_none()
+                        .px_2()
+                        .py_1()
+                        .rounded_md()
+                        .cursor_pointer()
+                        .hover(|d| d.bg(theme.row_hover))
+                        .on_click(cx.listener(|this, _event, _window, cx| {
+                            let playback = this.list.playback().clone();
+                            let scope = this.scope.clone();
+                            this.list.library().clone().update(cx, |state, cx| {
+                                state.play_shuffled(scope, &playback, cx)
+                            });
+                        }))
+                        // The shuffle SVG is inset ~21% inside its viewBox;
+                        // the larger box makes the visible mark read at the
+                        // same 1.6×cell size as a full-bleed icon.
+                        .child(svg_icon(
+                            theme.cell_px() * 2.0,
+                            theme.cell_px() * 2.0,
+                            "assets/shuffle.svg",
+                            theme.text_muted,
+                        ))
                         .into_any_element()
                 }),
             ));
@@ -315,12 +310,3 @@ impl Render for BrowseView {
         root
     }
 }
-
-const SHUFFLE_POLYGONS: &[&[(f32, f32)]] = &[
-    // Top-left arm, falling to the bottom-right head.
-    &[(0.0, 0.28), (0.35, 0.28), (0.68, 0.64), (0.68, 0.80), (0.35, 0.44), (0.0, 0.44)],
-    &[(0.66, 0.50), (0.98, 0.72), (0.66, 0.94)],
-    // Bottom-left arm, rising to the top-right head.
-    &[(0.0, 0.56), (0.35, 0.56), (0.68, 0.20), (0.68, 0.36), (0.35, 0.72), (0.0, 0.72)],
-    &[(0.66, 0.06), (0.98, 0.28), (0.66, 0.50)],
-];

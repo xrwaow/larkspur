@@ -892,6 +892,7 @@ impl Render for PlaylistsView {
                 None,
                 if scanning { Some(("scanning…", theme.text_muted)) } else { None },
                 None,
+                None,
             ))
             .child(
                 div()

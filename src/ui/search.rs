@@ -223,6 +223,7 @@ impl Render for SearchView {
                 None,
                 Some((&summary, hint_color)),
                 None,
+                None,
             ));
 
         if sections.is_empty() {

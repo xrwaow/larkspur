@@ -140,8 +140,10 @@ pub fn panel_header(
     subtitle: Option<&str>,
     hint: Option<(&str, Rgba)>,
     tools: Option<AnyElement>,
+    trailing: Option<AnyElement>,
 ) -> AnyElement {
     div()
+        .relative()
         .flex()
         .items_center()
         .justify_between()
@@ -176,9 +178,9 @@ pub fn panel_header(
                                     .child(subtitle.to_string()),
                             )
                         }),
-                )
-                .when_some(tools, |d, tools| d.child(tools)),
+                ),
         )
+        .when_some(trailing, |d, trailing| d.child(trailing))
         .when_some(hint, |d, (hint, color)| {
             d.child(
                 div()
@@ -186,6 +188,19 @@ pub fn panel_header(
                     .text_size(px(theme.small_px()))
                     .text_color(color)
                     .child(hint.to_string()),
+            )
+        })
+        // Tools live in an overlay so they can center on the whole header
+        // rather than on whatever space the title leaves over.
+        .when_some(tools, |d, tools| {
+            d.child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .child(tools),
             )
         })
         .into_any_element()
@@ -230,16 +245,11 @@ pub fn search_box(
         ),
         _ => trailing,
     };
-    let mut box_el = div()
-        .flex()
-        .items_center()
-        .gap_2()
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .bg(theme.row_odd)
-        .border_1()
-        .border_color(if accented { theme.accent } else { theme.border })
+    let focused = focus.is_focused(window);
+    // Shared chrome with the plain box, so the search box matches every other
+    // field. `accented` keeps the overlay's pinned-open highlight even while
+    // the box is blurred.
+    let mut box_el = TextField::chrome(theme, accented || focused)
         .track_focus(focus)
         .child(field.render_text(theme, placeholder, focus, window));
     if hint.is_some() && field.is_empty() && !focus.is_focused(window) {

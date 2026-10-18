@@ -3,7 +3,7 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    canvas, div, point, prelude::*, px, AnyElement, Bounds, ClickEvent, Context, Entity,
+    canvas, div, point, prelude::*, px, svg, AnyElement, Bounds, ClickEvent, Context, Entity,
     MouseButton, MouseDownEvent, PathBuilder, Pixels, Render, Rgba, Subscription, Window,
 };
 
@@ -170,6 +170,17 @@ impl Container for PlaybackView {
 pub(crate) const BAR_WIDTH: f32 = 480.0;
 const BAR_HEIGHT: f32 = 40.0;
 
+/// Every transport control — including play/pause — shares one hit area and
+/// one glyph box, so the row reads as a single set rather than a giant play
+/// button surrounded by small ones.
+const TRANSPORT_BUTTON: f32 = 36.0;
+const TRANSPORT_ICON: f32 = 16.0;
+
+/// The repeat SVGs are drawn with roughly 24% horizontal padding inside their
+/// viewBox, so at a 16px box their visible mark is only ~12px wide. The larger
+/// box compensates so the mark reads at the same width as the polygon glyphs.
+const REPEAT_ICON: f32 = 21.0;
+
 impl Render for PlaybackView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.themed.theme();
@@ -246,9 +257,9 @@ impl Render for PlaybackView {
                 }),
             );
 
-        // The waveform sits on top, flanked by the two times; below it the
-        // transport buttons on the left. The live bitrate lives in the tab
-        // strip's right edge (ui::tabs), not here.
+        // Transport buttons on top, the waveform below flanked by the two
+        // times. The live bitrate lives in the tab strip's right edge
+        // (ui::tabs), not here.
         div()
             .flex()
             .flex_col()
@@ -262,27 +273,8 @@ impl Render for PlaybackView {
                 div()
                     .flex()
                     .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_size(px(theme.small_px()))
-                            .text_color(theme.text_muted)
-                            .child(format_duration(position)),
-                    )
-                    .child(seek_bar)
-                    .child(
-                        div()
-                            .text_size(px(theme.small_px()))
-                            .text_color(theme.text_muted)
-                            .child(format_duration(duration)),
-                    ),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
                     .justify_center()
-                    .gap_2()
+                    .gap_3()
                     .w_full()
                     .child(repeat_toggle(theme, repeat, self.repeat_hovered, cx))
                     .child(transport_button(
@@ -316,6 +308,25 @@ impl Render for PlaybackView {
                     ))
                     .child(queue_toggle(theme, queue_open, self.queue_hovered, cx)),
             )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .child(
+                        div()
+                            .text_size(px(theme.small_px()))
+                            .text_color(theme.text_muted)
+                            .child(format_duration(position)),
+                    )
+                    .child(seek_bar)
+                    .child(
+                        div()
+                            .text_size(px(theme.small_px()))
+                            .text_color(theme.text_muted)
+                            .child(format_duration(duration)),
+                    ),
+            )
     }
 }
 
@@ -326,7 +337,7 @@ fn play_button(playing: bool, ended: bool, theme: Theme, cx: &mut Context<Playba
         .when(!ended, |d| d.cursor_pointer())
         .when(ended, |d| d.opacity(0.4))
         .rounded_full()
-        .size(px(48.0))
+        .size(px(TRANSPORT_BUTTON))
         .flex()
         .items_center()
         .justify_center()
@@ -359,7 +370,7 @@ fn repeat_toggle(
     div()
         .id("repeat-toggle")
         .cursor_pointer()
-        .size(px(36.0))
+        .size(px(TRANSPORT_BUTTON))
         .flex()
         .items_center()
         .justify_center()
@@ -370,10 +381,10 @@ fn repeat_toggle(
         .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
             this.state.update(cx, |state, cx| state.cycle_repeat(cx));
         }))
-        .child(icon(
-            15.0,
-            14.0,
-            if repeat == RepeatMode::Once { REPEAT_ONCE_POLYGONS } else { REPEAT_POLYGONS },
+        .child(svg_icon(
+            REPEAT_ICON,
+            REPEAT_ICON,
+            if repeat == RepeatMode::Once { "assets/repeat_one.svg" } else { "assets/repeat.svg" },
             if repeat != RepeatMode::Off || hovered { theme.accent } else { theme.text_muted },
         ))
         .into_any_element()
@@ -397,17 +408,17 @@ fn queue_toggle(theme: Theme, queue_open: bool, hovered: bool, cx: &mut Context<
             this.state.update(cx, |state, cx| state.toggle_queue(cx));
         }))
         .child(icon(
-            15.0,
-            14.0,
+            TRANSPORT_ICON,
+            TRANSPORT_ICON,
             QUEUE_POLYGONS,
             if queue_open || hovered { theme.accent } else { theme.text_muted },
         ))
         .into_any_element()
 }
 
-/// Unit-square polygon sets for the transport icons, painted via
-/// `PathBuilder` — gpui has no per-side border colors, so the old
-/// CSS-border triangle trick just rendered solid squares.
+/// Transport glyphs that stay as unit-square polygons rather than SVGs — the
+/// triangle, pause bars, and skip arrows are simple enough that drawing them
+/// directly keeps them crisp and free of asset padding.
 const PLAY_POLYGONS: &[&[(f32, f32)]] = &[&[(0.0, 0.0), (0.0, 1.0), (1.0, 0.5)]];
 
 const PAUSE_POLYGONS: &[&[(f32, f32)]] = &[
@@ -425,50 +436,6 @@ const PREV_POLYGONS: &[&[(f32, f32)]] = &[
     &[(0.0, 0.0), (0.2, 0.0), (0.2, 1.0), (0.0, 1.0)],
 ];
 
-/// The repeat glyph: two curved arrows chasing each other around a rounded
-/// loop — the top one flows right, the bottom one flows left. Each arrow is a
-/// straight stub, a quarter-arc (outer/inner radius around a shared center),
-/// a straight run, and a triangular head.
-const REPEAT_POLYGONS: &[&[(f32, f32)]] = &[
-    // Top arrow: rises on the left, curves over the top, heads right.
-    &[(0.10, 0.60), (0.26, 0.60), (0.26, 0.36), (0.10, 0.36)],
-    &[
-        (0.10, 0.36), (0.124, 0.238), (0.194, 0.134), (0.297, 0.065), (0.42, 0.04),
-        (0.42, 0.20), (0.359, 0.212), (0.307, 0.247), (0.256, 0.299), (0.26, 0.36),
-    ],
-    &[(0.42, 0.04), (0.70, 0.04), (0.70, 0.20), (0.42, 0.20)],
-    &[(0.66, 0.00), (0.94, 0.12), (0.66, 0.24)],
-    // Bottom arrow: falls on the right, curves under the bottom, heads left.
-    &[(0.74, 0.40), (0.90, 0.40), (0.90, 0.64), (0.74, 0.64)],
-    &[
-        (0.90, 0.64), (0.876, 0.762), (0.806, 0.866), (0.703, 0.935), (0.58, 0.96),
-        (0.58, 0.80), (0.641, 0.788), (0.693, 0.753), (0.744, 0.701), (0.74, 0.64),
-    ],
-    &[(0.30, 0.80), (0.58, 0.80), (0.58, 0.96), (0.30, 0.96)],
-    &[(0.34, 0.76), (0.06, 0.88), (0.34, 1.00)],
-];
-
-/// Repeat-one: the loop mark plus a "1" in the ring's center.
-const REPEAT_ONCE_POLYGONS: &[&[(f32, f32)]] = &[
-    &[(0.10, 0.60), (0.26, 0.60), (0.26, 0.36), (0.10, 0.36)],
-    &[
-        (0.10, 0.36), (0.124, 0.238), (0.194, 0.134), (0.297, 0.065), (0.42, 0.04),
-        (0.42, 0.20), (0.359, 0.212), (0.307, 0.247), (0.256, 0.299), (0.26, 0.36),
-    ],
-    &[(0.42, 0.04), (0.70, 0.04), (0.70, 0.20), (0.42, 0.20)],
-    &[(0.66, 0.00), (0.94, 0.12), (0.66, 0.24)],
-    &[(0.74, 0.40), (0.90, 0.40), (0.90, 0.64), (0.74, 0.64)],
-    &[
-        (0.90, 0.64), (0.876, 0.762), (0.806, 0.866), (0.703, 0.935), (0.58, 0.96),
-        (0.58, 0.80), (0.641, 0.788), (0.693, 0.753), (0.744, 0.701), (0.74, 0.64),
-    ],
-    &[(0.30, 0.80), (0.58, 0.80), (0.58, 0.96), (0.30, 0.96)],
-    &[(0.34, 0.76), (0.06, 0.88), (0.34, 1.00)],
-    // The "1": a stem with a diagonal serif at its top left.
-    &[(0.46, 0.38), (0.54, 0.38), (0.54, 0.66), (0.46, 0.66)],
-    &[(0.38, 0.48), (0.46, 0.38), (0.46, 0.48)],
-];
-
 /// The queue toggle's glyph: three horizontal bars, the last one shorter —
 /// the standard "up next" list mark.
 const QUEUE_POLYGONS: &[&[(f32, f32)]] = &[
@@ -478,9 +445,16 @@ const QUEUE_POLYGONS: &[&[(f32, f32)]] = &[
 ];
 
 
+/// A fixed-size SVG glyph from `assets/`, tinted to `color`. gpui's `svg()`
+/// element renders through the app's `AssetSource` (see `ui::assets`). Used
+/// for the shuffle, repeat, and repeat-one icons. Their viewBoxes carry
+/// padding, so callers pass a box a little larger than the polygon icons.
+pub(crate) fn svg_icon(w: f32, h: f32, path: &'static str, color: Rgba) -> impl IntoElement {
+    svg().path(path).w(px(w)).h(px(h)).text_color(color)
+}
+
 /// A fixed-size canvas painting filled polygons given in unit-square
-/// coordinates, scaled into the element's bounds. Shared by the transport's
-/// buttons and the library's shuffle glyph.
+/// coordinates, scaled into the element's bounds.
 pub(crate) fn icon(
     w: f32,
     h: f32,
@@ -526,7 +500,7 @@ fn transport_button(
     div()
         .id(id)
         .when(enabled, |d| d.cursor_pointer())
-        .size(px(36.0))
+        .size(px(TRANSPORT_BUTTON))
         .flex()
         .items_center()
         .justify_center()
@@ -539,8 +513,8 @@ fn transport_button(
         // darker than faint text, so a usable button would read as more
         // muted than a disabled one.)
         .child(icon(
-            15.0,
-            14.0,
+            TRANSPORT_ICON,
+            TRANSPORT_ICON,
             polygons,
             if !enabled {
                 theme.text_faint

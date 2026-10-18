@@ -287,6 +287,7 @@ impl Render for SettingsView {
                 None,
                 Some(("esc", theme.text_faint)),
                 None,
+                None,
             ))
             .child(
                 div()

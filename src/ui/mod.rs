@@ -1,6 +1,7 @@
 pub mod album_list;
 pub mod albums;
 pub mod animation;
+pub mod assets;
 pub mod browse;
 pub mod config_state;
 pub mod container;

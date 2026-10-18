@@ -16,11 +16,16 @@
 use std::time::Duration;
 
 use gpui::{
-    div, prelude::*, px, Animation, AnimationExt, AnyElement, FocusHandle, KeyDownEvent, TextRun,
-    Window,
+    div, prelude::*, px, Animation, AnimationExt, AnyElement, Div, FocusHandle, KeyDownEvent,
+    TextRun, Window,
 };
 
 use crate::ui::theme::Theme;
+
+/// Left inset of the text inside the field. The text, placeholder, and caret
+/// all start here, so nothing shifts when you focus, type, or select, and the
+/// caret never touches the border.
+const TEXT_INSET: f32 = 4.0;
 
 #[derive(Default, Clone)]
 pub struct TextField {
@@ -218,12 +223,22 @@ impl TextField {
         self.anchor = self.caret;
     }
 
+    /// The shared box chrome: roomier padding, softer corners, and an accent
+    /// border while focused. Use this for the search box too.
+    pub fn chrome(theme: Theme, focused: bool) -> Div {
+        div()
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_1p5()
+            .rounded_lg()
+            .bg(theme.row_odd)
+            .border_1()
+            .border_color(if focused { theme.accent } else { theme.border })
+    }
+
     /// Render the box: the text with a caret and selection, or a placeholder.
-    ///
-    /// `focus` is the handle the surrounding view tracks on the box chrome: the
-    /// caret and selection only draw while it holds window focus, and clicking
-    /// the chrome focuses it (gpui focuses `track_focus` elements on mouse
-    /// down), so a field never types unless it was actually selected.
     pub fn render(
         &self,
         theme: Theme,
@@ -231,28 +246,17 @@ impl TextField {
         focus: &FocusHandle,
         window: &Window,
     ) -> AnyElement {
-        div()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_2()
-            .py_1()
-            .rounded_md()
-            .bg(theme.row_odd)
-            .border_1()
-            .border_color(theme.border)
+        Self::chrome(theme, focus.is_focused(window))
             .track_focus(focus)
             .child(self.render_text(theme, Some(placeholder), focus, window))
             .into_any_element()
     }
 
-    /// Render just the editable text — the caret, selection, and placeholder —
-    /// so a caller can wrap it in its own chrome (e.g. the search box).
+    /// Render just the editable text: caret, selection, and placeholder.
     ///
-    /// The value is laid out as **one** text run with the caret overlaid at its
-    /// measured x position. Splitting the text around the caret (the old way)
-    /// shaped each side separately, which dropped the kerning across the
-    /// boundary — characters visibly shifted size as the caret moved past them.
+    /// The value is always a single text run, so kerning never changes. The
+    /// caret and selection are absolutely positioned overlays measured with
+    /// the same font, and the placeholder starts at the same x as real text.
     pub fn render_text(
         &self,
         theme: Theme,
@@ -272,61 +276,70 @@ impl TextField {
             .text_size(px(theme.cell_px()))
             .text_color(theme.text);
 
-        match self.selection() {
-            Some((start, end)) if focused => {
-                row = row
-                    .child(self.value[..start].to_string())
+        let selection = if focused { self.selection() } else { None };
+
+        // Selection highlight goes first so the text paints on top of it.
+        if let Some((start, end)) = selection {
+            let x0 = caret_x(&self.value, start, theme, window);
+            let x1 = caret_x(&self.value, end, theme, window);
+            row = row.child(
+                div()
+                    .absolute()
+                    .top(px(2.0))
+                    .bottom(px(2.0))
+                    .left(px(TEXT_INSET + x0))
+                    .w(px((x1 - x0).max(0.0)))
+                    .rounded_sm()
+                    .bg(theme.selection),
+            );
+        }
+
+        if self.value.is_empty() {
+            if let Some(placeholder) = placeholder {
+                // Same start x as typed text, so there's no jump on first key.
+                row = row.child(
+                    div()
+                        .ml(px(TEXT_INSET))
+                        .flex_none()
+                        .whitespace_nowrap()
+                        .text_color(theme.text_faint)
+                        .child(placeholder.to_string()),
+                );
+            }
+        } else {
+            row = row.child(
+                div()
+                    .ml(px(TEXT_INSET))
+                    .flex_none()
+                    .whitespace_nowrap()
+                    .child(self.value.clone()),
+            );
+        }
+
+        if focused && selection.is_none() {
+            let x = caret_x(&self.value, self.caret, theme, window);
+            row = row.child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .bottom_0()
+                    // Center the 2px bar on the character boundary.
+                    .left(px(TEXT_INSET + x - 1.0))
+                    .flex()
+                    .items_center()
                     .child(
                         div()
-                            .flex_none()
+                            .w(px(2.0))
+                            .h(px(caret_px))
                             .rounded_sm()
-                            .bg(theme.selection)
-                            .text_color(theme.text)
-                            .child(self.value[start..end].to_string()),
-                    )
-                    .child(self.value[end..].to_string());
-            }
-            _ => {
-                row = row.child(self.value.clone());
-                if focused {
-                    let x = caret_x(&self.value, self.caret, theme, window);
-                    row = row.child(
-                        div()
-                            .absolute()
-                            .top_0()
-                            .bottom_0()
-                            .left(px(x))
-                            .flex()
-                            .items_center()
-                            .child(
-                                div()
-                                    .w(px(2.0))
-                                    .h(px(caret_px))
-                                    .bg(theme.accent)
-                                    // The standard caret blink: a beat on, a
-                                    // beat off, looping.
-                                    .with_animation(
-                                        "caret-blink",
-                                        Animation::new(Duration::from_millis(1100)).repeat(),
-                                        |bar, delta| {
-                                            bar.opacity(if delta < 0.5 { 1.0 } else { 0.0 })
-                                        },
-                                    ),
+                            .bg(theme.accent)
+                            .with_animation(
+                                "caret-blink",
+                                Animation::new(Duration::from_millis(1100)).repeat(),
+                                |bar, delta| bar.opacity(if delta < 0.5 { 1.0 } else { 0.0 }),
                             ),
-                    );
-                }
-                if self.value.is_empty() {
-                    if let Some(placeholder) = placeholder {
-                        row = row.child(
-                            div()
-                                .flex_none()
-                                .pl_2()
-                                .text_color(theme.text_faint)
-                                .child(placeholder.to_string()),
-                        );
-                    }
-                }
-            }
+                    ),
+            );
         }
         row.into_any_element()
     }
