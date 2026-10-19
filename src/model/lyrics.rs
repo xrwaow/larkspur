@@ -17,8 +17,9 @@ pub struct LyricLine {
 /// timestamps, so `Synced` usually comes from a `.lrc` sidecar — but some
 /// taggers *do* embed LRC-formatted text, which is why [`looks_like_lrc`]
 /// sniffs the tag contents rather than trusting the source.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Lyrics {
+    #[default]
     None,
     /// Unsynced text, shown as a block.
     Plain(String),
@@ -98,7 +99,11 @@ pub(crate) fn parse_timestamp_tag(tag: &str) -> Option<Duration> {
     let mut parts = tag.splitn(2, ':');
     let min: u64 = parts.next()?.trim().parse().ok()?;
     let sec: f64 = parts.next()?.trim().parse().ok()?;
-    Some(Duration::from_secs_f64(min as f64 * 60.0 + sec))
+    let total = min as f64 * 60.0 + sec;
+    if !sec.is_finite() || sec < 0.0 || !total.is_finite() || total < 0.0 {
+        return None;
+    }
+    Duration::try_from_secs_f64(total).ok()
 }
 
 /// Parses LRC-format lyrics text into synced lines.
@@ -225,5 +230,12 @@ mod tests {
         assert_eq!(parse_timestamp_tag("00:01"), Some(at(0, 1.0)));
         assert_eq!(parse_timestamp_tag("01:02.50"), Some(at(1, 2.5)));
         assert_eq!(parse_timestamp_tag("ti:Title"), None);
+    }
+
+    #[test]
+    fn rejects_non_finite_timestamps_without_panicking() {
+        assert_eq!(parse_timestamp_tag("00:nan"), None);
+        assert_eq!(parse_timestamp_tag("00:inf"), None);
+        assert_eq!(parse_timestamp_tag("01:-5"), None);
     }
 }

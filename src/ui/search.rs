@@ -67,10 +67,11 @@ impl SearchView {
         cx: &mut Context<Self>,
     ) -> Self {
         let observe = crate::ui::album_list::observe(&library, None, &covers, &animator, cx);
+        let wake = animator.read(cx).wake_handle();
         // Search is the one view that keeps the compact single: a one-track
         // section collapses into a single row carrying its cover.
-        let mut list = AlbumListView::new(library, playback, covers, animator, Play::Result);
-        list.rows_mut().set_compact_singles();
+        let mut list = AlbumListView::new(library, playback, covers, animator, wake, Play::Result);
+        list.rows_mut().set_layout(albums::RowLayout::CompactSingles);
         // The search overlay draws the library's rows, so it shares the browse
         // list's typography — one size, so the tabs can't drift apart.
         let themed = BrowseView::themed(&config, cx);

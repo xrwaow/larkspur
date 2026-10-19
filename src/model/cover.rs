@@ -1,6 +1,8 @@
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use super::identity::SongId;
+
 /// Decoded, already-downscaled RGBA pixel buffer ready for GPU upload.
 /// Kept deliberately minimal/framework-agnostic — GPUI's own asset
 /// system owns the actual texture upload.
@@ -31,7 +33,7 @@ impl DecodedImage {
 pub struct CoverCache<T> {
     /// Each entry keeps its own byte size, so a replaced or evicted entry can
     /// be subtracted from the running total.
-    memory: lru::LruCache<u64, (Arc<T>, usize)>,
+    memory: lru::LruCache<SongId, (Arc<T>, usize)>,
     memory_bytes: usize,
     memory_budget_bytes: usize,
     disk_dir: PathBuf,
@@ -49,7 +51,7 @@ impl<T> CoverCache<T> {
         }
     }
 
-    pub fn get(&mut self, id: u64) -> Option<Arc<T>> {
+    pub fn get(&mut self, id: SongId) -> Option<Arc<T>> {
         self.memory.get(&id).map(|(value, _)| value.clone())
     }
 
@@ -60,7 +62,7 @@ impl<T> CoverCache<T> {
     /// Returns the ids it evicted, so a caller keeping a parallel map (the UI's
     /// GPU-ready images) can drop the same entries and stay in lockstep with
     /// this cache instead of growing a second, unbounded one.
-    pub fn insert(&mut self, id: u64, value: Arc<T>, bytes: usize) -> Vec<u64> {
+    pub fn insert(&mut self, id: SongId, value: Arc<T>, bytes: usize) -> Vec<SongId> {
         let mut evicted = Vec::new();
 
         // `put` hands back the entry it displaced. Account for it, or a
@@ -90,8 +92,8 @@ impl<T> CoverCache<T> {
         self.memory_bytes
     }
 
-    pub fn disk_path(&self, id: u64) -> PathBuf {
-        self.disk_dir.join(format!("{id:016x}.jpg"))
+    pub fn disk_path(&self, id: SongId) -> PathBuf {
+        self.disk_dir.join(format!("{:016x}.jpg", id.get()))
     }
 }
 
@@ -108,7 +110,7 @@ mod tests {
     }
 
     /// Insert accounting for the payload's real size, the way the UI does.
-    fn insert(c: &mut CoverCache<DecodedImage>, id: u64, bytes: usize) -> Vec<u64> {
+    fn insert(c: &mut CoverCache<DecodedImage>, id: SongId, bytes: usize) -> Vec<SongId> {
         let image = image(bytes);
         let size = image.byte_len();
         c.insert(id, image, size)
@@ -117,29 +119,29 @@ mod tests {
     #[test]
     fn evicts_least_recently_used_to_meet_budget() {
         let mut c = cache(100);
-        insert(&mut c, 1, 60);
-        let evicted = insert(&mut c, 2, 60); // 120 > 100, so id 1 goes first
-        assert_eq!(evicted, vec![1], "the caller is told what was dropped");
-        assert!(c.get(1).is_none());
-        assert!(c.get(2).is_some());
+        insert(&mut c, SongId(1), 60);
+        let evicted = insert(&mut c, SongId(2), 60); // 120 > 100, so id 1 goes first
+        assert_eq!(evicted, vec![SongId(1)], "the caller is told what was dropped");
+        assert!(c.get(SongId(1)).is_none());
+        assert!(c.get(SongId(2)).is_some());
         assert_eq!(c.memory_usage(), 60);
     }
 
     #[test]
     fn reinsert_does_not_leak_budget() {
         let mut c = cache(100);
-        insert(&mut c, 1, 60);
-        insert(&mut c, 1, 60); // replace, not accumulate
+        insert(&mut c, SongId(1), 60);
+        insert(&mut c, SongId(1), 60); // replace, not accumulate
         assert_eq!(c.memory_usage(), 60);
-        assert!(c.get(1).is_some());
+        assert!(c.get(SongId(1)).is_some());
     }
 
     #[test]
     fn oversized_image_does_not_stay_cached() {
         let mut c = cache(10);
-        let evicted = insert(&mut c, 1, 50);
-        assert_eq!(evicted, vec![1], "it evicted itself");
+        let evicted = insert(&mut c, SongId(1), 50);
+        assert_eq!(evicted, vec![SongId(1)], "it evicted itself");
         assert_eq!(c.memory_usage(), 0);
-        assert!(c.get(1).is_none());
+        assert!(c.get(SongId(1)).is_none());
     }
 }

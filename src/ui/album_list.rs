@@ -17,14 +17,14 @@ use gpui::{canvas, div, prelude::*, px, Context, Entity, KeyDownEvent, Render, S
 
 use crate::model::select::{Order, Scope, Selection};
 use crate::model::{search, InputAction, Library, PlaylistId, SongId};
-use crate::ui::albums::{self, AlbumSection, RowActions};
-use crate::ui::animation::Animator;
+use crate::ui::albums::{self, AlbumSection, RowActions, SectionSource};
+use crate::ui::animation::{Animator, WakeHandle};
 use crate::ui::cover_store::CoverStore;
 use crate::ui::drag::DragInfo;
 use crate::ui::format::format_bitrate;
 use crate::ui::input::action_for_key;
 use crate::ui::library_state::{LibraryState, Request};
-use crate::ui::menu::SongMenuRequest;
+use crate::ui::menu::{MenuOrigin, SongMenuRequest};
 use crate::ui::playback_state::PlaybackState;
 use crate::ui::row_list::{Cell, RowAction, RowList, SmoothScroll};
 use crate::ui::theme::Theme;
@@ -69,6 +69,9 @@ pub struct AlbumListView {
     covers: Entity<CoverStore>,
     /// The shared frame clock, read for the playing row's equalizer phase.
     animator: Entity<Animator>,
+    /// A no-`Context` handle to that clock, so any row operation that starts a
+    /// fade, slide, or eased scroll can wake it.
+    wake: WakeHandle,
     play: Play,
     rows: RowList,
     /// The icon grid's scroll offset, in px from the top — owned outright (no
@@ -100,6 +103,7 @@ impl AlbumListView {
         playback: Entity<PlaybackState>,
         covers: Entity<CoverStore>,
         animator: Entity<Animator>,
+        wake: WakeHandle,
         play: Play,
     ) -> Self {
         Self {
@@ -107,6 +111,7 @@ impl AlbumListView {
             playback,
             covers,
             animator,
+            wake,
             play,
             rows: RowList::new(),
             icon_scroll_y: std::cell::Cell::new(0.0),
@@ -149,6 +154,12 @@ impl AlbumListView {
         &mut self.rows
     }
 
+    /// Ask the frame clock for another frame. Called wherever a row operation
+    /// may have started a highlight fade, marquee slide, or eased scroll.
+    pub fn request_frame(&self) {
+        self.wake.request();
+    }
+
     /// Switch what a plain click plays — the library's filter box toggles
     /// between whole albums (unfiltered) and the matched songs only.
     pub fn set_play(&mut self, play: Play) {
@@ -181,12 +192,16 @@ impl AlbumListView {
                 InputAction::PageUp => self.icon_scroll.queue(-self.icon_viewport_height()),
                 _ => return,
             }
+            self.request_frame();
             cx.notify();
             return;
         }
         match self.rows.handle(action) {
-            RowAction::Play(playlist, index) => self.play(playlist, index, cx),
-            RowAction::Handled => cx.notify(),
+            RowAction::Play(source, index) => self.play(source, index, cx),
+            RowAction::Handled => {
+                self.request_frame();
+                cx.notify();
+            }
             RowAction::Ignored => {}
         }
     }
@@ -211,24 +226,29 @@ impl AlbumListView {
         self.rows.set_anchor(song.and_then(|song| albums::row_of_song(&items, &sections, song)));
     }
 
-    /// Play `playlist` from `index` the way `play` chose at construction: the
-    /// whole playlist (browse/playlist views), or only the section's matched
-    /// songs (search).
-    fn play(&mut self, playlist: PlaylistId, index: usize, cx: &mut gpui::App) {
+    /// Play `source` from `index` the way `play` chose at construction: the
+    /// whole playlist (browse/playlist views), only the section's matched
+    /// songs (search), or the queue entry at `index`.
+    fn play(&mut self, source: SectionSource, index: usize, cx: &mut gpui::App) {
         // Playing consumes the selection: the played row carries the playing
         // highlight from here, and up/down re-anchor from it.
         self.rows.clear_selection();
+        self.request_frame();
         let playback = self.playback.clone();
         match self.play {
-            Play::Playlist => self
-                .library
-                .update(cx, |state, cx| state.play_playlist(playlist, index, &playback, cx)),
+            Play::Playlist => match source {
+                SectionSource::Playlist(playlist) => self
+                    .library
+                    .update(cx, |state, cx| state.play_playlist(playlist, index, &playback, cx)),
+                SectionSource::Queue => playback
+                    .update(cx, |state, cx| state.play_queue_index(index, cx)),
+            },
             Play::Result => {
                 let songs: Vec<_> = self
                     .rows
                     .sections()
                     .iter()
-                    .find(|section| section.playlist == playlist)
+                    .find(|section| section.source == source)
                     .map(|section| section.tracks.iter().map(|track| track.song))
                     .into_iter()
                     .flatten()
@@ -268,8 +288,11 @@ fn raise_menu<V: AlbumList>(
     card: Option<PlaylistId>,
     cx: &mut Context<V>,
 ) {
-    let request =
-        SongMenuRequest { songs, position: event.position, playlist: context, queue: false, card };
+    let origin = match card {
+        Some(card) => MenuOrigin::Card(card),
+        None => MenuOrigin::Row { playlist: context },
+    };
+    let request = SongMenuRequest { songs, position: event.position, origin };
     let library = view.list().library.clone();
     library.update(cx, |state, cx| state.request(Request::SongMenu(request), cx));
 }
@@ -279,13 +302,13 @@ impl<V: AlbumList> RowActions<V> for Icons {
         &self,
         view: &mut V,
         _item_ix: usize,
-        playlist: PlaylistId,
+        source: SectionSource,
         index: usize,
         _event: &gpui::ClickEvent,
         _window: &mut Window,
         cx: &mut Context<V>,
     ) {
-        view.list_mut().play(playlist, index, cx);
+        view.list_mut().play(source, index, cx);
     }
 
     fn context(
@@ -293,7 +316,7 @@ impl<V: AlbumList> RowActions<V> for Icons {
         view: &mut V,
         _item_ix: usize,
         songs: Vec<crate::model::SongId>,
-        playlist: PlaylistId,
+        source: SectionSource,
         context: Option<PlaylistId>,
         event: &gpui::MouseDownEvent,
         _window: &mut Window,
@@ -301,7 +324,11 @@ impl<V: AlbumList> RowActions<V> for Icons {
     ) {
         // The card's playlist turns on the card-only items: "Go to {artist}"
         // per credited artist and "Go to playlist".
-        raise_menu(view, songs, context, event, Some(playlist), cx);
+        let card = match source {
+            SectionSource::Playlist(id) => Some(id),
+            SectionSource::Queue => None,
+        };
+        raise_menu(view, songs, context, event, card, cx);
     }
 
     fn hover(&self, _view: &mut V, _item_ix: usize, _hovered: bool, _cx: &mut Context<V>) {}
@@ -312,17 +339,18 @@ impl<V: AlbumList> RowActions<V> for Rows {
         &self,
         view: &mut V,
         item_ix: usize,
-        playlist: PlaylistId,
+        source: SectionSource,
         index: usize,
         event: &gpui::ClickEvent,
         _window: &mut Window,
         cx: &mut Context<V>,
     ) {
         if view.list_mut().rows.click(item_ix, event.modifiers()) {
+            view.list().request_frame();
             cx.notify();
             return;
         }
-        view.list_mut().play(playlist, index, cx);
+        view.list_mut().play(source, index, cx);
     }
 
     fn context(
@@ -330,7 +358,7 @@ impl<V: AlbumList> RowActions<V> for Rows {
         view: &mut V,
         item_ix: usize,
         _songs: Vec<crate::model::SongId>,
-        _playlist: PlaylistId,
+        _source: SectionSource,
         context: Option<PlaylistId>,
         event: &gpui::MouseDownEvent,
         _window: &mut Window,
@@ -344,6 +372,7 @@ impl<V: AlbumList> RowActions<V> for Rows {
 
     fn hover(&self, view: &mut V, item_ix: usize, hovered: bool, cx: &mut Context<V>) {
         if view.list_mut().rows.set_hover(item_ix, hovered) {
+            view.list().request_frame();
             cx.notify();
         }
     }
@@ -357,6 +386,7 @@ impl<V: AlbumList> RowActions<V> for Rows {
         cx: &mut Context<V>,
     ) {
         if view.list_mut().rows.set_cell_hover(item_ix, cell, hovered) {
+            view.list().request_frame();
             cx.notify();
         }
     }
@@ -397,6 +427,9 @@ pub fn observe<V: AlbumList>(
         // Keep the playing row's equalizer moving even when nothing else is.
         let playing = this.list().playback().read(cx).is_playing();
         if moved || scrolled || playing {
+            // Keep the clock awake while a fade/scroll is in flight, and while
+            // a playing row's equalizer is running.
+            this.list().request_frame();
             cx.notify();
         }
     });
@@ -462,6 +495,7 @@ pub fn render_rows_with<V: AlbumList>(
         gpui::list(list_state, render).size_full().into_any_element(),
         cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
             if this.list_mut().rows.wheel(wheel_pixels(event)) {
+                this.list().request_frame();
                 cx.notify();
             }
             cx.stop_propagation();
@@ -574,6 +608,7 @@ pub fn render_icons<V: AlbumList>(
                     // (Clamping happens in `tick_icon_scroll`, against the
                     // laid-out height recorded by this render.)
                     this.list_mut().icon_scroll.accumulate(-wheel_pixels(event));
+                    this.list().request_frame();
                     cx.notify();
                     cx.stop_propagation();
                 }),

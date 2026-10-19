@@ -65,11 +65,18 @@ impl PlaybackView {
         cx: &mut Context<Self>,
     ) -> Self {
         // Re-render whenever the shared state changes. The state owns the
-        // ticker, so this view no longer polls for position updates.
-        let observe = cx.observe(&state, |_this, _state, cx| cx.notify());
+        // ticker, so this view no longer polls for position updates. A state
+        // change can bring a fresh waveform chunk, so it also wakes the frame
+        // clock (which otherwise sleeps while the waveform is at rest).
+        let wake_animator = animator.clone();
+        let observe = cx.observe(&state, move |_this, _state, cx| {
+            wake_animator.read(cx).request();
+            cx.notify();
+        });
         // The waveform's chunk animations run on the shared frame clock.
         let observe_animator = cx.observe(&animator, |this, animator, cx| {
             if this.tick(animator.read(cx).dt(), cx) {
+                animator.read(cx).request();
                 cx.notify();
             }
         });

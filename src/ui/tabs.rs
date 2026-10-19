@@ -25,7 +25,7 @@ use gpui::{
     KeyDownEvent, MouseDownEvent, Render, SharedString, Subscription, Window,
 };
 
-use crate::model::{FolderMode, InputAction, PlaylistId, TabId};
+use crate::model::{FolderMode, InputAction, PlaylistId, SongId, TabId};
 use crate::ui::animation::Animator;
 use crate::ui::browse::BrowseView;
 use crate::ui::config_state::{ConfigState, Themed};
@@ -75,6 +75,10 @@ pub struct TabsView {
     menu: Option<SongMenuRequest>,
     /// The window title last set, so the titlebar is only touched on change.
     last_title: String,
+    /// The `(current song, ended)` pair the title was last derived from. A
+    /// playback notification only re-renders when this actually moves, so a
+    /// play-count tick doesn't repaint every tab just to find the same title.
+    title_key: Option<(Option<SongId>, bool)>,
     /// Per-tab marquee — the same fade/slide/spring-back the list rows use,
     /// so a long label slides on hover instead of being truncated. Its
     /// region-hover also carries the tab's hover wash, so the fade matches
@@ -123,7 +127,14 @@ impl TabsView {
             this.library_dirty = true;
             cx.notify();
         });
-        let observe_playback = cx.observe(&playback, |_this, _state, cx| cx.notify());
+        let observe_playback = cx.observe(&playback, |this, playback, cx| {
+            let state = playback.read(cx);
+            let key = (state.current_song(), state.ended());
+            if this.title_key != Some(key) {
+                this.title_key = Some(key);
+                cx.notify();
+            }
+        });
         let observe_animator = cx.observe(&animator, |this, animator, cx| {
             let dt = animator.read(cx).dt();
             let moved = this
@@ -131,6 +142,7 @@ impl TabsView {
                 .values_mut()
                 .any(|marquee| marquee.tick(dt));
             if moved {
+                animator.read(cx).request();
                 cx.notify();
             }
         });
@@ -151,6 +163,7 @@ impl TabsView {
             settings_open: false,
             menu: None,
             last_title: String::new(),
+            title_key: None,
             marquees: HashMap::new(),
             library_dirty: false,
             focus_handle: cx.focus_handle(),
@@ -170,6 +183,19 @@ impl TabsView {
             return Some(self.search.read(cx).focus_handle_for_window());
         }
         self.focus_of(self.active.clone(), cx)
+    }
+
+    /// Build a fresh browse view sharing this tab container's entities — the
+    /// common body of every tab that mounts one.
+    fn new_browse(&self, cx: &mut Context<Self>) -> Entity<BrowseView> {
+        let (library, playback, covers, config, animator) = (
+            self.library.clone(),
+            self.playback.clone(),
+            self.covers.clone(),
+            self.config.clone(),
+            self.animator.clone(),
+        );
+        cx.new(|cx| BrowseView::new(library, playback, covers, config, animator, cx))
     }
 
     /// Open (or focus) a playlist's tab.
@@ -199,18 +225,8 @@ impl TabsView {
     pub fn open_artist(&mut self, artist: String, window: &mut Window, cx: &mut Context<Self>) {
         let tab_id = TabId::Artist(artist.clone());
         if !self.tabs.iter().any(|tab| tab.id == tab_id) {
-            let view = cx.new(|cx| {
-                let mut browse = BrowseView::new(
-                    self.library.clone(),
-                    self.playback.clone(),
-                    self.covers.clone(),
-                    self.config.clone(),
-                    self.animator.clone(),
-                    cx,
-                );
-                browse.set_artist_filter(Some(artist.clone()), cx);
-                browse
-            });
+            let view = self.new_browse(cx);
+            view.update(cx, |browse, cx| browse.set_artist_filter(Some(artist.clone()), cx));
             let focus = view.read(cx).focus_handle_for_window();
             self.tabs.push(Tab { id: tab_id.clone(), view: view.into(), focus });
         }
@@ -236,18 +252,8 @@ impl TabsView {
                 }
             }
             None => {
-                let view = cx.new(|cx| {
-                    let mut browse = BrowseView::new(
-                        self.library.clone(),
-                        self.playback.clone(),
-                        self.covers.clone(),
-                        self.config.clone(),
-                        self.animator.clone(),
-                        cx,
-                    );
-                    browse.set_folder_scope(dir, mode, cx);
-                    browse
-                });
+                let view = self.new_browse(cx);
+                view.update(cx, |browse, cx| browse.set_folder_scope(dir, mode, cx));
                 let focus = view.read(cx).focus_handle_for_window();
                 self.tabs.push(Tab { id: tab_id.clone(), view: view.into(), focus });
             }
@@ -576,6 +582,7 @@ impl Render for TabsView {
                 cx.listener(move |this, hovered: &bool, _window, cx| {
                     if let Some(marquee) = this.marquees.get_mut(&hover_id) {
                         if marquee.set_hovered(*hovered, title_travel) {
+                            this.animator.read(cx).request();
                             cx.notify();
                         }
                     }
@@ -627,9 +634,7 @@ impl Render for TabsView {
                     &self.library,
                     &self.playback,
                     &menu.songs,
-                    menu.playlist,
-                    menu.queue,
-                    menu.card,
+                    &menu.origin,
                     cx,
                 )
                     .into_iter()

@@ -2,9 +2,16 @@
 //!
 //! One `Entity<Animator>` exists per window. Views that need per-frame motion
 //! (a highlight fading in, lyrics scrolling) hold a clone and **observe** it;
-//! on each frame the observer ticks its own [`Tween`]s and re-renders only
-//! while something is actually moving, so an idle UI costs nothing beyond the
-//! clock's own wake-ups.
+//! on each frame the observer ticks its own [`Tween`]s, re-renders only while
+//! something is actually moving, and calls [`WakeHandle::request`] to keep the
+//! clock running for another frame. When nothing asks for a frame the clock
+//! parks on a channel instead of waking on a timer, so an idle UI draws (and
+//! burns) exactly nothing.
+//!
+//! Anything that *starts* an animation must call [`WakeHandle::request`] too —
+//! otherwise the clock stays parked and the first tick never arrives. Views
+//! keep a [`WakeHandle`] (it needs no `Context`) and call it from the listener
+//! or render path where the motion begins.
 //!
 //! Coarse values that don't need per-frame updates — the transport's time
 //! readout, the waveform progress, the live bitrate — are deliberately *not*
@@ -14,8 +21,12 @@
 //!
 //! The two rates are plain constants so they're easy to tune.
 
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use futures::channel::mpsc;
+use futures::StreamExt;
 use gpui::Context;
 
 /// Frames per second for coarse, non-animated readouts: the transport's time
@@ -27,10 +38,48 @@ pub const SLOW_FPS: f32 = 1.0;
 /// toward 144 on a high-refresh display.
 pub const SMOOTH_FPS: f32 = 144.0;
 
+/// A cheap, clonable way to ask the frame clock for another frame.
+///
+/// Deliberately needs no `Context`: animation can begin from an event listener,
+/// a render closure, or a plain helper struct, all of which are the places a
+/// [`Tween`]/[`Spring`] gets retargeted. Calling it from inside a frame's
+/// observer is what keeps the clock awake until the motion settles.
+#[derive(Clone)]
+pub struct WakeHandle {
+    shared: Arc<WakeShared>,
+    // Held here, not in `WakeShared`: when every handle is dropped the channel
+    // closes and the parked loop exits, rather than the loop keeping its own
+    // sender alive forever.
+    wake: mpsc::UnboundedSender<()>,
+}
+
+struct WakeShared {
+    /// A frame has been requested since the clock last consumed the flag.
+    demand: AtomicBool,
+    /// Whether the clock is currently running (so `request` knows whether it
+    /// needs to kick the parked loop with a channel message).
+    awake: AtomicBool,
+}
+
+impl WakeHandle {
+    /// Ask for at least one more frame. While an animation is running this is
+    /// called once per observer tick; the send only happens on the idle→awake
+    /// transition, so it never floods the channel.
+    pub fn request(&self) {
+        self.shared.demand.store(true, Ordering::SeqCst);
+        if !self.shared.awake.swap(true, Ordering::SeqCst) {
+            // The clock is parked: nudge it. It may already have gone away if
+            // the window closed; that's fine.
+            let _ = self.wake.unbounded_send(());
+        }
+    }
+}
+
 /// The shared frame clock.
 ///
-/// Runs a single ticker at [`SMOOTH_FPS`] and notifies its observers each
-/// frame. Views observe it and advance their own animations by
+/// Sits parked on a channel until something calls [`WakeHandle::request`], then
+/// ticks at [`SMOOTH_FPS`] and notifies its observers each frame while any of
+/// them asks for another. Views observe it and advance their own animations by
 /// [`dt`](Self::dt).
 pub struct Animator {
     /// Seconds since the previous frame, clamped so a stalled frame can't jump
@@ -38,12 +87,13 @@ pub struct Animator {
     dt: f32,
     /// Seconds since the clock started.
     elapsed: f32,
+    wake: WakeHandle,
 }
 
 impl Animator {
     pub fn new(cx: &mut Context<Self>) -> Self {
-        Self::start(cx);
-        Self { dt: 0.0, elapsed: 0.0 }
+        let wake = Self::start(cx);
+        Self { dt: 0.0, elapsed: 0.0, wake }
     }
 
     /// Seconds since the previous frame.
@@ -56,30 +106,71 @@ impl Animator {
         self.elapsed
     }
 
-    fn start(cx: &mut Context<Self>) {
+    /// A handle for asking this clock for frames without borrowing the entity.
+    pub fn wake_handle(&self) -> WakeHandle {
+        self.wake.clone()
+    }
+
+    /// Ask for at least one more frame. Shorthand for `wake_handle().request()`.
+    pub fn request(&self) {
+        self.wake.request();
+    }
+
+    fn start(cx: &mut Context<Self>) -> WakeHandle {
+        let (wake, mut rx) = mpsc::unbounded::<()>();
+        let shared = Arc::new(WakeShared {
+            demand: AtomicBool::new(false),
+            awake: AtomicBool::new(false),
+        });
+        let handle = WakeHandle { shared: shared.clone(), wake };
         cx.spawn(async move |this, cx| {
             let interval = Duration::from_secs_f32(1.0 / SMOOTH_FPS.max(1.0));
-            let mut last = Instant::now();
-            loop {
-                cx.background_executor().timer(interval).await;
-                let now = Instant::now();
-                // Clamp so a long stall (a slow frame, a suspend) doesn't make
-                // an animation leap straight to its end.
-                let dt = now.saturating_duration_since(last).as_secs_f32().min(0.1);
-                last = now;
-                if this
-                    .update(cx, |this, cx| {
-                        this.dt = dt;
-                        this.elapsed += dt;
-                        cx.notify();
-                    })
-                    .is_err()
-                {
+            'idle: loop {
+                // Park with no timer: an idle window costs nothing at all.
+                if rx.next().await.is_none() {
                     break;
+                }
+                // Coalesce any other wake-ups queued before we got here.
+                while rx.try_recv().is_ok() {}
+
+                let mut last = Instant::now();
+                loop {
+                    // A request since the last frame keeps the clock running.
+                    if !shared.demand.swap(false, Ordering::SeqCst) {
+                        shared.awake.store(false, Ordering::SeqCst);
+                        // A request may have landed between the swap and the
+                        // store — it saw `awake` still true and didn't nudge
+                        // us, so pick it up here rather than losing it.
+                        if shared.demand.load(Ordering::SeqCst) {
+                            shared.awake.store(true, Ordering::SeqCst);
+                            continue;
+                        }
+                        continue 'idle;
+                    }
+
+                    cx.background_executor().timer(interval).await;
+                    let now = Instant::now();
+                    // Clamp so a long stall (a slow frame, a suspend) doesn't
+                    // make an animation leap straight to its end.
+                    let dt = now.saturating_duration_since(last).as_secs_f32().min(0.1);
+                    last = now;
+                    if this
+                        .update(cx, |this, cx| {
+                            this.dt = dt;
+                            this.elapsed += dt;
+                            cx.notify();
+                        })
+                        .is_err()
+                    {
+                        break 'idle;
+                    }
+                    // Observers have now run and requested another frame if
+                    // they're still moving; the flag is read at the loop top.
                 }
             }
         })
         .detach();
+        handle
     }
 }
 
@@ -246,6 +337,34 @@ impl Spring {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_request_wakes_a_parked_clock_exactly_once() {
+        let (tx, mut rx) = mpsc::unbounded::<()>();
+        let shared = Arc::new(WakeShared {
+            demand: AtomicBool::new(false),
+            awake: AtomicBool::new(false),
+        });
+        let handle = WakeHandle { shared: shared.clone(), wake: tx };
+
+        // A request from parked state arms the demand flag and nudges the
+        // channel once.
+        handle.request();
+        assert!(shared.demand.load(Ordering::SeqCst));
+        assert!(shared.awake.load(Ordering::SeqCst));
+        assert!(rx.try_recv().is_ok());
+
+        // Further requests while the clock is running must not enqueue more
+        // messages — otherwise a long animation would flood the channel.
+        handle.request();
+        handle.request();
+        assert!(rx.try_recv().is_err());
+
+        // Once the loop parks again, the next request nudges it afresh.
+        shared.awake.store(false, Ordering::SeqCst);
+        handle.request();
+        assert!(rx.try_recv().is_ok());
+    }
 
     #[test]
     fn a_tween_settles_on_its_target() {

@@ -5,20 +5,34 @@
 //! [`deferred`], and dismissed with `on_mouse_down_out`. The menu occludes the
 //! mouse so a click on an item can't also land on the row behind it.
 
-use std::path::{Path, PathBuf};
+use std::path::Path;
 
 use gpui::{
     anchored, deferred, div, prelude::*, px, AnyElement, App, ClickEvent, Corner, Entity,
     MouseDownEvent, Point, Pixels, Window,
 };
 
-use crate::model::{FolderMode, PlaylistId, SongId};
+use crate::model::{FolderMode, PlaylistId, QueueEntry, SongId};
 use crate::ui::library_state::{LibraryState, Request};
 use crate::ui::playback_state::PlaybackState;
 use crate::ui::theme::Theme;
 
 /// A menu item's click handler.
 pub type MenuHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static>;
+
+/// Where a song menu was raised from. Each variant names exactly the actions
+/// that origin can offer, so impossible combinations (queue *and* playlist,
+/// a card *and* a row) are unrepresentable.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum MenuOrigin {
+    /// A song row (or a multi-row selection); `playlist` is the tab it came
+    /// from, when that tab is a playlist.
+    Row { playlist: Option<PlaylistId> },
+    /// The queue panel.
+    Queue,
+    /// An icon-grid playlist card.
+    Card(PlaylistId),
+}
 
 /// A request to open a song's context menu, raised by a row's right-click and
 /// rendered by whichever view owns it.
@@ -29,16 +43,8 @@ pub struct SongMenuRequest {
     pub songs: Vec<SongId>,
     /// Where the click landed, in window coordinates.
     pub position: Point<Pixels>,
-    /// The playlist tab the menu was raised from, if any — lets the menu offer
-    /// "Remove from playlist" when that playlist is a custom one.
-    pub playlist: Option<PlaylistId>,
-    /// Whether the menu was raised from the queue panel — swaps the playlist
-    /// operations for "Remove from queue".
-    pub queue: bool,
-    /// The playlist a right-clicked icon card represents, if the menu was
-    /// raised from one — lets the card's menu offer "Go to {artist}" per
-    /// credited artist and "Go to playlist" for the card itself.
-    pub card: Option<PlaylistId>,
+    /// What raised the menu — decides which origin-specific items appear.
+    pub origin: MenuOrigin,
 }
 
 /// A preset menu item: "Add to Queue" for one song.
@@ -52,47 +58,25 @@ fn add_to_queue_item(
     (
         "Add to Queue".to_string(),
         Box::new(move |_event, _window, cx| {
-            let entry =
-                library.read(cx).library().get(song).map(|song| (song.id, song.path.clone()));
-            if let Some(entry) = entry {
-                playback.update(cx, |state, cx| state.add_to_queue(vec![entry], cx));
+            let entries = library.read(cx).queue_entries(&[song]);
+            if !entries.is_empty() {
+                playback.update(cx, |state, cx| state.add_to_queue(entries, cx));
             }
         }),
     )
 }
 
-/// A preset menu item: "Go to {artist}", opening the artist's discography tab.
-fn go_to_artist_item(library: &Entity<LibraryState>, artist: String) -> (String, MenuHandler) {
+/// A preset menu item that raises a cross-view request on the library.
+fn request_item(
+    label: String,
+    library: &Entity<LibraryState>,
+    request: Request,
+) -> (String, MenuHandler) {
     let library = library.clone();
     (
-        format!("Go to {artist}"),
+        label,
         Box::new(move |_event, _window, cx| {
-            let artist = artist.clone();
-            library.update(cx, |state, cx| state.request(Request::ArtistView(artist), cx));
-        }),
-    )
-}
-
-/// A preset menu item: "Go to playlist", opening the playlist's tab.
-fn go_to_playlist_item(library: &Entity<LibraryState>, playlist: PlaylistId) -> (String, MenuHandler) {
-    let library = library.clone();
-    (
-        "Go to playlist".to_string(),
-        Box::new(move |_event, _window, cx| {
-            library.update(cx, |state, cx| state.request(Request::OpenPlaylist(playlist), cx));
-        }),
-    )
-}
-
-/// A preset menu item: "Go to folder", opening the folder's own view — its
-/// songs only, no subfolders.
-fn go_to_folder_item(library: &Entity<LibraryState>, dir: PathBuf) -> (String, MenuHandler) {
-    let library = library.clone();
-    (
-        "Go to folder".to_string(),
-        Box::new(move |_event, _window, cx| {
-            library
-                .update(cx, |state, cx| state.request(Request::FolderOpen(dir.clone(), FolderMode::Here), cx));
+            library.update(cx, |state, cx| state.request(request.clone(), cx));
         }),
     )
 }
@@ -131,12 +115,19 @@ pub fn song_menu_items(
     library: &Entity<LibraryState>,
     playback: &Entity<PlaybackState>,
     songs: &[SongId],
-    context: Option<PlaylistId>,
-    queue: bool,
-    playlist_card: Option<PlaylistId>,
+    origin: &MenuOrigin,
     cx: &App,
 ) -> Vec<(String, MenuHandler)> {
     let mut items: Vec<(String, MenuHandler)> = Vec::new();
+    let context = match *origin {
+        MenuOrigin::Row { playlist } => playlist,
+        MenuOrigin::Queue | MenuOrigin::Card(_) => None,
+    };
+    let queue = matches!(origin, MenuOrigin::Queue);
+    let playlist_card = match *origin {
+        MenuOrigin::Card(id) => Some(id),
+        _ => None,
+    };
     let custom_context = context
         .and_then(|id| library.read(cx).library().playlist(id))
         .is_some_and(|playlist| playlist.is_custom());
@@ -172,11 +163,11 @@ pub fn song_menu_items(
         }
 
         if let Some(album) = album {
-            items.push(go_to_playlist_item(library, album));
+            items.push(request_item("Go to playlist".into(), library, Request::OpenPlaylist(album)));
         }
 
         if let Some(folder) = folder {
-            items.push(go_to_folder_item(library, folder));
+            items.push(request_item("Go to folder".into(), library, Request::FolderOpen(folder, FolderMode::Here)));
         }
 
         if let Some(playlist) = context.filter(|_| custom_context) {
@@ -184,7 +175,7 @@ pub fn song_menu_items(
         }
 
         // "Go to {artist}" closes the menu, after every other option.
-        items.extend(artists.into_iter().map(|artist| go_to_artist_item(library, artist)));
+        items.extend(artists.into_iter().map(|artist| request_item(format!("Go to {artist}"), library, Request::ArtistView(artist))));
 
         return items;
     }
@@ -214,12 +205,9 @@ pub fn song_menu_items(
         items.push((
             format!("Add {count} songs to queue"),
             Box::new(move |_event, _window, cx| {
-                let entries: Vec<(SongId, PathBuf)> = songs
-                    .iter()
-                    .filter_map(|id| {
-                        library.read(cx).library().get(*id).map(|song| (song.id, song.path.clone()))
-                    })
-                    .collect();
+                let entries: Vec<QueueEntry> = library
+                    .read(cx)
+                    .queue_entries(&songs);
                 playback.update(cx, |state, cx| state.add_to_queue(entries, cx));
             }),
         ));
@@ -246,7 +234,7 @@ pub fn song_menu_items(
             .and_then(|id| library.read(cx).library().get(*id))
             .and_then(|song| song.path.parent().map(Path::to_path_buf));
         if let Some(folder) = folder {
-            items.push(go_to_folder_item(library, folder));
+            items.push(request_item("Go to folder".into(), library, Request::FolderOpen(folder, FolderMode::Here)));
         }
         let mut artists: Vec<String> = Vec::new();
         for id in songs {
@@ -257,7 +245,7 @@ pub fn song_menu_items(
                 }
             }
         }
-        items.push(go_to_playlist_item(library, card));
+        items.push(request_item("Go to playlist".into(), library, Request::OpenPlaylist(card)));
         card_artists = Some(artists);
     }
 
@@ -303,7 +291,7 @@ pub fn song_menu_items(
 
     // "Go to {artist}" closes the menu, whichever branch built it.
     if let Some(artists) = card_artists {
-        items.extend(artists.into_iter().map(|artist| go_to_artist_item(library, artist)));
+        items.extend(artists.into_iter().map(|artist| request_item(format!("Go to {artist}"), library, Request::ArtistView(artist))));
     }
 
     items

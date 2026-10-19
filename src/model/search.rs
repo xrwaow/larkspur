@@ -4,7 +4,7 @@
 //! Framework-agnostic and pure: `parse` turns text into a [`Query`], `matches`
 //! decides whether one song satisfies it, and [`search`] applies that over a
 //! [`Library`]. The UI never implements matching itself — it parses a query
-//! and renders the [`AlbumGroup`]s that come back.
+//! and renders the [`SongGroup`]s that come back.
 //!
 //! # Query language
 //!
@@ -85,6 +85,16 @@ impl Field {
     /// Every searchable field — the default scope for a free word.
     pub const ALL: [Field; 4] = [Field::Artist, Field::Album, Field::Song, Field::Lyrics];
 
+    /// This field's bit in a [`FieldSet`].
+    const fn bit(self) -> u8 {
+        match self {
+            Field::Artist => 1 << 0,
+            Field::Album => 1 << 1,
+            Field::Song => 1 << 2,
+            Field::Lyrics => 1 << 3,
+        }
+    }
+
     fn parse(name: &str) -> Option<Self> {
         match name.trim().to_ascii_lowercase().as_str() {
             "artist" | "artists" => Some(Field::Artist),
@@ -93,6 +103,41 @@ impl Field {
             "lyrics" => Some(Field::Lyrics),
             _ => None,
         }
+    }
+}
+
+/// A set of [`Field`]s, stored as bits so field scoping is a `Copy` value
+/// rather than a `Vec` allocation.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct FieldSet(u8);
+
+impl FieldSet {
+    pub const fn empty() -> Self {
+        Self(0)
+    }
+
+    pub fn all() -> Self {
+        Field::ALL.iter().fold(Self::empty(), |set, field| set.with(*field))
+    }
+
+    pub fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    pub fn contains(self, field: Field) -> bool {
+        self.0 & field.bit() != 0
+    }
+
+    pub const fn with(self, field: Field) -> Self {
+        Self(self.0 | field.bit())
+    }
+
+    pub fn insert(&mut self, field: Field) {
+        self.0 |= field.bit();
+    }
+
+    pub fn union(self, other: Self) -> Self {
+        Self(self.0 | other.0)
     }
 }
 
@@ -121,18 +166,18 @@ pub enum Term {
 pub struct Query {
     pub terms: Vec<Term>,
     /// Fields free words search. Empty means all of [`Field::ALL`].
-    pub fields: Vec<Field>,
+    pub fields: FieldSet,
     pub mode: MatchMode,
     pub filters: Vec<Filter>,
 }
 
 impl Query {
     /// The fields free words are matched against.
-    fn scope(&self) -> &[Field] {
+    fn scope(&self) -> FieldSet {
         if self.fields.is_empty() {
-            &Field::ALL
+            FieldSet::all()
         } else {
-            &self.fields
+            self.fields
         }
     }
 
@@ -152,22 +197,28 @@ impl Query {
 
     /// A reusable matcher over this query.
     pub fn matcher(&self) -> Matcher<'_> {
-        Matcher { query: self, needed: self.needed_fields() }
+        Matcher {
+            query: self,
+            needed: self.needed_fields(),
+            // Normalize each term's needle once here rather than per song.
+            needles: self
+                .terms
+                .iter()
+                .map(|term| match term {
+                    Term::Any(text) | Term::In(_, text) => text.trim().to_lowercase(),
+                })
+                .collect(),
+        }
     }
 
     /// Only the fields this query actually reads, so lyrics aren't lowercased
     /// (or even joined) for a query that never touches them.
-    fn needed_fields(&self) -> Vec<Field> {
-        let mut needed: Vec<Field> = Vec::new();
+    fn needed_fields(&self) -> FieldSet {
+        let mut needed = FieldSet::empty();
         for term in &self.terms {
-            let fields: &[Field] = match term {
-                Term::Any(_) => self.scope(),
-                Term::In(field, _) => std::slice::from_ref(field),
-            };
-            for field in fields {
-                if !needed.contains(field) {
-                    needed.push(*field);
-                }
+            match term {
+                Term::Any(_) => needed = needed.union(self.scope()),
+                Term::In(field, _) => needed.insert(*field),
             }
         }
         needed
@@ -178,7 +229,9 @@ impl Query {
 /// matching many songs doesn't re-derive them per song.
 pub struct Matcher<'a> {
     query: &'a Query,
-    needed: Vec<Field>,
+    needed: FieldSet,
+    /// Each term's needle, trimmed and lowercased once in [`Query::matcher`].
+    needles: Vec<String>,
 }
 
 impl Matcher<'_> {
@@ -190,11 +243,14 @@ impl Matcher<'_> {
         if self.query.terms.is_empty() {
             return true;
         }
-        let haystack = Haystack::new(song, &self.needed);
+        let haystack = Haystack::new(song, self.needed);
         self.query
             .terms
             .iter()
-            .all(|term| haystack.matches_term(term, self.query.scope(), self.query.mode))
+            .zip(&self.needles)
+            .all(|(term, needle)| {
+                haystack.matches_term(term, needle, self.query.scope(), self.query.mode)
+            })
     }
 }
 
@@ -230,9 +286,12 @@ struct Haystack {
 }
 
 impl Haystack {
-    fn new(song: &SongMetadata, needed: &[Field]) -> Self {
+    fn new(song: &SongMetadata, needed: FieldSet) -> Self {
         let mut haystack = Self::default();
-        for field in needed {
+        for field in Field::ALL {
+            if !needed.contains(field) {
+                continue;
+            }
             match field {
                 Field::Artist => {
                     let mut names = song.artists.clone();
@@ -262,30 +321,51 @@ impl Haystack {
         }
     }
 
-    fn matches_term(&self, term: &Term, scope: &[Field], mode: MatchMode) -> bool {
+    fn matches_term(&self, term: &Term, needle: &str, scope: FieldSet, mode: MatchMode) -> bool {
         match term {
-            Term::Any(text) => {
-                scope.iter().any(|f| self.field(*f).is_some_and(|h| matches_text(h, text, mode)))
-            }
-            Term::In(field, text) => {
-                self.field(*field).is_some_and(|h| matches_text(h, text, mode))
+            Term::Any(_) => Field::ALL.iter().any(|f| {
+                scope.contains(*f)
+                    && self.field(*f).is_some_and(|h| matches_text_lower(h, needle, mode))
+            }),
+            Term::In(field, _) => {
+                self.field(*field).is_some_and(|h| matches_text_lower(h, needle, mode))
             }
         }
     }
 }
 
 /// Whether `needle` matches the (already lowercased) `haystack`.
-fn matches_text(haystack: &str, needle: &str, mode: MatchMode) -> bool {
-    let needle = needle.trim().to_lowercase();
+///
+/// The allocation-free core of the matcher: both sides must already be
+/// trimmed and lowercased.
+fn matches_text_lower(haystack: &str, needle: &str, mode: MatchMode) -> bool {
     if needle.is_empty() {
         return true;
     }
     match mode {
-        MatchMode::Contains => haystack.contains(&needle),
+        MatchMode::Contains => haystack.contains(needle),
         MatchMode::Exact => {
             haystack == needle || haystack.split_whitespace().any(|word| word == needle)
         }
-        MatchMode::Fuzzy => is_subsequence(haystack, &needle),
+        MatchMode::Fuzzy => is_subsequence(haystack, needle),
+    }
+}
+
+/// A reusable text matcher: the query is normalized once, then tested against
+/// many strings. The rail's album/artist filters use this so they share one
+/// matching implementation with search instead of re-lowercasing ad hoc.
+pub struct TextMatcher {
+    needle: String,
+    mode: MatchMode,
+}
+
+impl TextMatcher {
+    pub fn new(input: &str, mode: MatchMode) -> Self {
+        Self { needle: input.trim().to_lowercase(), mode }
+    }
+
+    pub fn matches(&self, haystack: &str) -> bool {
+        matches_text_lower(&haystack.to_lowercase(), &self.needle, self.mode)
     }
 }
 
@@ -297,7 +377,7 @@ fn is_subsequence(haystack: &str, needle: &str) -> bool {
 
 /// Songs matching a query, grouped by the album playlist they belong to.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct AlbumGroup {
+pub struct SongGroup {
     /// The autogen album playlist this group is headed by — its title, artist,
     /// cover, and track order all come from here.
     pub playlist: PlaylistId,
@@ -305,34 +385,9 @@ pub struct AlbumGroup {
     pub songs: Vec<SongId>,
 }
 
-/// Every album playlist with all of its songs — the browse view's list.
-///
-/// The "easy search" the browse container uses: no query, just the library
-/// grouped the way the UI wants to draw it.
-pub fn all_albums(library: &Library) -> Vec<AlbumGroup> {
-    library.select(&Selection {
-        scope: Scope::Library,
-        query: Query::default(),
-        order: Order::AlbumTitle,
-    })
-}
-
 /// Run a query over the library, grouped by album.
-pub fn search(library: &Library, query: &Query) -> Vec<AlbumGroup> {
+pub fn search(library: &Library, query: &Query) -> Vec<SongGroup> {
     library.select(&Selection {
-        scope: Scope::Library,
-        query: query.clone(),
-        order: Order::AlbumTitle,
-    })
-}
-
-/// Song ids matching a query, flattened out of their album groups in album and
-/// track order — the shape a flat "add songs" list wants.
-///
-/// An empty query matches the whole library, which is what makes an empty
-/// search box read as "everything you could add".
-pub fn matching_songs(library: &Library, query: &Query) -> Vec<SongId> {
-    library.select_songs(&Selection {
         scope: Scope::Library,
         query: query.clone(),
         order: Order::AlbumTitle,
@@ -380,12 +435,11 @@ pub fn parse(input: &str) -> (Query, Vec<String>) {
                     let name = name.trim();
                     // `from:all` clears the scope rather than naming a field.
                     if matches!(name.to_ascii_lowercase().as_str(), "all" | "any") {
-                        query.fields.clear();
+                        query.fields = FieldSet::empty();
                         continue;
                     }
                     match Field::parse(name) {
-                        Some(field) if !query.fields.contains(&field) => query.fields.push(field),
-                        Some(_) => {}
+                        Some(field) => query.fields.insert(field),
                         None => warnings.push(format!("unknown field `{name}`")),
                     }
                 }
@@ -575,7 +629,7 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
         }
         _ => return Err(bad()),
     };
-    Ok(Duration::from_secs_f64(seconds))
+    Duration::try_from_secs_f64(seconds).map_err(|_| bad())
 }
 
 #[cfg(test)]
@@ -591,12 +645,9 @@ mod tests {
             artists: vec![artist.into()],
             album_name: Some(album.into()),
             album_artist: Some(artist.into()),
-            track_position: None,
-            date: None,
             nominal_bitrate: Some(320_000),
-            lyrics: Lyrics::None,
             duration: Duration::from_secs(180),
-            has_art: false,
+            ..Default::default()
         }
     }
 
@@ -607,7 +658,7 @@ mod tests {
 
     #[test]
     fn free_words_are_anded_in_any_order() {
-        let s = song(1, "Bang Bang", "Nancy Sinatra", "Kill Bill");
+        let s = song(SongId(1), "Bang Bang", "Nancy Sinatra", "Kill Bill");
         assert!(run("sinatra nancy", &s), "both words present, any order");
         assert!(run("nancy sinatra", &s));
         assert!(!run("nancy grimes", &s), "one word missing fails");
@@ -615,7 +666,7 @@ mod tests {
 
     #[test]
     fn contains_is_the_default_mode() {
-        let s = song(1, "Bang Bang", "Nancy Sinatra", "Kill Bill");
+        let s = song(SongId(1), "Bang Bang", "Nancy Sinatra", "Kill Bill");
         assert!(run("\"ang b\"", &s), "a quoted phrase may span a word boundary");
         assert!(run("ang", &s), "partial words match by default");
         assert!(!run("grimes", &s));
@@ -623,7 +674,7 @@ mod tests {
 
     #[test]
     fn exact_matches_whole_words_only() {
-        let s = song(1, "Bang Bang", "Nancy Sinatra", "Kill Bill");
+        let s = song(SongId(1), "Bang Bang", "Nancy Sinatra", "Kill Bill");
         assert!(run("type:exact bang", &s), "whole word");
         assert!(!run("type:exact ang", &s), "partial word is not exact");
         assert!(run("type:exact \"bang bang\"", &s), "whole field");
@@ -631,14 +682,14 @@ mod tests {
 
     #[test]
     fn fuzzy_matches_subsequences() {
-        let s = song(1, "0004:a galaxy odyssey", "GINGA", "GINGA");
+        let s = song(SongId(1), "0004:a galaxy odyssey", "GINGA", "GINGA");
         assert!(run("type:fuzzy gnga", &s), "g-n-g-a is a subsequence of GINGA");
         assert!(!run("type:fuzzy gnaa", &s), "out of order does not match");
     }
 
     #[test]
     fn from_scopes_free_words() {
-        let s = song(1, "Bang Bang", "Nancy Sinatra", "Kill Bill");
+        let s = song(SongId(1), "Bang Bang", "Nancy Sinatra", "Kill Bill");
         assert!(run("from:artist sinatra", &s));
         assert!(!run("from:album sinatra", &s), "sinatra is not in the album");
         assert!(run("from:artist,song bang", &s), "comma-separated scope");
@@ -646,20 +697,20 @@ mod tests {
 
     #[test]
     fn field_prefixed_terms_scope_a_single_term() {
-        let s = song(1, "Bang Bang", "Nancy Sinatra", "Kill Bill");
+        let s = song(SongId(1), "Bang Bang", "Nancy Sinatra", "Kill Bill");
         assert!(run("artist:sinatra album:\"kill bill\"", &s));
         assert!(!run("artist:bang", &s));
     }
 
     #[test]
     fn lyrics_are_searchable() {
-        let mut s = song(1, "Song", "Artist", "Album");
+        let mut s = song(SongId(1), "Song", "Artist", "Album");
         s.lyrics = Lyrics::Plain("I saw the sunset on the sea".into());
         assert!(run("lyrics:sunset", &s));
         assert!(run("from:lyrics sea", &s));
         assert!(!run("from:artist sea", &s), "the term is scoped away from lyrics");
 
-        let mut synced = song(2, "Song", "Artist", "Album");
+        let mut synced = song(SongId(2), "Song", "Artist", "Album");
         synced.lyrics = Lyrics::Synced(vec![crate::model::LyricLine {
             timestamp: Duration::from_secs(1),
             text: "hello world".into(),
@@ -669,7 +720,7 @@ mod tests {
 
     #[test]
     fn year_filters_accept_ranges_and_comparisons() {
-        let mut s = song(1, "Song", "Artist", "Album");
+        let mut s = song(SongId(1), "Song", "Artist", "Album");
         s.date = Some(ReleaseDate::new(2003, None, None));
         assert!(run("year:2003", &s));
         assert!(run("year:2000-2010", &s));
@@ -682,13 +733,13 @@ mod tests {
 
     #[test]
     fn songs_without_a_year_fail_year_filters() {
-        let s = song(1, "Song", "Artist", "Album");
+        let s = song(SongId(1), "Song", "Artist", "Album");
         assert!(!run("year:2000-2030", &s));
     }
 
     #[test]
     fn duration_filters_accept_ranges_and_comparisons() {
-        let mut s = song(1, "Song", "Artist", "Album");
+        let mut s = song(SongId(1), "Song", "Artist", "Album");
         s.duration = Duration::from_secs(200); // 3:20
         assert!(run("dur:3:20", &s));
         assert!(run("dur:2:00-4:00", &s));
@@ -699,8 +750,16 @@ mod tests {
     }
 
     #[test]
+    fn duration_filters_reject_non_finite_input_without_panicking() {
+        for spec in ["nan", "inf", "0:-5", "-inf", "nan:nan"] {
+            assert!(parse_duration_spec(spec).is_err(), "{spec} should be rejected");
+        }
+        assert!(parse_duration_spec("3:20").is_ok());
+    }
+
+    #[test]
     fn extension_filters_match_the_path() {
-        let s = song(1, "Song", "Artist", "Album"); // .flac
+        let s = song(SongId(1), "Song", "Artist", "Album"); // .flac
         assert!(run("ext:flac", &s));
         assert!(run("ext:mp3,flac", &s));
         assert!(!run("ext:mp3", &s));
@@ -788,7 +847,7 @@ mod tests {
         let (query, warnings) = parse("   ");
         assert!(query.is_empty());
         assert!(warnings.is_empty());
-        assert!(query.matches(&song(1, "Any", "Artist", "Album")));
+        assert!(query.matches(&song(SongId(1), "Any", "Artist", "Album")));
     }
 
     /// A library with two albums, in a known order. "Kill Bill" is a
@@ -800,7 +859,7 @@ mod tests {
             (2, "Twisted Nerve", "Bernard Herrmann", "Kill Bill", "Various Artists"),
             (3, "Vide Noir", "Lord Huron", "Vide Noir", "Lord Huron"),
         ] {
-            let mut s = song(id, title, artist, album);
+            let mut s = song(SongId(id), title, artist, album);
             s.album_artist = Some(album_artist.into());
             s.track_position = Some(id as u16);
             library.insert_song(s);
@@ -836,7 +895,7 @@ mod tests {
         let library = library();
         let (query, _) = parse("");
         let groups = search(&library, &query);
-        assert_eq!(groups, all_albums(&library));
+        assert_eq!(groups, search(&library, &Query::default()));
         assert_eq!(groups.len(), 2, "two albums");
         assert_eq!(groups.iter().map(|g| g.songs.len()).sum::<usize>(), 3);
     }
@@ -844,7 +903,7 @@ mod tests {
     #[test]
     fn album_groups_orders_albums_by_title() {
         let library = library();
-        let groups = all_albums(&library);
+        let groups = search(&library, &Query::default());
         let titles: Vec<String> = groups
             .iter()
             .map(|g| library.playlist(g.playlist).unwrap().title().to_string())

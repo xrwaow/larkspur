@@ -58,10 +58,11 @@ impl BrowseView {
     ) -> Self {
         let observe =
             album_list::observe(&library, Some(&playback), &covers, &animator, cx);
+        let wake = animator.read(cx).wake_handle();
         let themed = Themed::new(&config, cx);
         Self {
             themed,
-            list: AlbumListView::new(library, playback, covers, animator, Play::Playlist),
+            list: AlbumListView::new(library, playback, covers, animator, wake, Play::Playlist),
             scope: Scope::Library,
             search: TextField::default(),
             search_focus: cx.focus_handle(),

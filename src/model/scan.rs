@@ -9,7 +9,7 @@
 //! never pixels (the cover cache owns those). That keeps the cache small and
 //! makes "reopen the app" cheap even for a large library.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -18,9 +18,11 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::{Deserialize, Serialize};
 
 use super::config::Config;
+use super::persist::{read_versioned, write_versioned};
 use super::library::Library;
 use super::lyrics;
 use super::playlist::{Playlist, PlaylistId};
+use super::identity::SongId;
 use super::song::SongMetadata;
 use super::stats::Stats;
 
@@ -62,12 +64,11 @@ impl CachedSong {
     }
 }
 
-/// The on-disk cache format. Versioned so a schema change can migrate instead
-/// of silently mis-parsing an old file.
+/// The on-disk cache body; [`CACHE_VERSION`] lives in the envelope.
 #[derive(Serialize, Deserialize)]
 struct CacheFile {
-    version: u32,
-    dirs: HashMap<PathBuf, SystemTime>,
+    /// `BTreeMap` so a save is byte-for-byte deterministic (stable order).
+    dirs: BTreeMap<PathBuf, SystemTime>,
     songs: Vec<CachedSong>,
 }
 
@@ -78,7 +79,6 @@ struct CacheFile {
 /// kilobytes instead of the whole library.
 #[derive(Serialize, Deserialize)]
 struct PlaylistsFile {
-    version: u32,
     playlists: Vec<Playlist>,
     next_playlist_id: u64,
 }
@@ -87,7 +87,6 @@ struct PlaylistsFile {
 /// playlists, because its lifetime is the user's, not the scan's.
 #[derive(Serialize, Deserialize)]
 struct StatsFile {
-    version: u32,
     stats: Stats,
 }
 
@@ -104,6 +103,13 @@ struct StatsFile {
 /// so `PlaylistMeta` and the parallel `meta`/`origin` fields are gone.
 const CACHE_VERSION: u32 = 8;
 
+/// Playlist schema version, independent of [`CACHE_VERSION`]: a song-schema
+/// bump must not invalidate the user's playlists.
+const PLAYLISTS_VERSION: u32 = 1;
+
+/// Stats schema version, likewise independent of the song cache.
+const STATS_VERSION: u32 = 1;
+
 /// Persisted library state: where we scanned, per-directory stamps, and the
 /// cached song metadata.
 pub struct LibraryCache {
@@ -111,7 +117,7 @@ pub struct LibraryCache {
     /// Per-directory mtime stamps. A change anywhere in the tree shows up
     /// here, so an unchanged tree skips the walk entirely.
     dirs: HashMap<PathBuf, SystemTime>,
-    entries: HashMap<PathBuf, CachedSong>,
+    entries: HashMap<SongId, CachedSong>,
 }
 
 impl LibraryCache {
@@ -121,16 +127,13 @@ impl LibraryCache {
     /// scan. A version mismatch is treated the same way rather than risking a
     /// mis-parse.
     pub fn open(path: PathBuf) -> Self {
-        let loaded = fs::read(&path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<CacheFile>(&bytes).ok())
-            .filter(|cache| cache.version == CACHE_VERSION);
+        let loaded = read_versioned::<CacheFile>(&path, CACHE_VERSION);
 
         match loaded {
             Some(cache) => Self {
                 path,
-                dirs: cache.dirs,
-                entries: cache.songs.into_iter().map(|s| (s.song.path.clone(), s)).collect(),
+                dirs: cache.dirs.into_iter().collect(),
+                entries: cache.songs.into_iter().map(|s| (s.song.id, s)).collect(),
             },
             None => Self {
                 path,
@@ -161,15 +164,29 @@ impl LibraryCache {
     /// for in-place tag edits, which change a file's mtime but not its
     /// directory's, so the fast path can't see them.
     ///
+    /// Note the "fast path" still **walks every directory** to compare mtimes;
+    /// it only skips re-parsing the audio files. On a launch where nothing
+    /// changed, the per-directory walk remains the hot part; `force` is the
+    /// explicit re-read, not the only traversal.
+    ///
     /// `stats` is seeded with `added` stamps for songs the library gains: on
     /// the very first run (empty stats file) from the file's mtime, later
     /// from "now" — a copy preserves the old mtime, which would bury a newly
     /// added song at the bottom of "Recently Added".
-    pub fn sync(&mut self, library: &mut Library, roots: &[PathBuf], force: bool, stats: &mut Stats) -> SyncReport {
+    pub fn sync(
+        &mut self,
+        roots: &[PathBuf],
+        force: bool,
+        stats: &mut Stats,
+    ) -> (HashMap<SongId, Arc<SongMetadata>>, SyncReport) {
         let mut report = SyncReport::default();
+        // Entries are keyed by SongId; a path→id view keeps the per-file walk
+        // a hash lookup instead of a linear scan.
+        let mut by_path: HashMap<PathBuf, SongId> =
+            self.entries.iter().map(|(id, e)| (e.song.path.clone(), *id)).collect();
 
         for root in normalize_roots(roots) {
-            let current = collect_dirs(&root);
+            let (current, files) = collect_tree(&root);
 
             // Fast path: nothing in the tree changed, so every cached song
             // under this root is still valid — skip the walk entirely.
@@ -190,21 +207,26 @@ impl LibraryCache {
             }
 
             let mut seen: HashSet<PathBuf> = HashSet::new();
-            for file in collect_files(&root) {
+            for file in files {
                 seen.insert(file.clone());
                 let mtime = source_stamp(&file);
-                if let (Some(cached), Some(m)) = (self.entries.get(&file), mtime) {
-                    if cached.modified == m {
+                let cached_id = by_path.get(&file).copied();
+                if let (Some(id), Some(m)) = (cached_id, mtime) {
+                    if self.entries.get(&id).is_some_and(|cached| cached.modified == m) {
                         report.reused += 1;
                         continue;
                     }
                 }
-                match SongMetadata::load(&file) {
+                match SongMetadata::load_canonical(&file) {
                     Ok(song) => {
-                        self.entries.insert(
-                            file.clone(),
-                            CachedSong::new(song, mtime.unwrap_or(UNIX_EPOCH)),
-                        );
+                        let id = song.id;
+                        if let Some(old) = cached_id {
+                            self.entries.remove(&old);
+                            by_path.remove(&file);
+                        }
+                        self.entries
+                            .insert(id, CachedSong::new(song, mtime.unwrap_or(UNIX_EPOCH)));
+                        by_path.insert(file.clone(), id);
                         report.parsed += 1;
                     }
                     Err(e) => report.errors.push((file.clone(), e.to_string())),
@@ -214,7 +236,7 @@ impl LibraryCache {
             // Anything cached under this root that we didn't see is gone.
             let before = self.entries.len();
             self.entries
-                .retain(|path, _| !path.starts_with(&root) || seen.contains(path));
+                .retain(|_, entry| !entry.song.path.starts_with(&root) || seen.contains(&entry.song.path));
             report.removed += before - self.entries.len();
 
             // Refresh this root's directory stamps.
@@ -222,25 +244,26 @@ impl LibraryCache {
             self.dirs.extend(current);
         }
 
-        // Rebuild the library's song map from the (now current) cache, then
-        // drop dangling references and refresh autogen playlists. Custom
-        // playlists the library already holds are left alone.
-        library.replace_songs(self.entries.values().map(|e| (e.song.id, e.to_song())).collect());
-        library.prune();
-        library.rebuild_auto();
-        seed_added(library, stats);
+        // Hand the caller the current song set rather than mutating a library:
+        // the live library owns the custom playlists and id counter, so
+        // applying the songs in place keeps both intact (and keeps album ids
+        // from colliding with custom ids).
+        let songs: HashMap<SongId, Arc<SongMetadata>> =
+            self.entries.values().map(|e| (e.song.id, e.to_song())).collect();
+        seed_added(songs.values().map(AsRef::as_ref), stats);
 
-        report
+        (songs, report)
     }
 
     /// Persist the cached song metadata and directory stamps to disk.
     pub fn save(&self) -> anyhow::Result<()> {
+        let mut songs: Vec<CachedSong> = self.entries.values().cloned().collect();
+        songs.sort_by_key(|entry| entry.song.id);
         let file = CacheFile {
-            version: CACHE_VERSION,
-            dirs: self.dirs.clone(),
-            songs: self.entries.values().cloned().collect(),
+            dirs: self.dirs.iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            songs,
         };
-        write_json(&self.path, &file)
+        write_versioned(&self.path, &file, CACHE_VERSION, false)
     }
 
     /// The file the user-owned playlists are persisted to — a sibling of the
@@ -252,10 +275,7 @@ impl LibraryCache {
     /// Load the user-owned playlists and the id counter, or empty on a first
     /// run / version mismatch.
     pub fn load_playlists(&self) -> (HashMap<PlaylistId, Playlist>, u64) {
-        let loaded = fs::read(self.playlists_path())
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<PlaylistsFile>(&bytes).ok())
-            .filter(|file| file.version == CACHE_VERSION);
+        let loaded = read_versioned::<PlaylistsFile>(&self.playlists_path(), PLAYLISTS_VERSION);
         match loaded {
             Some(file) => (
                 file.playlists.into_iter().map(|p| (p.id, p)).collect(),
@@ -269,18 +289,17 @@ impl LibraryCache {
     /// what a playlist edit writes, instead of the whole song library.
     pub fn save_playlists(&self, library: &Library) -> anyhow::Result<()> {
         let file = PlaylistsFile {
-            version: CACHE_VERSION,
             playlists: library.custom_playlists().into_iter().cloned().collect(),
             next_playlist_id: library.next_playlist_id(),
         };
-        write_json(&self.playlists_path(), &file)
+        write_versioned(&self.playlists_path(), &file, PLAYLISTS_VERSION, true)
     }
 
     /// Persist the per-user song stats. Tiny — a few bytes per song the user
     /// has actually played.
     pub fn save_stats(&self, stats: &Stats) -> anyhow::Result<()> {
-        let file = StatsFile { version: CACHE_VERSION, stats: stats.clone() };
-        write_json(&self.stats_path(), &file)
+        let file = StatsFile { stats: stats.clone() };
+        write_versioned(&self.stats_path(), &file, STATS_VERSION, false)
     }
 
     /// The file the per-user song stats are persisted to — a sibling of the
@@ -293,11 +312,7 @@ impl LibraryCache {
     /// mismatch. Never an error: stats are user state a broken file must not
     /// take down the library with.
     pub fn load_stats(&self) -> Stats {
-        fs::read(self.stats_path())
-            .ok()
-            .and_then(|bytes| serde_json::from_slice::<StatsFile>(&bytes).ok())
-            .filter(|file| file.version == CACHE_VERSION)
-            .map(|file| file.stats)
+        read_versioned::<StatsFile>(&self.stats_path(), STATS_VERSION).map(|file| file.stats)
             .unwrap_or_default()
     }
 
@@ -311,7 +326,7 @@ impl LibraryCache {
     pub fn retain_roots(&mut self, roots: &[PathBuf]) {
         let normalized = normalize_roots(roots);
         let covered = |path: &Path| normalized.iter().any(|root| path.starts_with(root));
-        self.entries.retain(|path, _| covered(path));
+        self.entries.retain(|_, entry| covered(&entry.song.path));
         self.dirs.retain(|dir, _| covered(dir));
     }
 }
@@ -322,9 +337,9 @@ impl LibraryCache {
 /// guess at when it entered the library. Later arrivals get "now": a copy
 /// carries the original's mtime, so trusting it there would sort a newly
 /// added song as if it had always been present.
-fn seed_added(library: &Library, stats: &mut Stats) {
+fn seed_added<'a>(songs: impl IntoIterator<Item = &'a SongMetadata>, stats: &mut Stats) {
     let first_run = stats.is_empty();
-    for song in library.songs() {
+    for song in songs {
         if stats.contains(song.id) {
             continue;
         }
@@ -337,18 +352,6 @@ fn seed_added(library: &Library, stats: &mut Stats) {
     }
 }
 
-/// Serialize `value` to `path` via a temp file + rename, so a crash mid-write
-/// can't leave a truncated file that fails to parse on the next launch.
-fn write_json<T: Serialize>(path: &Path, value: &T) -> anyhow::Result<()> {
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent)?;
-    }
-    let bytes = serde_json::to_vec_pretty(value)?;
-    let tmp = path.with_extension("tmp");
-    fs::write(&tmp, bytes)?;
-    fs::rename(&tmp, path)?;
-    Ok(())
-}
 
 /// Canonicalize, dedupe, and drop roots nested inside another — the parent's
 /// walk already covers them, so scanning both would double-read every file.
@@ -368,49 +371,43 @@ fn normalize_roots(roots: &[PathBuf]) -> Vec<PathBuf> {
     result
 }
 
-/// Recursively collect every directory under `root` (including `root`), with
-/// its mtime.
-fn collect_dirs(root: &Path) -> HashMap<PathBuf, SystemTime> {
+/// Recursively walk `root` once, returning every directory's mtime and every
+/// supported audio file. A single traversal (rather than one for directories
+/// and another for files) halves the `read_dir` calls on a changed root.
+fn collect_tree(root: &Path) -> (HashMap<PathBuf, SystemTime>, Vec<PathBuf>) {
     let mut dirs = HashMap::new();
+    let mut files = Vec::new();
     let mut stack = vec![root.to_path_buf()];
     while let Some(dir) = stack.pop() {
-        if let Some(mtime) = dir_modified(&dir) {
+        if let Some(mtime) = modified(&dir) {
             dirs.insert(dir.clone(), mtime);
         }
         let Ok(entries) = fs::read_dir(&dir) else { continue };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_dir() {
-                stack.push(path);
-            }
-        }
-    }
-    dirs
-}
-
-/// Recursively collect every supported audio file under `root`.
-fn collect_files(root: &Path) -> Vec<PathBuf> {
-    let mut files = Vec::new();
-    let mut stack = vec![root.to_path_buf()];
-    while let Some(dir) = stack.pop() {
-        let Ok(entries) = fs::read_dir(&dir) else { continue };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            if path.is_dir() {
+            let Ok(file_type) = entry.file_type() else { continue };
+            if file_type.is_symlink() {
+                // Resolve once per link so every file path the walk yields is
+                // canonical — `SongMetadata::load_canonical` then skips a
+                // `canonicalize` syscall per file.
+                let target = path.canonicalize().unwrap_or(path);
+                if target.is_dir() {
+                    stack.push(target);
+                } else if Config::is_supported(&target) {
+                    files.push(target);
+                }
+            } else if file_type.is_dir() {
                 stack.push(path);
             } else if Config::is_supported(&path) {
                 files.push(path);
             }
         }
     }
-    files
+    (dirs, files)
 }
 
-fn dir_modified(path: &Path) -> Option<SystemTime> {
-    fs::metadata(path).ok().and_then(|m| m.modified().ok())
-}
-
-fn file_modified(path: &Path) -> Option<SystemTime> {
+/// A path's mtime, used for both directory stamps and file staleness.
+fn modified(path: &Path) -> Option<SystemTime> {
     fs::metadata(path).ok().and_then(|m| m.modified().ok())
 }
 
@@ -421,8 +418,8 @@ fn file_modified(path: &Path) -> Option<SystemTime> {
 /// cache. The sidecar lives in the same directory, so its own directory-mtime
 /// bump would re-walk the tree anyway; this is what makes the *file* re-read.
 fn source_stamp(path: &Path) -> Option<SystemTime> {
-    let audio = file_modified(path);
-    let sidecar = file_modified(&lyrics::sidecar_path(path));
+    let audio = modified(path);
+    let sidecar = modified(&lyrics::sidecar_path(path));
     match (audio, sidecar) {
         (Some(a), Some(s)) => Some(a.max(s)),
         (Some(a), None) => Some(a),
@@ -433,8 +430,24 @@ fn source_stamp(path: &Path) -> Option<SystemTime> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Lyrics, ReleaseDate, SongStats};
+    use crate::model::{Lyrics, ReleaseDate, SongId, SongStats};
     use std::time::Duration;
+
+    /// Apply a sync the way the app does: replace the song set in place so the
+    /// library keeps its playlists and id counter, then refresh derived data.
+    fn sync_into(
+        cache: &mut LibraryCache,
+        library: &mut Library,
+        roots: &[PathBuf],
+        force: bool,
+        stats: &mut Stats,
+    ) -> SyncReport {
+        let (songs, report) = cache.sync(roots, force, stats);
+        library.replace_songs(songs);
+        library.prune();
+        library.rebuild_auto();
+        report
+    }
 
     /// A unique temp directory per test, cleaned up by the caller's drop.
     struct TempDir(PathBuf);
@@ -468,21 +481,8 @@ mod tests {
     }
 
     /// A minimal song for cache tests.
-    fn song(id: u64, path: &Path) -> SongMetadata {
-        SongMetadata {
-            id,
-            path: path.to_path_buf(),
-            song_name: Some("X".into()),
-            artists: Vec::new(),
-            album_name: None,
-            album_artist: None,
-            track_position: None,
-            date: None,
-            nominal_bitrate: None,
-            lyrics: Lyrics::None,
-            duration: Duration::ZERO,
-            has_art: false,
-        }
+    fn song(id: SongId, path: &Path) -> SongMetadata {
+        SongMetadata { id, path: path.to_path_buf(), song_name: Some("X".into()), ..Default::default() }
     }
 
     #[test]
@@ -502,7 +502,8 @@ mod tests {
         tmp.touch("sub/b.opus");
         tmp.touch("sub/notes.txt");
 
-        let mut files: Vec<String> = collect_files(tmp.path())
+        let (_, files) = collect_tree(tmp.path());
+        let mut files: Vec<String> = files
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
@@ -514,7 +515,7 @@ mod tests {
     fn collect_dirs_walks_the_whole_tree() {
         let tmp = TempDir::new("dirs");
         tmp.touch("a/b/c.flac");
-        let dirs = collect_dirs(tmp.path());
+        let (dirs, _) = collect_tree(tmp.path());
         assert_eq!(dirs.len(), 3, "root, a, and a/b");
     }
 
@@ -525,11 +526,11 @@ mod tests {
         let mut cache = LibraryCache::open(tmp.path().join("cache.json"));
         let mut library = Library::default();
 
-        let first = cache.sync(&mut library, &[tmp.path().to_path_buf()], false, &mut Stats::default());
+        let first = sync_into(&mut cache, &mut library, &[tmp.path().to_path_buf()], false, &mut Stats::default());
         assert_eq!(first.skipped_roots, 0);
         assert_eq!(first.errors.len(), 1, "the fake file can't be parsed");
 
-        let second = cache.sync(&mut library, &[tmp.path().to_path_buf()], false, &mut Stats::default());
+        let second = sync_into(&mut cache, &mut library, &[tmp.path().to_path_buf()], false, &mut Stats::default());
         assert_eq!(second.skipped_roots, 1, "nothing changed, so nothing walked");
     }
 
@@ -540,8 +541,8 @@ mod tests {
         let mut cache = LibraryCache::open(tmp.path().join("cache.json"));
         let mut library = Library::default();
 
-        cache.sync(&mut library, &[tmp.path().to_path_buf()], false, &mut Stats::default());
-        let forced = cache.sync(&mut library, &[tmp.path().to_path_buf()], true, &mut Stats::default());
+        sync_into(&mut cache, &mut library, &[tmp.path().to_path_buf()], false, &mut Stats::default());
+        let forced = sync_into(&mut cache, &mut library, &[tmp.path().to_path_buf()], true, &mut Stats::default());
         assert_eq!(forced.skipped_roots, 0);
         assert_eq!(forced.errors.len(), 1, "re-read, and failed again");
     }
@@ -553,33 +554,33 @@ mod tests {
 
         let mut library = Library::default();
         library.insert_song(SongMetadata {
-            id: 42,
+            id: SongId(42),
             path: tmp.path().join("x.flac"),
             song_name: Some("X".into()),
             artists: vec!["Grimes".into()],
             album_name: Some("Visions".into()),
-            album_artist: None,
             track_position: Some(3),
             date: Some(ReleaseDate::new(2012, Some(1), Some(1))),
             nominal_bitrate: Some(320_000),
             lyrics: Lyrics::Plain("a line".into()),
             duration: Duration::from_secs(200),
             has_art: true,
+            ..Default::default()
         });
 
         let mut cache = LibraryCache::open(cache_path.clone());
         // Seed the per-file entry the way a real scan would.
         cache.entries.insert(
-            tmp.path().join("x.flac"),
-            CachedSong::new(library.get(42).unwrap().clone(), UNIX_EPOCH),
+            SongId(42),
+            CachedSong::new(library.get(SongId(42)).unwrap().clone(), UNIX_EPOCH),
         );
         cache.save().unwrap();
 
         let mut reloaded = Library::default();
         LibraryCache::open(cache_path).install(&mut reloaded);
         assert_eq!(reloaded.song_count(), 1);
-        assert_eq!(reloaded.get(42).unwrap().album(), "Visions");
-        let song = reloaded.get(42).unwrap();
+        assert_eq!(reloaded.get(SongId(42)).unwrap().album(), "Visions");
+        let song = reloaded.get(SongId(42)).unwrap();
         assert_eq!(
             song.date,
             Some(ReleaseDate::new(2012, Some(1), Some(1))),
@@ -598,9 +599,9 @@ mod tests {
         let cache_path = tmp.path().join("cache.json");
 
         let mut library = Library::default();
-        library.insert_song(song(42, &tmp.path().join("x.flac")));
+        library.insert_song(song(SongId(42), &tmp.path().join("x.flac")));
         let custom = library.create_custom("Faves");
-        library.add_song(custom, 42);
+        library.add_song(custom, SongId(42));
 
         let cache = LibraryCache::open(cache_path.clone());
         cache.save_playlists(&library).unwrap();
@@ -631,18 +632,10 @@ mod tests {
                 id,
                 path: path.to_path_buf(),
                 song_name: Some("X".into()),
-                artists: Vec::new(),
-                album_name: None,
-                album_artist: None,
-                track_position: None,
-                date: None,
-                nominal_bitrate: None,
-                lyrics: Lyrics::None,
-                duration: Duration::ZERO,
-                has_art: false,
+                ..Default::default()
             };
-            cache.entries.insert(nested.clone(), CachedSong::new(song(1, &nested), UNIX_EPOCH));
-            cache.entries.insert(other.clone(), CachedSong::new(song(2, &other), UNIX_EPOCH));
+            cache.entries.insert(SongId(1), CachedSong::new(song(SongId(1), &nested), UNIX_EPOCH));
+            cache.entries.insert(SongId(2), CachedSong::new(song(SongId(2), &other), UNIX_EPOCH));
             cache.dirs.insert(a.clone(), UNIX_EPOCH);
             cache.dirs.insert(nested_dir.clone(), UNIX_EPOCH);
             cache.dirs.insert(b.clone(), UNIX_EPOCH);
@@ -652,16 +645,16 @@ mod tests {
         let mut cache = LibraryCache::open(tmp.path().join("cache.json"));
         seed(&mut cache);
         cache.retain_roots(&[a.clone()]);
-        assert!(cache.entries.contains_key(&nested), "a/nested is still covered by a");
-        assert!(!cache.entries.contains_key(&other), "b's song is dropped");
+        assert!(cache.entries.contains_key(&SongId(1)), "a/nested is still covered by a");
+        assert!(!cache.entries.contains_key(&SongId(2)), "b's song is dropped");
         assert!(cache.dirs.contains_key(&nested_dir), "a's directory stamps survive");
 
         // Removing `a` instead drops the nested contents, leaving only `b`'s.
         let mut cache = LibraryCache::open(tmp.path().join("cache.json"));
         seed(&mut cache);
         cache.retain_roots(&[b.clone()]);
-        assert!(!cache.entries.contains_key(&nested), "a/nested is gone with a");
-        assert!(cache.entries.contains_key(&other), "b's song remains");
+        assert!(!cache.entries.contains_key(&SongId(1)), "a/nested is gone with a");
+        assert!(cache.entries.contains_key(&SongId(2)), "b's song remains");
     }
 
     #[test]
@@ -684,14 +677,62 @@ mod tests {
         let cache = LibraryCache::open(cache_path.clone());
 
         let mut stats = Stats::default();
-        stats.record_play(42, UNIX_EPOCH);
-        stats.ensure_added(42, UNIX_EPOCH);
+        stats.record_play(SongId(42), UNIX_EPOCH);
+        stats.ensure_added(SongId(42), UNIX_EPOCH);
         cache.save_stats(&stats).unwrap();
 
         let loaded = LibraryCache::open(cache_path).load_stats();
-        assert_eq!(loaded.get(42).plays, 1);
-        assert_eq!(loaded.get(42).added, Some(UNIX_EPOCH));
-        assert_eq!(loaded.get(7), SongStats::default(), "unknown songs stay default");
+        assert_eq!(loaded.get(SongId(42)).plays, 1);
+        assert_eq!(loaded.get(SongId(42)).added, Some(UNIX_EPOCH));
+        assert_eq!(loaded.get(SongId(7)), SongStats::default(), "unknown songs stay default");
+    }
+
+    #[test]
+    fn playlists_survive_a_song_cache_version_bump() {
+        // A song-schema bump only invalidates the song cache; the user's
+        // playlists live in their own file with their own version.
+        let tmp = TempDir::new("playlists-independent");
+        let cache_path = tmp.path().join("cache.json");
+        let cache = LibraryCache::open(cache_path.clone());
+        let mut library = Library::default();
+        library.insert_song(song(SongId(42), &tmp.path().join("x.flac")));
+        let id = library.create_custom("Faves");
+        library.add_song(id, SongId(42));
+        cache.save_playlists(&library).unwrap();
+
+        // Simulate an old song cache: its version no longer matches.
+        fs::write(&cache_path, r#"{"version":1,"dirs":{},"songs":[]}"#).unwrap();
+        let reopened = LibraryCache::open(cache_path);
+        let (playlists, _) = reopened.load_playlists();
+        assert_eq!(playlists.len(), 1, "a cache bump leaves playlists alone");
+    }
+
+    #[test]
+    fn playlists_version_mismatch_is_treated_as_empty() {
+        let tmp = TempDir::new("playlists-version");
+        let cache = LibraryCache::open(tmp.path().join("cache.json"));
+        fs::write(
+            cache.playlists_path(),
+            r#"{"version":999,"playlists":[],"next_playlist_id":5}"#,
+        )
+        .unwrap();
+        assert!(cache.load_playlists().0.is_empty());
+    }
+
+    #[test]
+    fn saving_twice_produces_identical_bytes() {
+        let tmp = TempDir::new("deterministic");
+        let cache_path = tmp.path().join("cache.json");
+        let cache = LibraryCache::open(cache_path);
+        let mut library = Library::default();
+        library.insert_song(song(SongId(2), &tmp.path().join("b.flac")));
+        library.insert_song(song(SongId(1), &tmp.path().join("a.flac")));
+        library.rebuild_auto();
+        cache.save_playlists(&library).unwrap();
+        let first = fs::read(cache.playlists_path()).unwrap();
+        cache.save_playlists(&library).unwrap();
+        let second = fs::read(cache.playlists_path()).unwrap();
+        assert_eq!(first, second);
     }
 
     #[test]
@@ -714,20 +755,20 @@ mod tests {
         let path = tmp.touch("track.flac");
         let mtime = source_stamp(&path).unwrap();
         let mut library = Library::default();
-        library.insert_song(song(1, &path));
+        library.insert_song(song(SongId(1), &path));
 
         // First run: the stats are empty, so the file's mtime is the best
         // guess at when the song entered the library.
         let mut stats = Stats::default();
-        seed_added(&library, &mut stats);
-        assert_eq!(stats.get(1).added, Some(mtime));
+        seed_added(library.songs(), &mut stats);
+        assert_eq!(stats.get(SongId(1)).added, Some(mtime));
 
         // A song that arrives when stats already exist is stamped "now", not
         // with its (old) mtime — otherwise a copied file would look ancient.
         let mut stats = Stats::default();
-        stats.record_play(999, UNIX_EPOCH); // non-empty => not the first run
-        seed_added(&library, &mut stats);
-        assert!(stats.get(1).added.is_some_and(|t| t > mtime), "later arrivals stamp now");
+        stats.record_play(SongId(999), UNIX_EPOCH); // non-empty => not the first run
+        seed_added(library.songs(), &mut stats);
+        assert!(stats.get(SongId(1)).added.is_some_and(|t| t > mtime), "later arrivals stamp now");
     }
 
     #[test]
@@ -737,29 +778,24 @@ mod tests {
         let mut library = Library::default();
         // Seed a cached song by hand (a real scan needs real audio).
         library.insert_song(SongMetadata {
-            id: 7,
+            id: SongId(7),
             path: tmp.path().join("y.flac"),
             song_name: Some("Y".into()),
             artists: vec!["Grimes".into()],
             album_name: Some("Visions".into()),
-            album_artist: None,
             track_position: Some(1),
-            date: None,
-            nominal_bitrate: None,
-            lyrics: Lyrics::None,
-            duration: Duration::ZERO,
-            has_art: false,
+            ..Default::default()
         });
         cache.entries.insert(
-            tmp.path().join("y.flac"),
-            CachedSong::new(library.get(7).unwrap().clone(), UNIX_EPOCH),
+            SongId(7),
+            CachedSong::new(library.get(SongId(7)).unwrap().clone(), UNIX_EPOCH),
         );
 
         // A sync with no roots still rebuilds from whatever is cached.
-        cache.sync(&mut library, &[], false, &mut Stats::default());
+        sync_into(&mut cache, &mut library, &[], false, &mut Stats::default());
         let auto = library.playlists();
         assert_eq!(auto.len(), 1);
         assert_eq!(auto[0].title(), "Visions");
-        assert_eq!(auto[0].song_ids, vec![7]);
+        assert_eq!(auto[0].song_ids, vec![SongId(7)]);
     }
 }

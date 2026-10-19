@@ -25,7 +25,7 @@ use gpui::{
 };
 
 use crate::model::search;
-use crate::model::{PlaylistId, PlaylistKind, SmartKind, SongId};
+use crate::model::{Order, PlaylistId, PlaylistKind, Scope, Selection, SongId};
 use crate::ui::album_list::{
     self, AlbumList, AlbumListSubs, AlbumListView, Play,
 };
@@ -53,7 +53,7 @@ pub struct PlaylistView {
     /// The add-songs query box.
     add_query: TextField,
     /// Add-songs candidates, recomputed when the query or library changes.
-    add_results: Vec<(SongId, String, String)>,
+    add_results: Vec<(SongId, SharedString, SharedString)>,
     add_stale: bool,
     /// Focus for the add-songs box, so it only takes keys once clicked.
     add_focus: FocusHandle,
@@ -73,13 +73,14 @@ impl PlaylistView {
     ) -> Self {
         let observe =
             album_list::observe(&library, Some(&playback), &covers, &animator, cx);
+        let wake = animator.read(cx).wake_handle();
         // The playlist tab draws the library's rows, so it shares the browse
         // list's typography — one size, so the tabs can't drift apart.
         let themed = BrowseView::themed(&config, cx);
         let is_custom = is_custom(&library, playlist, cx);
         Self {
             themed,
-            list: AlbumListView::new(library, playback, covers, animator, Play::Playlist),
+            list: AlbumListView::new(library, playback, covers, animator, wake, Play::Playlist),
             playlist,
             is_custom,
             add_query: TextField::default(),
@@ -109,11 +110,11 @@ impl PlaylistView {
                 .map(|p| p.song_ids.iter().copied().collect())
                 .unwrap_or_default();
             let (query, _) = search::parse(&self.add_query.value);
-            let mut results: Vec<(SongId, String, String)> = search::matching_songs(library, &query)
+            let mut results: Vec<(SongId, SharedString, SharedString)> = library.select_songs(&Selection { scope: Scope::Library, query: query.clone(), order: Order::AlbumTitle })
                 .into_iter()
                 .filter(|id| !present.contains(id))
                 .filter_map(|id| {
-                    library.get(id).map(|song| (id, song.display_title(), song.artists.join(", ")))
+                    library.get(id).map(|song| (id, song.display_title().into_owned().into(), song.artists.join(", ").into()))
                 })
                 .collect();
             results.truncate(ADD_LIST_CAP);
@@ -248,11 +249,7 @@ impl Render for PlaylistView {
                     .child(empty_hint(
                         theme,
                         if let Some(kind) = smart_kind {
-                            match kind {
-                                SmartKind::RecentlyAdded => "Add music — new songs land here.",
-                                SmartKind::RecentlyPlayed => "Play something to fill this in.",
-                                SmartKind::MostPlayed => "Play something to fill this in.",
-                            }
+                            kind.empty_hint()
                         } else if is_custom {
                             "Empty playlist — search below to add songs."
                         } else {
@@ -291,13 +288,14 @@ impl Render for PlaylistView {
                     .overflow_y_scroll()
                     .flex()
                     .flex_col();
-                for (index, (song, title, artist)) in self.add_results.clone().into_iter().enumerate() {
+                for (index, (song, title, artist)) in self.add_results.iter().enumerate() {
+                    let song = *song;
                     list_el = list_el.child(add_row(
                         theme,
                         index,
                         song,
-                        title,
-                        artist,
+                        title.clone(),
+                        artist.clone(),
                         cx.listener(move |this, _event, _window, cx| {
                             this.list.library().clone().update(cx, |state, cx| {
                                 state.add_song(selected, song, cx)
@@ -332,12 +330,12 @@ fn add_row(
     theme: Theme,
     index: usize,
     song: SongId,
-    title: String,
-    artist: String,
+    title: SharedString,
+    artist: SharedString,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static,
 ) -> AnyElement {
     div()
-        .id(("add", song))
+        .id(("add", song.get()))
         .flex()
         .items_center()
         .justify_between()

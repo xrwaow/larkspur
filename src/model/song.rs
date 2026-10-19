@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -6,7 +7,7 @@ use lofty::probe::Probe;
 use lofty::tag::{Accessor, ItemKey, Tag};
 use serde::{Deserialize, Serialize};
 
-use super::identity::{generate_song_id, SongId};
+use super::identity::{generate_song_id, song_id_for_canonical, SongId};
 use super::lyrics::{load_sidecar, looks_like_lrc, parse_lrc, Lyrics};
 
 /// A release date packed as `YYYYMMDD` (e.g. `20230501`), with zeros for
@@ -50,7 +51,7 @@ impl ReleaseDate {
 /// Serialize/Deserialize is derived so the scan cache can round-trip a song
 /// whole rather than mirroring every field. Decoded pixels aren't part of the
 /// metadata — the cover cache owns those — only *whether* art exists is.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SongMetadata {
     pub id: SongId,
     pub path: PathBuf,
@@ -91,11 +92,22 @@ impl SongMetadata {
     /// without a title. An `Err` means the file couldn't be opened or isn't
     /// a container `lofty` understands, not merely "has no tags".
     pub fn load(path: &Path) -> anyhow::Result<Self> {
+        let id = generate_song_id(path)?;
+        Self::load_with_id(path, id)
+    }
+
+    /// Like [`load`](Self::load), for a path the caller knows is already
+    /// canonical — the scanner's walk resolves symlinked directories, so it
+    /// skips a `canonicalize` syscall per file.
+    pub fn load_canonical(path: &Path) -> anyhow::Result<Self> {
+        Self::load_with_id(path, song_id_for_canonical(path))
+    }
+
+    fn load_with_id(path: &Path, id: SongId) -> anyhow::Result<Self> {
         // Re-guess from the file's actual bytes: `Probe::open` guesses from
         // the extension, and `.ogg` files may hold Opus (lofty would then
         // fail with "Vorbis: File missing magic signature").
         let tagged_file = Probe::open(path)?.guess_file_type()?.read()?;
-        let id = generate_song_id(path)?;
         let properties = tagged_file.properties();
         let duration = properties.duration();
         // lofty reports kbps; store bps so it matches the live bitrate's units.
@@ -114,16 +126,10 @@ impl SongMetadata {
             return Ok(Self {
                 id,
                 path: path.to_path_buf(),
-                song_name: None,
-                artists: Vec::new(),
-                album_name: None,
-                album_artist: None,
-                track_position: None,
-                date: None,
-                nominal_bitrate: None,
-                lyrics: sidecar.unwrap_or(Lyrics::None),
+                nominal_bitrate,
+                lyrics: sidecar.unwrap_or_default(),
                 duration,
-                has_art: false,
+                ..Self::default()
             });
         };
 
@@ -197,13 +203,18 @@ impl SongMetadata {
     /// The title to show for this song: the tag's title, or the file's stem
     /// when it's untagged. Every list that names a song uses this, so a
     /// missing tag degrades to the filename instead of a blank row.
-    pub fn display_title(&self) -> String {
-        self.song_name.clone().unwrap_or_else(|| {
-            self.path
+    ///
+    /// Borrowed when the tag carries a title (the common case), so sorting
+    /// comparators that only compare titles don't allocate.
+    pub fn display_title(&self) -> Cow<'_, str> {
+        match &self.song_name {
+            Some(name) => Cow::Borrowed(name),
+            None => self
+                .path
                 .file_stem()
-                .map(|stem| stem.to_string_lossy().into_owned())
-                .unwrap_or_else(|| "Untitled".to_string())
-        })
+                .map(|stem| stem.to_string_lossy())
+                .unwrap_or(Cow::Borrowed("Untitled")),
+        }
     }
 
 }

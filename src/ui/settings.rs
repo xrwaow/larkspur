@@ -20,7 +20,7 @@ use gpui::{
 };
 
 use crate::model::config::{
-    DynamicBase, FontKind, ThemeKind, WaveformStyle, MAX_FONT_SIZE, MIN_FONT_SIZE,
+    DynamicBase, FontKind, TextureMode, ThemeKind, WaveformStyle, MAX_FONT_SIZE, MIN_FONT_SIZE,
 };
 use crate::ui::browse::BrowseView;
 use crate::ui::config_state::{ConfigState, Themed};
@@ -49,12 +49,18 @@ enum Segmented {
     DynamicBase,
     Waveform,
     Visualizer,
+    Texture,
 }
 
 impl Segmented {
     /// All groups, in render order-ish. Used to create their focus handles.
-    const ALL: [Segmented; 4] =
-        [Segmented::Theme, Segmented::DynamicBase, Segmented::Waveform, Segmented::Visualizer];
+    const ALL: [Segmented; 5] = [
+        Segmented::Theme,
+        Segmented::DynamicBase,
+        Segmented::Waveform,
+        Segmented::Visualizer,
+        Segmented::Texture,
+    ];
 
     fn key(self) -> &'static str {
         match self {
@@ -62,6 +68,7 @@ impl Segmented {
             Segmented::DynamicBase => "seg-dynamic-base",
             Segmented::Waveform => "seg-waveform",
             Segmented::Visualizer => "seg-visualizer",
+            Segmented::Texture => "seg-lyrics-texture",
         }
     }
 
@@ -71,6 +78,7 @@ impl Segmented {
             Segmented::DynamicBase => &["Black", "White"],
             Segmented::Waveform => &["Bars", "Line"],
             Segmented::Visualizer => &["On", "Off"],
+            Segmented::Texture => &["Off", "No lyrics", "Always"],
         }
     }
 
@@ -138,6 +146,10 @@ impl SettingsView {
                 .position(|style| *style == config.waveform())
                 .unwrap_or(0),
             Segmented::Visualizer => usize::from(!config.visualizer()),
+            Segmented::Texture => TextureMode::ALL
+                .iter()
+                .position(|mode| *mode == config.lyrics_texture())
+                .unwrap_or(0),
         }
     }
 
@@ -162,6 +174,10 @@ impl SettingsView {
             Segmented::Visualizer => {
                 let on = index == 0;
                 self.config.update(cx, |config, cx| config.set_visualizer(on, cx));
+            }
+            Segmented::Texture => {
+                let mode = TextureMode::ALL[index];
+                self.config.update(cx, |config, cx| config.set_lyrics_texture(mode, cx));
             }
         }
     }
@@ -227,6 +243,7 @@ impl Render for SettingsView {
         let waveform = config.waveform();
         let dynamic_base = config.dynamic_base();
         let visualizer_on = config.visualizer();
+        let lyrics_texture = config.lyrics_texture();
         let theme_active = ThemeKind::ALL.iter().position(|kind| *kind == theme_kind).unwrap_or(0);
         let base_active = DynamicBase::ALL
             .iter()
@@ -235,6 +252,10 @@ impl Render for SettingsView {
         let waveform_active =
             WaveformStyle::ALL.iter().position(|style| *style == waveform).unwrap_or(0);
         let visualizer_active = usize::from(!visualizer_on);
+        let texture_active = TextureMode::ALL
+            .iter()
+            .position(|mode| *mode == lyrics_texture)
+            .unwrap_or(0);
         let roots: Vec<PathBuf> = config.roots().to_vec();
         let rows: Vec<ContainerRow> = containers()
             .into_iter()
@@ -307,6 +328,21 @@ impl Render for SettingsView {
                 visualizer_active,
                 self.hovered_segment,
                 &visualizer_focus,
+                cx,
+            ),
+        ));
+
+        // --- procedural lyrics texture ---
+        let texture_focus = self.segment_focus[&Segmented::Texture].clone();
+        items.push(setting_row(
+            theme,
+            "Texture",
+            segmented_control(
+                theme,
+                Segmented::Texture,
+                texture_active,
+                self.hovered_segment,
+                &texture_focus,
                 cx,
             ),
         ));

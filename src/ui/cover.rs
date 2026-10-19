@@ -8,7 +8,7 @@ use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::cover_store::{CoverImage, CoverStore};
 use crate::ui::library_state::{LibraryState, Request};
-use crate::ui::menu::SongMenuRequest;
+use crate::ui::menu::{MenuOrigin, SongMenuRequest};
 use crate::ui::playback_state::PlaybackState;
 
 /// The now-playing cover square.
@@ -144,9 +144,7 @@ impl Render for CoverView {
                 let request = SongMenuRequest {
                     songs: vec![song],
                     position: event.position,
-                    playlist: None,
-                    queue: false,
-                    card: None,
+                    origin: MenuOrigin::Row { playlist: None },
                 };
                 library.update(cx, |state, cx| state.request(Request::SongMenu(request), cx));
             }

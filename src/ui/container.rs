@@ -240,6 +240,8 @@ pub struct Workspace {
     rail: Tween,
     /// Where the rail is heading, so a repeated request is a no-op.
     rail_target: f32,
+    /// The frame clock, held so starting a slide can wake it from sleep.
+    animator: Option<Entity<Animator>>,
     _observe_animator: Option<Subscription>,
 }
 
@@ -268,6 +270,7 @@ impl Workspace {
             themed,
             rail: Tween::new(rail_px),
             rail_target: rail_px,
+            animator: None,
             _observe_animator: None,
         }
     }
@@ -279,11 +282,13 @@ impl Workspace {
         let observe = cx.observe(&animator, |this, animator, cx| {
             let dt = animator.read(cx).dt();
             if this.rail.tick(dt) {
+                animator.read(cx).request();
                 set_module_px(&mut this.plan, "playlists", this.rail.value());
                 cx.notify();
             }
         });
         self._observe_animator = Some(observe);
+        self.animator = Some(animator);
     }
 
     /// The left rail's width right now — mid-slide it's between the open and
@@ -301,6 +306,9 @@ impl Workspace {
         }
         self.rail_target = target;
         self.rail.to(target, RAIL_ANIM_SECS);
+        if let Some(animator) = &self.animator {
+            animator.read(cx).request();
+        }
         cx.notify();
     }
 

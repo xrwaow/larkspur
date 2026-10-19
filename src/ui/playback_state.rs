@@ -29,7 +29,7 @@ use gpui::{App, Context, Entity};
 use crate::analysis::{TrackAnalyzer, Waveform};
 use crate::audio::{PlaybackController, RepeatMode, SampleTap, SongStatus};
 use crate::bitrate::BitrateProfile;
-use crate::model::{InputAction, SongId, SongMetadata};
+use crate::model::{InputAction, QueueEntry, SongId, SongMetadata};
 use crate::ui::animation::SLOW_FPS;
 use crate::ui::library_state::LibraryState;
 
@@ -257,7 +257,7 @@ impl PlaybackState {
     }
 
     /// The play queue and the index of the loaded entry, for the queue view.
-    pub fn queue(&self) -> (&[(SongId, PathBuf)], Option<usize>) {
+    pub fn queue(&self) -> (&[QueueEntry], Option<usize>) {
         self.controller.queue()
     }
 
@@ -326,7 +326,7 @@ impl PlaybackState {
     }
 
     /// Append `entries` to the play queue — the song menu's "Add to Queue".
-    pub fn add_to_queue(&mut self, entries: Vec<(SongId, PathBuf)>, cx: &mut Context<Self>) {
+    pub fn add_to_queue(&mut self, entries: Vec<QueueEntry>, cx: &mut Context<Self>) {
         if entries.is_empty() {
             return;
         }
@@ -380,7 +380,7 @@ impl PlaybackState {
     /// the waveform for whatever track ends up current.
     pub fn play_paths(
         &mut self,
-        entries: Vec<(SongId, PathBuf)>,
+        entries: Vec<QueueEntry>,
         start: usize,
         _cx: &mut Context<Self>,
     ) -> bool {
@@ -673,7 +673,7 @@ impl PlayCounter {
 mod tests {
     use super::*;
 
-    const SONG: SongId = 42;
+    const SONG: SongId = SongId(42);
 
     #[test]
     fn no_play_before_the_threshold() {

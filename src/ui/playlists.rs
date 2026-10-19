@@ -34,6 +34,7 @@ use gpui::{
     Pixels, Point, Render, RenderImage, Subscription, Window,
 };
 
+use crate::model::search::{MatchMode, TextMatcher};
 use crate::model::{FolderMode, Playlist, PlaylistId, PlaylistKind, SmartKind, SongId};
 use crate::ui::albums;
 use crate::ui::config_state::{ConfigState, Themed};
@@ -98,6 +99,7 @@ enum RailFilter {
 /// The rail's collapsible sections. `Library` wraps Albums, Artists and
 /// Folders; `Playlists` wraps the smart and custom playlists.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[repr(u64)]
 enum Group {
     Library,
     Albums,
@@ -114,16 +116,6 @@ impl Group {
             Group::Artists => "Artists",
             Group::Folders => "Folders",
             Group::Playlists => "Playlists",
-        }
-    }
-
-    fn hash_key(self) -> u64 {
-        match self {
-            Group::Library => 0,
-            Group::Albums => 1,
-            Group::Artists => 2,
-            Group::Folders => 3,
-            Group::Playlists => 4,
         }
     }
 
@@ -164,12 +156,6 @@ impl GroupFilter {
     fn showing(&self) -> bool {
         self.open || !self.field.is_empty()
     }
-}
-
-/// The row filter a group's query builds: an empty query matches everything,
-/// so one closure serves filtered and unfiltered builds alike.
-fn query_matches(query: &str) -> impl Fn(&str) -> bool + '_ {
-    move |text: &str| query.is_empty() || text.to_lowercase().contains(query)
 }
 
 pub struct PlaylistsView {
@@ -220,6 +206,7 @@ pub struct PlaylistsView {
     /// Set by anything that changes what the rows show; the next render
     /// rebuilds them.
     dirty: bool,
+    animator: Entity<Animator>,
     _observe: Subscription,
     _observe_animator: Subscription,
     _observe_covers: Subscription,
@@ -244,6 +231,7 @@ impl PlaylistsView {
             let dt = animator.read(cx).dt();
             let moved = this.marquees.values_mut().any(|marquee| marquee.tick(dt));
             if moved {
+                animator.read(cx).request();
                 cx.notify();
             }
         });
@@ -253,6 +241,7 @@ impl PlaylistsView {
             tabs,
             config,
             covers,
+            animator,
             themed,
             folder_open: false,
             open_dirs: HashSet::new(),
@@ -324,6 +313,7 @@ impl PlaylistsView {
         let on_slide = cx.listener(move |this, hovered: &bool, _window, cx| {
             if let Some(marquee) = this.marquees.get_mut(&key) {
                 if marquee.set_hovered(*hovered, travel) {
+                    this.animator.read(cx).request();
                     cx.notify();
                 }
             }
@@ -372,12 +362,12 @@ impl PlaylistsView {
         // collapse: searching must reveal what the fold is hiding. An
         // expanded tree renders directly under its own header.
         let (album_query, artist_query) = (self.album_filter.query(), self.artist_filter.query());
-        let (album_matches, artist_matches) =
-            (query_matches(&album_query), query_matches(&artist_query));
+        let album_matcher = TextMatcher::new(&album_query, MatchMode::Contains);
+        let artist_matcher = TextMatcher::new(&artist_query, MatchMode::Contains);
         let albums: Vec<Row> = lib
             .playlists()
             .iter()
-            .filter(|p| !p.is_custom() && album_matches(p.title()))
+            .filter(|p| !p.is_custom() && album_matcher.matches(p.title()))
             .map(|p| row_of(p))
             .collect();
         // "Your Library" and "Playlists" are plain titles; only the groups
@@ -408,7 +398,7 @@ impl PlaylistsView {
                 let artists: Vec<&str> = all_artists
                     .iter()
                     .map(String::as_str)
-                    .filter(|name| artist_matches(name))
+                    .filter(|name| artist_matcher.matches(name))
                     .collect();
                 if !artist_query.is_empty() && artists.is_empty() {
                     rows.push(RailRow::NoMatches);
@@ -421,7 +411,7 @@ impl PlaylistsView {
                             lib.discography(artist)
                                 .into_iter()
                                 .filter_map(|id| lib.playlist(id))
-                                .filter(|p| artist_matches(p.title()))
+                                .filter(|p| artist_matcher.matches(p.title()))
                                 .map(|p| RailRow::Discography(row_of(p))),
                         );
                     }
@@ -451,15 +441,15 @@ impl PlaylistsView {
             depth: 0,
         });
         {
-            for (kind, glyph) in [
-                (SmartKind::RecentlyAdded, "✦"),
-                (SmartKind::RecentlyPlayed, "↻"),
-                (SmartKind::MostPlayed, "▲"),
-            ] {
+            for kind in SmartKind::ALL {
                 if let Some(p) =
                     lib.smart_playlists().iter().find(|p| p.kind == PlaylistKind::Smart(kind))
                 {
-                    rows.push(RailRow::Smart { id: p.id, glyph, title: kind.title() });
+                    rows.push(RailRow::Smart {
+                        id: p.id,
+                        glyph: kind.glyph(),
+                        title: kind.title(),
+                    });
                 }
             }
             rows.push(RailRow::NewPlaylist);
@@ -541,7 +531,7 @@ impl PlaylistsView {
                 // line, and its children all share one column.
                 let guide = theme.cell_px() * 1.1;
                 div()
-                    .id(("group-header", group.hash_key()))
+                    .id(("group-header", group as u64))
                     .flex()
                     .items_center()
                     .justify_between()
@@ -990,7 +980,7 @@ fn collapsed_group_icons(theme: Theme, cx: &mut Context<PlaylistsView>) -> AnyEl
         .children([Group::Albums, Group::Artists, Group::Folders].map(|group| {
             let path = group.icon_path().expect("library group without an icon");
             div()
-                .id(("collapsed-group", group.hash_key()))
+                .id(("collapsed-group", group as u64))
                 .flex_none()
                 .flex()
                 .items_center()

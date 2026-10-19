@@ -169,7 +169,9 @@ fn library(roots: &[String]) -> anyhow::Result<()> {
         std::env::temp_dir().join(format!("larkspur-library-dump-{}.json", std::process::id()));
     let mut cache = LibraryCache::open(cache_path.clone());
     let mut library = Library::default();
-    let report = cache.sync(&mut library, &roots, true, &mut Stats::default());
+    let (songs, report) = cache.sync(&roots, true, &mut Stats::default());
+    library.replace_songs(songs);
+    library.rebuild_auto();
 
     println!("roots: {}", roots.len());
     println!(

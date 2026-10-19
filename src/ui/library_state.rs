@@ -18,16 +18,17 @@
 //! selected belongs to the playlist tab showing it, since each tab keeps its
 //! own.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::SystemTime;
 
 use gpui::{Context, Entity, Subscription};
 
 use crate::model::search::Query;
 use crate::model::{
-    generate_song_id, shuffle, FolderMode, Library, LibraryCache, Order, PlaylistId, Scope,
-    Selection, SongId, SongMetadata, Stats,
+    generate_song_id, shuffle, FolderMode, Library, LibraryCache, Order, PlaylistId, QueueEntry,
+    Scope, Selection, SongId, SongMetadata, Stats,
 };
 use crate::ui::config_state::ConfigState;
 use crate::ui::menu::SongMenuRequest;
@@ -93,7 +94,7 @@ impl LibraryState {
         library.replace_playlists(playlists, next_playlist_id);
         // Stats too — a sibling file with the same lifetime.
         let mut stats = cache.load_stats();
-        stats.prune(&library);
+        stats.prune(|id| library.get(id).is_some());
         // Smart playlists are views over the stats, so they exist as soon as
         // the cached library does — the sidebar can list them before any
         // scan finishes.
@@ -354,6 +355,21 @@ impl LibraryState {
         self.play(&songs, 0, playback, cx);
     }
 
+    /// Resolve song ids to queue entries (id + path). Ids the library no
+    /// longer holds (a moved or deleted file) are skipped rather than yielding
+    /// a dangling entry. This is the one id→path resolver for the controller.
+    pub fn queue_entries(&self, songs: &[SongId]) -> Vec<QueueEntry> {
+        songs
+            .iter()
+            .filter_map(|id| {
+                self.library.get(*id).map(|song| QueueEntry {
+                    song: song.id,
+                    path: song.path.clone(),
+                })
+            })
+            .collect()
+    }
+
     /// Replace the play queue with `songs`, starting at `start`. Nothing is
     /// persisted — this is how a playlist, or an ad-hoc selection, becomes the
     /// queue.
@@ -364,10 +380,7 @@ impl LibraryState {
         playback: &Entity<PlaybackState>,
         cx: &mut Context<Self>,
     ) {
-        let entries: Vec<(SongId, PathBuf)> = songs
-            .iter()
-            .filter_map(|id| self.library.get(*id).map(|song| (*id, song.path.clone())))
-            .collect();
+        let entries = self.queue_entries(songs);
         if entries.is_empty() {
             return;
         }
@@ -399,19 +412,22 @@ impl LibraryState {
     }
 
     /// Ensure every path is in the library (loading tags for any that aren't),
-    /// returning `(SongId, path)` pairs — so a queued file is always
-    /// resolvable to metadata.
-    fn ensure_songs(&mut self, paths: &[PathBuf]) -> Vec<(SongId, PathBuf)> {
+    /// returning queue entries — so a queued file is always resolvable to
+    /// metadata.
+    fn ensure_songs(&mut self, paths: &[PathBuf]) -> Vec<QueueEntry> {
         let mut entries = Vec::new();
+        let mut missing = Vec::new();
         for path in paths {
             let Ok(id) = generate_song_id(path) else { continue };
             if self.library.get(id).is_none() {
                 if let Ok(song) = SongMetadata::load(path) {
-                    self.library.insert_song(song);
+                    missing.push(song);
                 }
             }
-            entries.push((id, path.clone()));
+            entries.push(QueueEntry { song: id, path: path.clone() });
         }
+        // One reindex for every file loaded, not one per file.
+        self.library.insert_songs(missing);
         entries
     }
 
@@ -442,17 +458,23 @@ impl LibraryState {
         }
     }
 
-    /// Take the scan's result, keeping the user's custom playlists — which the
-    /// scan never touches, but which may have been edited while it ran.
-    fn merge_scanned(&mut self, scanned: Library) {
-        let previous = std::mem::take(&mut self.library);
-        self.library = scanned;
-        self.library.adopt_custom_from(&previous);
-        // The adopted custom playlists may reference songs the scan dropped
-        // (e.g. a removed root), so drop those references too. The scanned
-        // library has no smart playlists (they're never persisted), so the
-        // views are regenerated from the live stats rather than carried over.
-        self.library.prune();
+    /// Apply a scan's song set in place, keeping the user's custom playlists
+    /// and playlist id counter — which the scan never touches, but which may
+    /// have been edited while it ran. Album playlists are rebuilt from the new
+    /// tags; ids stay disjoint from the custom ones because the counter is
+    /// never reset.
+    fn adopt_scanned(&mut self, songs: HashMap<SongId, Arc<SongMetadata>>) {
+        {
+            let mut batch = self.library.batch();
+            batch.replace_songs(songs);
+            // Custom playlists may reference songs the scan dropped (e.g. a
+            // removed root), so drop those references too. Temporary views are
+            // snapshots a rescan invalidates.
+            batch.prune();
+            batch.drop_temporary();
+            batch.rebuild_auto();
+        }
+        self.stats.prune(|id| self.library.get(id).is_some());
         self.library.rebuild_smart(&self.stats);
     }
 
@@ -470,19 +492,17 @@ impl LibraryState {
                 .background_executor()
                 .spawn(async move {
                     let mut cache = cache;
-                    let mut library = Library::default();
                     let mut stats = stats;
-                    let report = cache.sync(&mut library, &roots, false, &mut stats);
-                    stats.prune(&library);
-                    (cache, library, stats, report)
+                    let (songs, report) = cache.sync(&roots, false, &mut stats);
+                    (cache, songs, stats, report)
                 })
                 .await;
 
             this.update(cx, |state, cx| {
-                let (cache, library, stats, report) = scanned;
+                let (cache, songs, stats, report) = scanned;
                 state.cache = Some(cache);
                 state.stats = stats;
-                state.merge_scanned(library);
+                state.adopt_scanned(songs);
                 state.scanning = false;
                 state.revision += 1;
                 // The synced-path list may have changed while we were scanning.

@@ -19,27 +19,27 @@
 //! line before any scan).
 
 use std::cell::Cell as StdCell;
-use std::path::PathBuf;
 use std::rc::Rc;
 use gpui::{
     canvas, div, prelude::*, px, App, ClickEvent, Context, Entity, MouseButton, MouseDownEvent,
     MouseMoveEvent, MouseUpEvent, Render, Window,
 };
 
-use crate::model::{PlaylistId, SongId};
+use std::sync::Arc;
+
+use crate::model::{PlaylistId, QueueEntry, SongMetadata};
 use crate::ui::album_list::{self, AlbumList, AlbumListSubs, AlbumListView, Play};
-use crate::ui::albums::{AlbumSection, RowActions, TrackRow};
+use crate::ui::albums::{AlbumSection, RowActions, RowLayout, SectionSource, TrackRow};
 use crate::ui::animation::Animator;
 use crate::ui::browse::BrowseView;
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::cover_store::CoverStore;
 use crate::ui::drag::Drag;
-use crate::ui::format::{format_bitrate, format_duration};
 use crate::ui::layout::RAIL_PX;
 use crate::ui::library_state::{LibraryState, Request};
 use crate::ui::marquee;
-use crate::ui::menu::SongMenuRequest;
+use crate::ui::menu::{MenuOrigin, SongMenuRequest};
 use crate::ui::playback_state::PlaybackState;
 use crate::ui::row_list::Cell;
 use crate::ui::widgets::empty_hint;
@@ -59,10 +59,8 @@ pub struct QueueView {
     /// The queue entries the rows were last built from, and the controller
     /// generation they were built at — the snapshot happens only when the
     /// generation moves, never per frame.
-    queue_entries: Vec<(SongId, PathBuf)>,
+    queue_entries: Vec<QueueEntry>,
     queue_generation: u64,
-    /// The queue's total time, computed with the snapshot.
-    total_secs: u64,
     /// The queue-open flag last seen in render, so opening can scroll the
     /// playing entry into view.
     open_last: bool,
@@ -76,6 +74,8 @@ pub struct QueueView {
     panel_top: Rc<StdCell<f32>>,
     /// The row grab in flight — hold a row and move to reorder it.
     drag: Drag,
+    /// The frame clock, held so starting a drag can wake it from sleep.
+    animator: Entity<Animator>,
     _subs: AlbumListSubs,
 }
 
@@ -88,15 +88,20 @@ impl QueueView {
         animator: Entity<Animator>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let mut list =
-            AlbumListView::new(library.clone(), playback.clone(), covers.clone(), animator.clone(), Play::Playlist);
-        list.rows_mut().set_flat();
+        let wake = animator.read(cx).wake_handle();
+        let mut list = AlbumListView::new(
+            library.clone(),
+            playback.clone(),
+            covers.clone(),
+            animator.clone(),
+            wake,
+            Play::Playlist,
+        );
+        list.rows_mut().set_layout(RowLayout::Flat);
         list.rows_mut().set_slim();
+        // `observe` already follows the playback state, so the open flag and
+        // queue generation invalidate this view.
         let subs = album_list::observe(&library, Some(&playback), &covers, &animator, cx);
-        // Follow the playback state (the queue contents are read during
-        // render; the open flag decides whether to draw at all).
-        cx.observe(&playback, |_this, _state, cx| cx.notify())
-        .detach();
         // Advance the drag ghost's chase spring on the shared frame clock —
         // the ghost renders at SMOOTH_FPS between the pointer's bursty events.
         // The rows tick through the album-list subscription, so only this is
@@ -105,6 +110,7 @@ impl QueueView {
             let dt = animator.read(cx).dt();
             let drag = this.drag.tick(dt);
             if drag {
+                animator.read(cx).request();
                 cx.notify();
             }
         })
@@ -120,56 +126,48 @@ impl QueueView {
             queue_entries: Vec::new(),
             panel_top: Rc::new(StdCell::new(0.0)),
             queue_generation: 0,
-            total_secs: 0,
             open_last: false,
             pending_reveal: None,
             drag: Drag::default(),
+            animator,
             _subs: subs,
         }
     }
 
     /// The queue as one drawable section: every path a track row, numbered by
-    /// queue position. `PlaylistId(0)` is inert — the row actions play from
-    /// the queue index, not the section's playlist.
-    fn queue_section(&self, queue: &[(SongId, PathBuf)], cx: &App) -> AlbumSection {
+    /// queue position. The source is [`SectionSource::Queue`], so the row
+    /// actions play from the queue index rather than a playlist.
+    fn queue_section(&self, queue: &[QueueEntry], cx: &App) -> AlbumSection {
         let library = self.library.read(cx).library();
         let tracks = queue
             .iter()
             .enumerate()
-            .map(|(index, (id, path))| {
-                let (title, artist, duration, bitrate) = match library.get(*id) {
-                    Some(song) => (
-                        song.display_title(),
-                        song.artists.join(", "),
-                        format_duration(song.duration),
-                        song.nominal_bitrate.map(format_bitrate).unwrap_or_default(),
-                    ),
-                    None => (
-                        path.file_stem()
-                            .unwrap_or(path.as_os_str())
-                            .to_string_lossy()
-                            .into_owned(),
-                        "Unknown Artist".to_string(),
-                        String::new(),
-                        String::new(),
-                    ),
-                };
-                TrackRow {
-                    song: *id,
-                    number: index + 1,
-                    title,
-                    artist,
-                    duration: duration.into(),
-                    bitrate: bitrate.into(),
-                }
+            .map(|(index, entry)| {
+                let id = entry.song;
+                let meta = library.get_arc(id).unwrap_or_else(|| {
+                    // A command-line file isn't in the library yet: synthesize
+                    // minimal metadata so the row still shows a filename.
+                    let path = entry.path.clone();
+                    Arc::new(SongMetadata {
+                        id,
+                        song_name: Some(
+                            path.file_stem()
+                                .unwrap_or(path.as_os_str())
+                                .to_string_lossy()
+                                .into_owned(),
+                        ),
+                        path,
+                        ..Default::default()
+                    })
+                });
+                TrackRow { song: id, number: index + 1, meta }
             })
             .collect();
         AlbumSection {
-            playlist: PlaylistId(0),
+            source: SectionSource::Queue,
             artist: String::new(),
             album: "Queue".to_string(),
             meta: String::new(),
-            year: String::new(),
             date: None,
             cover_song: None,
             row_covers: false,
@@ -216,7 +214,7 @@ impl RowActions<QueueView> for QueueRows {
         &self,
         view: &mut QueueView,
         item_ix: usize,
-        _playlist: PlaylistId,
+        _source: SectionSource,
         index: usize,
         event: &ClickEvent,
         _window: &mut Window,
@@ -227,6 +225,7 @@ impl RowActions<QueueView> for QueueRows {
             return;
         }
         if view.list_mut().rows_mut().click(item_ix, event.modifiers()) {
+            view.list().request_frame();
             cx.notify();
             return;
         }
@@ -234,6 +233,7 @@ impl RowActions<QueueView> for QueueRows {
         // Playing consumes the selection; up/down re-anchor from the playing
         // entry.
         view.list_mut().rows_mut().clear_selection();
+        view.list().request_frame();
     }
 
     fn press(
@@ -259,7 +259,7 @@ impl RowActions<QueueView> for QueueRows {
         view: &mut QueueView,
         item_ix: usize,
         _songs: Vec<crate::model::SongId>,
-        _playlist: PlaylistId,
+        _source: SectionSource,
         _context: Option<PlaylistId>,
         event: &gpui::MouseDownEvent,
         _window: &mut Window,
@@ -269,9 +269,7 @@ impl RowActions<QueueView> for QueueRows {
         let request = SongMenuRequest {
             songs,
             position: event.position,
-            playlist: None,
-            queue: true,
-            card: None,
+            origin: MenuOrigin::Queue,
         };
         let library = view.list().library().clone();
         library.update(cx, |state, cx| state.request(Request::SongMenu(request), cx));
@@ -279,6 +277,7 @@ impl RowActions<QueueView> for QueueRows {
 
     fn hover(&self, view: &mut QueueView, item_ix: usize, hovered: bool, cx: &mut Context<QueueView>) {
         if view.list_mut().rows_mut().set_hover(item_ix, hovered) {
+            view.list().request_frame();
             cx.notify();
         }
     }
@@ -292,6 +291,7 @@ impl RowActions<QueueView> for QueueRows {
         cx: &mut Context<QueueView>,
     ) {
         if view.list_mut().rows_mut().set_cell_hover(item_ix, cell, hovered) {
+            view.list().request_frame();
             cx.notify();
         }
     }
@@ -320,13 +320,6 @@ impl Render for QueueView {
         if queue_changed {
             self.queue_generation = generation;
             self.queue_entries = self.playback.read(cx).queue().0.to_vec();
-            let library = self.library.read(cx).library();
-            self.total_secs = self
-                .queue_entries
-                .iter()
-                .filter_map(|(id, _)| library.get(*id))
-                .map(|song| song.duration.as_secs())
-                .sum();
         }
 
         // A queue change under an active grab (a track finished, an entry was
@@ -376,6 +369,7 @@ impl Render for QueueView {
         if let Some(ix) = self.pending_reveal {
             if self.list.rows().viewport_height() > 0.0 {
                 self.list.rows_mut().reveal(ix);
+                self.list.request_frame();
                 self.pending_reveal = None;
             }
         }
@@ -393,6 +387,7 @@ impl Render for QueueView {
             // drag keeps tracking however far the pointer roams inside it.
             .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
                 if this.drag.drag(event.position.y, this.queue_entries.len()) {
+                    this.animator.read(cx).request();
                     cx.notify();
                 }
             }))
@@ -445,10 +440,10 @@ impl Render for QueueView {
         if let Some(info) = drag_info {
             let library = self.library.read(cx).library();
             let (title, artist) = match self.queue_entries.get(info.grabbed) {
-                Some((id, path)) => match library.get(*id) {
-                    Some(song) => (song.display_title(), song.artists.join(", ")),
+                Some(entry) => match library.get(entry.song) {
+                    Some(song) => (song.display_title().into_owned(), song.artists.join(", ")),
                     None => (
-                        path.file_stem().unwrap_or(path.as_os_str()).to_string_lossy().into_owned(),
+                        entry.path.file_stem().unwrap_or(entry.path.as_os_str()).to_string_lossy().into_owned(),
                         "Unknown Artist".to_string(),
                     ),
                 },

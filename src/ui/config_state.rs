@@ -17,7 +17,7 @@ use std::time::Duration;
 use gpui::{Context, Entity, Rgba, Subscription};
 
 use crate::model::config::{
-    Config, DynamicBase, FontKind, WaveformStyle, WindowPlacement,
+    Config, DynamicBase, FontKind, TextureMode, WaveformStyle, WindowPlacement,
 };
 use crate::model::ThemeKind;
 use crate::ui::container::Container;
@@ -33,6 +33,10 @@ pub struct ConfigState {
     /// Whether a debounced save of the window placement is already scheduled —
     /// resizing fires many bounds events, and each must not hit the disk.
     window_save_pending: bool,
+    /// Bumped whenever anything that feeds a [`Theme`] changes. [`Themed`]
+    /// skips its recompute + notify while this is unchanged, so changing a
+    /// scan root doesn't re-theme every view.
+    appearance_revision: u64,
 }
 
 impl ConfigState {
@@ -40,7 +44,7 @@ impl ConfigState {
     /// persist changes.
     pub fn new(config: Config, path: PathBuf, cx: &mut Context<Self>) -> Self {
         let _ = cx;
-        Self { config, path, dynamic_accent: None, window_save_pending: false }
+        Self { config, path, dynamic_accent: None, window_save_pending: false, appearance_revision: 0 }
     }
 
     // --- read-only accessors: what views render from -------------------
@@ -57,6 +61,26 @@ impl ConfigState {
     /// [`ThemeKind::Dynamic`].
     pub fn dynamic_base(&self) -> DynamicBase {
         self.config.dynamic_base
+    }
+
+    /// Bumped whenever the theme, dynamic base, accent, typeface or font size
+    /// changes. [`Themed`] uses it to skip needless re-renders on unrelated
+    /// config changes (scan roots, visualizer, window placement).
+    pub fn appearance_revision(&self) -> u64 {
+        self.appearance_revision
+    }
+
+    /// The base the lyrics panel's procedural texture should be drawn on.
+    ///
+    /// It follows the effective palette rather than just the dynamic-base
+    /// setting: the static Dark theme gets the black texture and Light the
+    /// white one, while Dynamic uses its configured black/white base.
+    pub fn texture_base(&self) -> DynamicBase {
+        match self.config.theme {
+            ThemeKind::Light => DynamicBase::White,
+            ThemeKind::Dark => DynamicBase::Black,
+            ThemeKind::Dynamic => self.config.dynamic_base,
+        }
     }
 
     /// The theme for `container`, at its configured (or built-in) font size and
@@ -100,6 +124,11 @@ impl ConfigState {
         self.config.visualizer
     }
 
+    /// When the lyrics panel draws its procedural texture.
+    pub fn lyrics_texture(&self) -> TextureMode {
+        self.config.lyrics_texture
+    }
+
     /// Whether the left library rail is collapsed to its header button.
     pub fn sidebar_minimized(&self) -> bool {
         self.config.sidebar_minimized
@@ -110,6 +139,7 @@ impl ConfigState {
     pub fn set_theme(&mut self, kind: ThemeKind, cx: &mut Context<Self>) {
         if self.config.theme != kind {
             self.config.theme = kind;
+            self.appearance_revision += 1;
             self.persist();
             cx.notify();
         }
@@ -134,6 +164,15 @@ impl ConfigState {
         }
     }
 
+    /// When the lyrics panel draws its procedural cover-art texture.
+    pub fn set_lyrics_texture(&mut self, mode: TextureMode, cx: &mut Context<Self>) {
+        if self.config.lyrics_texture != mode {
+            self.config.lyrics_texture = mode;
+            self.persist();
+            cx.notify();
+        }
+    }
+
     /// Collapse or expand the left library rail. The workspace observes this
     /// and slides the rail to its new width.
     pub fn set_sidebar_minimized(&mut self, minimized: bool, cx: &mut Context<Self>) {
@@ -149,6 +188,7 @@ impl ConfigState {
     pub fn set_dynamic_accent(&mut self, accent: Option<Rgba>, cx: &mut Context<Self>) {
         if self.dynamic_accent != accent {
             self.dynamic_accent = accent;
+            self.appearance_revision += 1;
             cx.notify();
         }
     }
@@ -158,6 +198,7 @@ impl ConfigState {
     pub fn set_dynamic_base(&mut self, base: DynamicBase, cx: &mut Context<Self>) {
         if self.config.dynamic_base != base {
             self.config.dynamic_base = base;
+            self.appearance_revision += 1;
             self.persist();
             cx.notify();
         }
@@ -165,22 +206,33 @@ impl ConfigState {
 
     /// Set (or clear, with `None`) a container's typeface override.
     pub fn set_font(&mut self, container: &str, font: Option<FontKind>, cx: &mut Context<Self>) {
+        if self.config.font_override(container) == font {
+            return;
+        }
         self.config.set_font(container, font);
+        self.appearance_revision += 1;
         self.persist();
         cx.notify();
     }
 
     pub fn set_font_size(&mut self, container: &str, size: f32, cx: &mut Context<Self>) {
+        if self.config.font_size_override(container) == Some(size) {
+            return;
+        }
         self.config.set_font_size(container, Some(size));
+        self.appearance_revision += 1;
         self.persist();
         cx.notify();
     }
 
     /// Clear a container's override, restoring its built-in default.
     pub fn reset_font_size(&mut self, container: &str, cx: &mut Context<Self>) {
-        self.config.set_font_size(container, None);
-        self.persist();
-        cx.notify();
+        if self.config.font_size_override(container).is_some() {
+            self.config.set_font_size(container, None);
+            self.appearance_revision += 1;
+            self.persist();
+            cx.notify();
+        }
     }
 
     /// Add a synced path. Returns whether it was actually added.
@@ -264,9 +316,17 @@ impl Themed {
     ) -> Self {
         let theme = Rc::new(Cell::new(config.read(cx).theme_for(container, default_size)));
         let cell = theme.clone();
+        let last_revision = Rc::new(Cell::new(config.read(cx).appearance_revision()));
+        let seen = last_revision.clone();
         let config = config.clone();
         let _config = cx.observe(&config, move |_this, config, cx| {
-            cell.set(config.read(cx).theme_for(container, default_size));
+            let state = config.read(cx);
+            let revision = state.appearance_revision();
+            if seen.get() == revision {
+                return;
+            }
+            seen.set(revision);
+            cell.set(state.theme_for(container, default_size));
             cx.notify();
         });
         Self { theme, _config }

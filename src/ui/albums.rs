@@ -21,7 +21,7 @@ use gpui::{
     SharedString, Window,
 };
 
-use crate::model::search::AlbumGroup;
+use crate::model::search::SongGroup;
 use crate::model::{Library, PlaylistId, ReleaseDate, SongId, SongMetadata};
 use crate::ui::cover_store::{CoverImage, CoverStore};
 use crate::ui::drag::{self, DragInfo};
@@ -94,28 +94,32 @@ impl Columns {
     }
 }
 
-/// One track row, snapshotted out of the library.
+/// One track row, snapshotted out of the library. It holds the shared song
+/// metadata rather than copies of its formatted labels: a rebuild is a cheap
+/// `Arc` clone, and the few cells that need text format it at render time
+/// (only visible rows).
 pub struct TrackRow {
     pub song: SongId,
     pub number: usize,
-    pub title: String,
-    pub artist: String,
-    /// The duration label, preformatted once per rebuild so render doesn't
-    /// format per row per frame.
-    pub duration: SharedString,
-    /// The declared-bitrate label, preformatted once per rebuild. The playing
-    /// row swaps in the live number at render.
-    pub bitrate: SharedString,
+    pub meta: Arc<SongMetadata>,
+}
+
+/// Where a section's rows come from. A real playlist, or the play queue —
+/// which has no [`PlaylistId`] of its own (there is no fake `PlaylistId(0)`
+/// sentinel that a future real playlist could alias).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectionSource {
+    Playlist(PlaylistId),
+    Queue,
 }
 
 /// One album section — its header data plus its tracks.
 pub struct AlbumSection {
-    pub playlist: PlaylistId,
+    pub source: SectionSource,
     pub artist: String,
     pub album: String,
     /// The `format | bitrate | tracks | time` line.
     pub meta: String,
-    pub year: String,
     /// The section's release date (packed `YYYYMMDD`), when its songs declare
     /// one — what the library's chronological ordering sorts by.
     pub date: Option<ReleaseDate>,
@@ -128,20 +132,31 @@ pub struct AlbumSection {
     pub tracks: Vec<TrackRow>,
 }
 
+impl AlbumSection {
+    /// The playlist this section draws, when it is one (not the queue).
+    pub fn playlist(&self) -> Option<PlaylistId> {
+        match self.source {
+            SectionSource::Playlist(id) => Some(id),
+            SectionSource::Queue => None,
+        }
+    }
+}
+
 /// Snapshot a set of album groups (e.g. search results) into drawable sections.
-pub fn sections_from_groups(library: &Library, groups: Vec<AlbumGroup>) -> Vec<AlbumSection> {
+pub fn sections_from_groups(library: &Library, groups: Vec<SongGroup>) -> Vec<AlbumSection> {
     groups.into_iter().filter_map(|group| section(library, group)).collect()
 }
 
 /// Snapshot one playlist — the playlist container's entry point.
 pub fn section_for_playlist(library: &Library, playlist: PlaylistId) -> Option<AlbumSection> {
     let playlist = library.playlist(playlist)?;
-    section(library, AlbumGroup { playlist: playlist.id, songs: playlist.song_ids.clone() })
+    section(library, SongGroup { playlist: playlist.id, songs: playlist.song_ids.clone() })
 }
 
-fn section(library: &Library, group: AlbumGroup) -> Option<AlbumSection> {
+fn section(library: &Library, group: SongGroup) -> Option<AlbumSection> {
     let playlist = library.playlist(group.playlist)?;
-    let songs: Vec<&SongMetadata> = group.songs.iter().filter_map(|id| library.get(*id)).collect();
+    let songs: Vec<Arc<SongMetadata>> =
+        group.songs.iter().filter_map(|id| library.get_arc(*id)).collect();
 
     // An album's row keeps the song's own track number (its position in the
     // album, falling back to the row order); a custom or smart playlist
@@ -158,10 +173,7 @@ fn section(library: &Library, group: AlbumGroup) -> Option<AlbumSection> {
             } else {
                 index + 1
             },
-            title: song.display_title(),
-            artist: song.artists.join(", "),
-            duration: format_duration(song.duration).into(),
-            bitrate: song.nominal_bitrate.map(format_bitrate).unwrap_or_default().into(),
+            meta: song.clone(),
         })
         .collect();
 
@@ -174,8 +186,8 @@ fn section(library: &Library, group: AlbumGroup) -> Option<AlbumSection> {
 
     // The meta line describes the playlist as a whole — every song in it, not
     // just the ones a search section lists.
-    let all: Vec<&SongMetadata> =
-        playlist.song_ids.iter().filter_map(|id| library.get(*id)).collect();
+    let all: Vec<Arc<SongMetadata>> =
+        playlist.song_ids.iter().filter_map(|id| library.get_arc(*id)).collect();
     let total_secs: u64 = all.iter().map(|song| song.duration.as_secs()).sum();
     let meta = album_meta(all.len(), total_secs);
 
@@ -199,11 +211,10 @@ fn section(library: &Library, group: AlbumGroup) -> Option<AlbumSection> {
     };
 
     Some(AlbumSection {
-        playlist: group.playlist,
+        source: SectionSource::Playlist(group.playlist),
         artist,
         album: playlist.title().to_string(),
         meta,
-        year: date.map(|date| date.year().to_string()).unwrap_or_default(),
         date,
         cover_song,
         // Anything that isn't an autogen album — custom and smart playlists —
@@ -216,7 +227,7 @@ fn section(library: &Library, group: AlbumGroup) -> Option<AlbumSection> {
 /// The artist line for an album: every artist credited on its tracks, deduped
 /// and in credit order — or "Several Artists" once more than a handful share
 /// the bill, so the line stays a line.
-fn album_artists(songs: &[&SongMetadata]) -> String {
+fn album_artists(songs: &[Arc<SongMetadata>]) -> String {
     let mut seen = std::collections::BTreeSet::new();
     let mut artists: Vec<&str> = Vec::new();
     for song in songs {
@@ -235,7 +246,7 @@ fn album_artists(songs: &[&SongMetadata]) -> String {
 
 /// The artist line for a custom playlist: the one artist every track credits,
 /// or "Various Artists" once they differ.
-fn custom_artist(songs: &[&SongMetadata]) -> String {
+fn custom_artist(songs: &[Arc<SongMetadata>]) -> String {
     let mut credited = songs.iter().map(|song| song.artists.join(", "));
     let first = credited.next().unwrap_or_default();
     if credited.all(|artist| artist == first) {
@@ -277,44 +288,41 @@ impl ListItem {
     }
 }
 
-/// Flatten sections into drawable rows, preserving album structure. A
-/// one-track album — a single — draws like any other album: a header plus its
-/// one track row.
-pub fn flatten(sections: &[AlbumSection]) -> Vec<ListItem> {
-    flatten_with(sections, false)
+/// How rows are flattened from album sections: with album headers, as a flat
+/// list of tracks (the queue), or with one-track sections collapsed into a
+/// single compact row (search).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RowLayout {
+    /// Headers plus track rows — the browse and playlist tables.
+    #[default]
+    Albums,
+    /// Track rows only, no headers — the queue panel.
+    Flat,
+    /// Like [`Albums`](Self::Albums), but a one-track section collapses into a
+    /// single row carrying its cover — the search panel.
+    CompactSingles,
 }
 
-/// Flatten sections the search panel's way: a one-track section — an album
-/// whose one song matched, or a true single — collapses into a single row
-/// carrying its cover.
-pub fn flatten_search(sections: &[AlbumSection]) -> Vec<ListItem> {
-    flatten_with(sections, true)
-}
-
-fn flatten_with(sections: &[AlbumSection], compact_singles: bool) -> Vec<ListItem> {
+/// Flatten sections into drawable rows according to `layout`.
+pub fn flatten(sections: &[AlbumSection], layout: RowLayout) -> Vec<ListItem> {
     let mut items = Vec::new();
     for (section, data) in sections.iter().enumerate() {
-        if data.tracks.is_empty() {
-            items.push(ListItem::Header(section));
-        } else if compact_singles && data.tracks.len() == 1 {
-            items.push(ListItem::Compact(section));
-        } else {
-            items.push(ListItem::Header(section));
-            for index in 0..data.tracks.len() {
-                items.push(ListItem::Track { section, index });
+        match layout {
+            RowLayout::Flat => {
+                for index in 0..data.tracks.len() {
+                    items.push(ListItem::Track { section, index });
+                }
             }
-        }
-    }
-    items
-}
-
-/// Flatten sections into track rows only — no album headers. The queue
-/// panel's flat list, where every entry is a song.
-pub fn flatten_tracks(sections: &[AlbumSection]) -> Vec<ListItem> {
-    let mut items = Vec::new();
-    for (section, data) in sections.iter().enumerate() {
-        for index in 0..data.tracks.len() {
-            items.push(ListItem::Track { section, index });
+            _ if data.tracks.is_empty() => items.push(ListItem::Header(section)),
+            RowLayout::CompactSingles if data.tracks.len() == 1 => {
+                items.push(ListItem::Compact(section));
+            }
+            _ => {
+                items.push(ListItem::Header(section));
+                for index in 0..data.tracks.len() {
+                    items.push(ListItem::Track { section, index });
+                }
+            }
         }
     }
     items
@@ -354,10 +362,10 @@ pub fn row_target(
     items: &[ListItem],
     sections: &[AlbumSection],
     ix: usize,
-) -> Option<(PlaylistId, usize)> {
+) -> Option<(SectionSource, usize)> {
     match items.get(ix)? {
-        ListItem::Track { section, index } => Some((sections.get(*section)?.playlist, *index)),
-        ListItem::Compact(section) => Some((sections.get(*section)?.playlist, 0)),
+        ListItem::Track { section, index } => Some((sections.get(*section)?.source, *index)),
+        ListItem::Compact(section) => Some((sections.get(*section)?.source, 0)),
         ListItem::Header(_) => None,
     }
 }
@@ -484,7 +492,7 @@ pub trait RowActions<V: Render>: 'static {
         &self,
         view: &mut V,
         item_ix: usize,
-        playlist: PlaylistId,
+        source: SectionSource,
         index: usize,
         event: &ClickEvent,
         window: &mut Window,
@@ -499,7 +507,7 @@ pub trait RowActions<V: Render>: 'static {
         view: &mut V,
         item_ix: usize,
         songs: Vec<SongId>,
-        playlist: PlaylistId,
+        source: SectionSource,
         context: Option<PlaylistId>,
         event: &MouseDownEvent,
         window: &mut Window,
@@ -587,6 +595,17 @@ struct RowPaint {
     slim: bool,
 }
 
+/// The six row listeners, bundled so a row takes one argument instead of six
+/// near-identical closures.
+struct RowHandlers {
+    on_click: Box<dyn Fn(&ClickEvent, &mut Window, &mut App)>,
+    on_right_click: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+    on_hover: Box<dyn Fn(&bool, &mut Window, &mut App)>,
+    on_title_hover: Box<dyn Fn(&bool, &mut Window, &mut App)>,
+    on_artist_hover: Box<dyn Fn(&bool, &mut Window, &mut App)>,
+    on_press: Box<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>,
+}
+
 /// Render one row — what `gpui::list` calls for each visible (and overdraw)
 /// item, so a huge library only ever draws the rows near the viewport.
 /// `actions` is absent for a header-only render (e.g. an empty playlist),
@@ -602,7 +621,7 @@ pub fn render_item<V: Render + 'static>(
 ) -> AnyElement {
     let item = items[ix];
     let section = &sections[item.section()];
-    let playlist = section.playlist;
+    let source = section.source;
     let playlist_context = context.context;
 
     // A header has no title/artist cells or row actions to wire; draw it and go.
@@ -632,7 +651,13 @@ pub fn render_item<V: Render + 'static>(
         hover: context.highlight.hover(ix),
         title_offset: context.highlight.marquee_offset(ix, Cell::Title),
         artist_offset: context.highlight.marquee_offset(ix, Cell::Artist),
-        bitrate: row_bitrate(playing, &track.bitrate, context.live_bitrate_label.as_ref()),
+        bitrate: row_bitrate(
+            playing,
+            &SharedString::from(
+                track.meta.nominal_bitrate.map(format_bitrate).unwrap_or_default(),
+            ),
+            context.live_bitrate_label.as_ref(),
+        ),
         translate,
         hidden,
         slim: context.slim,
@@ -641,57 +666,44 @@ pub fn render_item<V: Render + 'static>(
     // The five listeners a track row wires up — the same for a compact row
     // (`index` is its section's only track) and a multi-track one.
     let actions = actions.expect("a row is interactive");
-    let on_click = {
-        let actions = actions.clone();
-        cx.listener(move |view, event: &ClickEvent, window, cx| {
-            actions.activate(view, ix, playlist, index, event, window, cx)
-        })
-    };
-    let on_right_click = {
-        let actions = actions.clone();
-        cx.listener(move |view, event: &MouseDownEvent, window, cx| {
-            actions.context(view, ix, vec![song], playlist, playlist_context, event, window, cx)
-        })
-    };
-    let on_hover = {
-        let actions = actions.clone();
-        cx.listener(move |view, hovered: &bool, _window, cx| actions.hover(view, ix, *hovered, cx))
-    };
-    let on_title_hover = {
-        let actions = actions.clone();
-        cx.listener(move |view, hovered: &bool, _window, cx| {
-            actions.cell_hover(view, ix, Cell::Title, *hovered, cx)
-        })
-    };
-    let on_artist_hover = {
-        let actions = actions.clone();
-        cx.listener(move |view, hovered: &bool, _window, cx| {
-            actions.cell_hover(view, ix, Cell::Artist, *hovered, cx)
-        })
-    };
-    let on_press = {
-        let actions = actions.clone();
-        cx.listener(move |view, event: &MouseDownEvent, window, cx| {
-            actions.press(view, ix, event, window, cx)
-        })
+    let (a1, actions2) = (actions.clone(), actions.clone());
+    let (actions3, actions4) = (actions.clone(), actions.clone());
+    let (actions5, actions6) = (actions.clone(), actions.clone());
+    let handlers = RowHandlers {
+        on_click: Box::new(cx.listener(move |view, event: &ClickEvent, window, cx| {
+            a1.activate(view, ix, source, index, event, window, cx)
+        })),
+        on_right_click: Box::new(cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+            actions2.context(view, ix, vec![song], source, playlist_context, event, window, cx)
+        })),
+        on_hover: Box::new(cx.listener(move |view, hovered: &bool, _window, cx| {
+            actions3.hover(view, ix, *hovered, cx)
+        })),
+        on_title_hover: Box::new(cx.listener(move |view, hovered: &bool, _window, cx| {
+            actions4.cell_hover(view, ix, Cell::Title, *hovered, cx)
+        })),
+        on_artist_hover: Box::new(cx.listener(move |view, hovered: &bool, _window, cx| {
+            actions5.cell_hover(view, ix, Cell::Artist, *hovered, cx)
+        })),
+        on_press: Box::new(cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+            actions6.press(view, ix, event, window, cx)
+        })),
     };
 
+    let year_label = section.date.map(|date| date.year().to_string());
     if matches!(item, ListItem::Compact(_)) {
         // A compact row carries its section's cover on the left.
         request_cover(context.covers, context.library, section.cover_song, cx);
         let cover = context.covers.read(cx).cover_of(section.cover_song);
-        compact_row(
+        track_row(
             &paint,
+            ix,
             track,
-            &section.year,
+            index,
             columns,
             cover,
-            on_click,
-            on_right_click,
-            on_hover,
-            on_title_hover,
-            on_artist_hover,
-            on_press,
+            Some(year_label.unwrap_or_default()),
+            handlers,
         )
     } else {
         // A custom or smart playlist's row carries its own song's cover; a
@@ -700,19 +712,7 @@ pub fn render_item<V: Render + 'static>(
             request_cover(context.covers, context.library, Some(song), cx);
             context.covers.read(cx).cover_of(Some(song))
         }).flatten();
-        track_row(
-            &paint,
-            track,
-            index,
-            columns,
-            row_cover,
-            on_click,
-            on_right_click,
-            on_hover,
-            on_title_hover,
-            on_artist_hover,
-            on_press,
-        )
+        track_row(&paint, ix, track, index, columns, row_cover, None, handlers)
     }
 }
 
@@ -872,7 +872,9 @@ pub fn album_header(theme: Theme, section: &AlbumSection, cover: AnyElement) -> 
                                 .flex_none()
                                 .text_size(px(theme.cell_px() + 2.0))
                                 .text_color(theme.text)
-                                .child(section.year.clone()),
+                                .child(
+                                section.date.map(|date| date.year().to_string()).unwrap_or_default(),
+                            ),
                         ),
                 )
                 .child(
@@ -886,92 +888,30 @@ pub fn album_header(theme: Theme, section: &AlbumSection, cover: AnyElement) -> 
         .into_any_element()
 }
 
-/// A one-track section, compressed into a single row with its cover on the
-/// left instead of a header plus one line. The cover is sized to the number
-/// column, so the song name starts at the same x as a playlist row's.
-#[allow(clippy::too_many_arguments)]
-fn compact_row(
-    paint: &RowPaint,
-    track: &TrackRow,
-    year: &str,
-    columns: &Columns,
-    cover: Option<CoverImage>,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    on_right_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-    on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
-    on_title_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
-    on_artist_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
-    on_press: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-) -> AnyElement {
-    let theme = paint.theme;
-    let background = row_background(theme, paint.playing, paint.selection, paint.hover, 0);
-    // The song-entry convention: regular rows are square; the selected and
-    // currently-playing ones carry the slight rounding.
-    let rounded = paint.playing || paint.selection.is_some();
-    div()
-        .id(("album-single", track.song))
-        .w_full()
-        .flex()
-        .items_center()
-        .gap_3()
-        .px_4()
-        .py(px(6.0))
-        .cursor_pointer()
-        .bg(background)
-        .when(rounded, |d| d.rounded_md())
-        .when(paint.hidden, |d| d.opacity(0.0))
-        .when(paint.translate != 0.0, |d| d.relative().top(px(paint.translate)))
-        .on_hover(on_hover)
-        .on_click(on_click)
-        .on_mouse_down(MouseButton::Right, on_right_click)
-        .on_mouse_down(MouseButton::Left, on_press)
-        .child(thumbnail(theme, cover, theme.cover_col()))
-        .child(title_cell(
-            theme,
-            track,
-            paint.playing,
-            columns,
-            paint.title_offset,
-            background,
-            on_title_hover,
-        ))
-        .child(artist_cell(
-            theme,
-            track,
-            columns,
-            paint.artist_offset,
-            background,
-            on_artist_hover,
-        ))
-        // Fill the gap so the numeric columns stay right-aligned.
-        .child(div().flex_1().min_w_0())
-        .child(year_cell(theme, year))
-        .when(!paint.slim, |d| d.child(bitrate_cell(theme, paint.bitrate.clone())))
-        .when(!paint.slim, |d| d.child(duration_cell(theme, track.duration.clone())))
-        .into_any_element()
-}
-
-/// One track row: number (or the playing row's equalizer), then — when the
-/// section sets `cover` — the song's cover, then title, artist, bitrate,
-/// duration. The playing row is drawn in the accent colour.
-#[allow(clippy::too_many_arguments)]
+/// One track row. A compact row (a one-track section) is compressed with its
+/// section's cover on the left instead of a number column plus a header; a
+/// regular row shows the number (or the playing row's equalizer), an optional
+/// per-song cover, then title, artist, and the numeric columns. The playing row
+/// is drawn in the accent colour.
 fn track_row(
     paint: &RowPaint,
+    item_ix: usize,
     track: &TrackRow,
     index: usize,
     columns: &Columns,
     cover: Option<CoverImage>,
-    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
-    on_right_click: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
-    on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
-    on_title_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
-    on_artist_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
-    on_press: impl Fn(&MouseDownEvent, &mut Window, &mut App) + 'static,
+    compact_year: Option<String>,
+    handlers: RowHandlers,
 ) -> AnyElement {
-    let id: ElementId = ("album-track", track.song).into();
+    let compact = compact_year.is_some();
+    let id: ElementId = if compact {
+        ("album-single", item_ix).into()
+    } else {
+        ("album-track", item_ix).into()
+    };
     let theme = paint.theme;
     let playing = paint.playing;
-    let background = row_background(theme, playing, paint.selection, paint.hover, index);
+    let background = row_background(theme, playing, paint.selection, paint.hover, if compact { 0 } else { index });
     // The song-entry convention: regular rows are square; the selected and
     // currently-playing ones carry the slight rounding.
     let rounded = playing || paint.selection.is_some();
@@ -983,22 +923,25 @@ fn track_row(
         .items_center()
         .gap_3()
         .px_4()
-        .py_1()
+        .py(if compact { px(6.0) } else { px(4.0) })
         .cursor_pointer()
         .bg(background)
         .when(rounded, |d| d.rounded_md())
         .when(paint.hidden, |d| d.opacity(0.0))
         .when(paint.translate != 0.0, |d| d.relative().top(px(paint.translate)))
-        .on_hover(on_hover)
-        .on_click(on_click)
-        .on_mouse_down(MouseButton::Right, on_right_click)
-        .on_mouse_down(MouseButton::Left, on_press)
-        .child(if playing {
-            eq_icon(theme, paint.eq_phase, paint.audio_playing)
-        } else {
-            number_cell(theme, track.number)
+        .on_hover(handlers.on_hover)
+        .on_click(handlers.on_click)
+        .on_mouse_down(MouseButton::Right, handlers.on_right_click)
+        .on_mouse_down(MouseButton::Left, handlers.on_press)
+        .when(compact, |d| d.child(thumbnail(theme, cover.clone(), theme.cover_col())))
+        .when(!compact, |d| {
+            d.child(if playing {
+                eq_icon(theme, paint.eq_phase, paint.audio_playing)
+            } else {
+                number_cell(theme, track.number)
+            })
+            .children(cover.map(|cover| thumbnail(theme, Some(cover), theme.cover_col())))
         })
-        .children(cover.map(|cover| thumbnail(theme, Some(cover), theme.cover_col())))
         .child(title_cell(
             theme,
             track,
@@ -1006,7 +949,7 @@ fn track_row(
             columns,
             paint.title_offset,
             background,
-            on_title_hover,
+            handlers.on_title_hover,
         ))
         .child(artist_cell(
             theme,
@@ -1014,16 +957,27 @@ fn track_row(
             columns,
             paint.artist_offset,
             background,
-            on_artist_hover,
+            handlers.on_artist_hover,
         ))
         // Fill the gap so the numeric columns stay right-aligned.
         .child(div().flex_1().min_w_0())
-        // Always reserve the action column, so rows keep identical children and
-        // the numeric columns stay put. Slim rows (the queue) end at the gap —
-        // no numeric columns follow, so there's nothing to keep put.
-        .when(!paint.slim, |d| d.child(div().w(px(theme.action_col())).flex_none()))
-        .when(!paint.slim, |d| d.child(bitrate_cell(theme, paint.bitrate.clone())))
-        .when(!paint.slim, |d| d.child(duration_cell(theme, track.duration.clone())))
+        .when_some(compact_year, |d, year| {
+            d.child(right_cell(theme, theme.year_col(), year))
+        })
+        // Always reserve the action column on regular rows, so rows keep
+        // identical children and the numeric columns stay put. Slim rows (the
+        // queue) end at the gap — no numeric columns follow.
+        .when(!compact && !paint.slim, |d| d.child(div().w(px(theme.action_col())).flex_none()))
+        .when(!paint.slim, |d| {
+            d.child(right_cell(theme, theme.bitrate_col(), paint.bitrate.clone()))
+        })
+        .when(!paint.slim, |d| {
+            d.child(right_cell(
+                theme,
+                theme.length_col(),
+                format_duration(track.meta.duration),
+            ))
+        })
         .into_any_element()
 }
 
@@ -1038,13 +992,13 @@ fn title_cell(
     background: Rgba,
     on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    marquee::marquee_text(
+    let title = track.meta.display_title();
+    text_cell(
         theme,
-        ("row-title", track.song),
-        &track.title,
+        ("row-title", track.song.get()),
+        &title,
         columns.title,
         columns.title_chars,
-        theme.cell_px(),
         offset,
         if playing { theme.accent } else { theme.text },
         background,
@@ -1053,6 +1007,7 @@ fn title_cell(
 }
 
 /// The artist cell: a fixed column that fades and slides when it overflows.
+#[allow(clippy::too_many_arguments)]
 fn artist_cell(
     theme: Theme,
     track: &TrackRow,
@@ -1061,15 +1016,43 @@ fn artist_cell(
     background: Rgba,
     on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
-    marquee::marquee_text(
+    let artist = track.meta.artists.join(", ");
+    text_cell(
         theme,
-        ("row-artist", track.song),
-        &track.artist,
+        ("row-artist", track.song.get()),
+        &artist,
         columns.artist,
         columns.artist_chars,
-        theme.cell_px(),
         offset,
         theme.text_muted,
+        background,
+        on_hover,
+    )
+}
+
+/// A marquee text cell of fixed width, the shared body of the title and artist
+/// columns.
+#[allow(clippy::too_many_arguments)]
+fn text_cell(
+    theme: Theme,
+    id: impl Into<ElementId>,
+    text: &str,
+    width: f32,
+    chars: usize,
+    offset: f32,
+    color: Rgba,
+    background: Rgba,
+    on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    marquee::marquee_text(
+        theme,
+        id,
+        text,
+        width,
+        chars,
+        theme.cell_px(),
+        offset,
+        color,
         background,
         on_hover,
     )
@@ -1177,40 +1160,16 @@ fn row_background(
     background
 }
 
-/// The declared/current bitrate, right-aligned just left of the duration.
-/// Empty when nothing is known.
-fn bitrate_cell(theme: Theme, label: SharedString) -> AnyElement {
+/// A right-aligned numeric label cell of fixed width, the shared body of the
+/// bitrate, duration and year columns. Empty when nothing is known.
+fn right_cell(theme: Theme, width: f32, label: impl Into<SharedString>) -> AnyElement {
     div()
-        .w(px(theme.bitrate_col()))
+        .w(px(width))
         .flex_none()
         .text_right()
         .text_size(px(theme.small_px()))
         .text_color(theme.text_faint)
-        .child(label)
-        .into_any_element()
-}
-
-fn duration_cell(theme: Theme, label: SharedString) -> AnyElement {
-    div()
-        .w(px(theme.length_col()))
-        .flex_none()
-        .text_right()
-        .text_size(px(theme.small_px()))
-        .text_color(theme.text_faint)
-        .child(label)
-        .into_any_element()
-}
-
-/// The release year, right-aligned just left of the bitrate. Empty when the
-/// tags declare none.
-fn year_cell(theme: Theme, year: &str) -> AnyElement {
-    div()
-        .w(px(theme.year_col()))
-        .flex_none()
-        .text_right()
-        .text_size(px(theme.small_px()))
-        .text_color(theme.text_faint)
-        .child(year.to_string())
+        .child(label.into())
         .into_any_element()
 }
 
@@ -1230,40 +1189,33 @@ fn row_bitrate(playing: bool, nominal: &SharedString, live: Option<&SharedString
 /// element itself (gpui's `overflow_hidden` clips to a rectangular mask that
 /// knows nothing of corner radii, so a rounded wrapper shows no rounding).
 pub(crate) fn thumbnail(theme: Theme, cover: Option<CoverImage>, size: f32) -> AnyElement {
-    match cover {
-        Some(CoverImage::Ready(image)) => img(image)
-            .size(px(size))
-            .flex_none()
-            .object_fit(ObjectFit::Cover)
-            .into_any_element(),
-        _ => div()
-            .size(px(size))
-            .flex_none()
-            .bg(theme.row_odd)
-            .flex()
-            .items_center()
-            .justify_center()
-            .text_color(theme.text_faint)
-            .child("♪")
-            .into_any_element(),
-    }
+    thumbnail_sized(theme, cover, size, false)
 }
 
 /// The rounded variant: the radius has to sit on the image element itself —
 /// gpui's `overflow_hidden` clips to a rectangular mask that knows nothing of
 /// corner radii, so a rounded wrapper around a square image shows no rounding.
 fn thumbnail_rounded(theme: Theme, cover: Option<CoverImage>, size: f32) -> AnyElement {
+    thumbnail_sized(theme, cover, size, true)
+}
+
+fn thumbnail_sized(
+    theme: Theme,
+    cover: Option<CoverImage>,
+    size: f32,
+    rounded: bool,
+) -> AnyElement {
     match cover {
         Some(CoverImage::Ready(image)) => img(image)
             .size(px(size))
             .flex_none()
             .object_fit(ObjectFit::Cover)
-            .rounded_md()
+            .when(rounded, |d| d.rounded_md())
             .into_any_element(),
         _ => div()
             .size(px(size))
             .flex_none()
-            .rounded_md()
+            .when(rounded, |d| d.rounded_md())
             .bg(theme.row_odd)
             .flex()
             .items_center()
@@ -1393,29 +1345,32 @@ fn icon_card<V: Render + 'static>(
     cx: &mut Context<V>,
 ) -> AnyElement {
     let theme = context.theme;
-    let playlist = section.playlist;
+    let source = section.source;
     let songs: Vec<SongId> = section.tracks.iter().map(|track| track.song).collect();
 
     // The cover plays the album from its first track.
     let on_click = section.tracks.first().map(|_track| {
         let actions = actions.clone();
         cx.listener(move |view, event: &ClickEvent, window, cx| {
-            actions.activate(view, 0, playlist, 0, event, window, cx)
+            actions.activate(view, 0, source, 0, event, window, cx)
         })
     });
     // Right-click opens the song menu for the album's songs.
     let on_right_click = {
         let actions = actions.clone();
         let songs = songs.clone();
-        let playlist = section.playlist;
+        let source = section.source;
         let playlist_context = context.context;
         cx.listener(move |view, event: &MouseDownEvent, window, cx| {
-            actions.context(view, 0, songs.clone(), playlist, playlist_context, event, window, cx)
+            actions.context(view, 0, songs.clone(), source, playlist_context, event, window, cx)
         })
     };
 
     div()
-        .id(ElementId::NamedInteger("icon-cover".into(), section.playlist.0 as u64))
+        .id(ElementId::NamedInteger(
+            "icon-cover".into(),
+            section.tracks.first().map_or(0, |track| track.song.0),
+        ))
         .w(px(ICON_CARD_PX))
         .h(px(icon_card_height()))
         .flex_none()
@@ -1443,9 +1398,8 @@ fn icon_card<V: Render + 'static>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Lyrics, PlaylistId};
+    use crate::model::PlaylistId;
     use std::path::PathBuf;
-    use std::time::Duration;
 
     fn song(id: SongId, title: &str, artist: &str, album: &str) -> SongMetadata {
         SongMetadata {
@@ -1454,13 +1408,7 @@ mod tests {
             song_name: Some(title.to_string()),
             artists: vec![artist.to_string()],
             album_name: Some(album.to_string()),
-            album_artist: None,
-            track_position: None,
-            date: None,
-            nominal_bitrate: None,
-            lyrics: Lyrics::None,
-            duration: Duration::ZERO,
-            has_art: false,
+            ..Default::default()
         }
     }
 
@@ -1487,11 +1435,11 @@ mod tests {
     fn a_custom_playlist_borrows_its_first_songs_cover() {
         let mut library = Library::default();
         let id = library.create_custom("Faves");
-        library.insert_song(song(7, "Seven", "Grimes", "Visions"));
-        library.add_song(id, 7);
+        library.insert_song(song(SongId(7), "Seven", "Grimes", "Visions"));
+        library.add_song(id, SongId(7));
 
         let section = section_for_playlist(&library, id).unwrap();
-        assert_eq!(section.cover_song, Some(7), "cover comes from the first song");
+        assert_eq!(section.cover_song, Some(SongId(7)), "cover comes from the first song");
         assert_eq!(section.album, "Faves", "the playlist title, not the album tag");
         assert_eq!(section.tracks.len(), 1);
     }
@@ -1500,24 +1448,24 @@ mod tests {
     fn a_custom_playlist_with_mixed_artists_reads_various_artists() {
         let mut library = Library::default();
         let id = library.create_custom("Mix");
-        library.insert_song(song(1, "One", "Grimes", "Visions"));
-        library.insert_song(song(2, "Two", "Laffey", "Depths"));
-        library.add_song(id, 1);
-        library.add_song(id, 2);
+        library.insert_song(song(SongId(1), "One", "Grimes", "Visions"));
+        library.insert_song(song(SongId(2), "Two", "Laffey", "Depths"));
+        library.add_song(id, SongId(1));
+        library.add_song(id, SongId(2));
 
         let section = section_for_playlist(&library, id).unwrap();
         assert_eq!(section.artist, "Various Artists");
-        assert_eq!(section.year, "", "a custom playlist carries no release year");
+        assert_eq!(section.date, None, "a custom playlist carries no release date");
     }
 
     #[test]
     fn a_custom_playlist_of_one_artist_keeps_that_artist() {
         let mut library = Library::default();
         let id = library.create_custom("Grimes");
-        library.insert_song(song(1, "One", "Grimes", "Visions"));
-        library.insert_song(song(2, "Two", "Grimes", "Visions"));
-        library.add_song(id, 1);
-        library.add_song(id, 2);
+        library.insert_song(song(SongId(1), "One", "Grimes", "Visions"));
+        library.insert_song(song(SongId(2), "Two", "Grimes", "Visions"));
+        library.add_song(id, SongId(1));
+        library.add_song(id, SongId(2));
 
         let section = section_for_playlist(&library, id).unwrap();
         assert_eq!(section.artist, "Grimes");
@@ -1534,22 +1482,21 @@ mod tests {
 
     fn section_with_tracks(count: usize) -> AlbumSection {
         AlbumSection {
-            playlist: PlaylistId(0),
+            source: SectionSource::Playlist(PlaylistId(0)),
             artist: String::new(),
             album: String::new(),
             row_covers: false,
             meta: String::new(),
-            year: String::new(),
             date: None,
             cover_song: None,
             tracks: (0..count)
                 .map(|i| TrackRow {
-                    song: i as SongId,
+                    song: SongId(i as u64),
                     number: i + 1,
-                    title: String::new(),
-                    artist: String::new(),
-                    duration: SharedString::from(""),
-                    bitrate: SharedString::from(""),
+                    meta: Arc::new(SongMetadata {
+                        id: SongId(i as u64),
+                        ..Default::default()
+                    }),
                 })
                 .collect(),
         }
@@ -1559,7 +1506,7 @@ mod tests {
     fn flatten_preserves_album_structure() {
         let sections =
             vec![section_with_tracks(2), section_with_tracks(0), section_with_tracks(1)];
-        let items = flatten(&sections);
+        let items = flatten(&sections, RowLayout::Albums);
 
         // A 2-track album is a header plus two rows; an empty one is just a
         // header; a one-track album — a single — draws like any other album:
@@ -1577,7 +1524,7 @@ mod tests {
     fn flatten_search_collapses_singles() {
         let sections =
             vec![section_with_tracks(2), section_with_tracks(0), section_with_tracks(1)];
-        let items = flatten_search(&sections);
+        let items = flatten(&sections, RowLayout::CompactSingles);
 
         // Search keeps the compact single: the one-track section collapses
         // into a single row carrying its cover.
@@ -1593,7 +1540,7 @@ mod tests {
     #[test]
     fn step_selectable_walks_tracks_and_clamps() {
         let sections = vec![section_with_tracks(2)];
-        let items = flatten(&sections); // Header, Track 0, Track 1
+        let items = flatten(&sections, RowLayout::Albums); // Header, Track 0, Track 1
         assert_eq!(step_selectable(&items, None, true), Some(1));
         assert_eq!(step_selectable(&items, Some(1), true), Some(2));
         assert_eq!(step_selectable(&items, Some(2), true), Some(2), "clamped at the last");
@@ -1605,16 +1552,16 @@ mod tests {
     #[test]
     fn row_of_song_finds_the_playing_row() {
         let sections = vec![section_with_tracks(2), section_with_tracks(1)];
-        let items = flatten_search(&sections); // Header, T0, T1, Compact
-        assert_eq!(row_of_song(&items, &sections, 1), Some(2));
-        assert_eq!(row_of_song(&items, &sections, 0), Some(1), "first match wins");
-        assert_eq!(row_of_song(&items, &sections, 9), None);
+        let items = flatten(&sections, RowLayout::CompactSingles); // Header, T0, T1, Compact
+        assert_eq!(row_of_song(&items, &sections, SongId(1)), Some(2));
+        assert_eq!(row_of_song(&items, &sections, SongId(0)), Some(1), "first match wins");
+        assert_eq!(row_of_song(&items, &sections, SongId(9)), None);
     }
 
     #[test]
     fn selection_ranges_skip_headers() {
         let sections = vec![section_with_tracks(2), section_with_tracks(2)];
-        let items = flatten(&sections); // Header, T0, T1, Header, T0, T1
+        let items = flatten(&sections, RowLayout::Albums); // Header, T0, T1, Header, T0, T1
         let mut selection = RowSelection::default();
         selection.set_single(1);
         selection.extend_to(4, &items);
@@ -1637,16 +1584,16 @@ mod tests {
     #[test]
     fn songs_follow_pick_order_not_list_order() {
         let sections = vec![section_with_tracks(4)];
-        let items = flatten(&sections); // Header, T0, T1, T2, T3
+        let items = flatten(&sections, RowLayout::Albums); // Header, T0, T1, T2, T3
         let mut selection = RowSelection::default();
         selection.toggle(3); // song 2
         selection.toggle(1); // song 0
         selection.toggle(4); // song 3
-        assert_eq!(selection.songs(&items, &sections), vec![2, 0, 3]);
+        assert_eq!(selection.songs(&items, &sections), vec![SongId(2), SongId(0), SongId(3)]);
 
         // Deselecting a middle pick keeps the rest in pick order.
         selection.toggle(1);
-        assert_eq!(selection.songs(&items, &sections), vec![2, 3]);
+        assert_eq!(selection.songs(&items, &sections), vec![SongId(2), SongId(3)]);
     }
 
     #[test]
@@ -1709,10 +1656,10 @@ mod tests {
     #[test]
     fn a_shift_range_queues_in_list_order() {
         let sections = vec![section_with_tracks(4)];
-        let items = flatten(&sections); // Header, T0, T1, T2, T3
+        let items = flatten(&sections, RowLayout::Albums); // Header, T0, T1, T2, T3
         let mut selection = RowSelection::default();
         selection.set_single(4);
         selection.extend_to(1, &items);
-        assert_eq!(selection.songs(&items, &sections), vec![0, 1, 2, 3]);
+        assert_eq!(selection.songs(&items, &sections), vec![SongId(0), SongId(1), SongId(2), SongId(3)]);
     }
 }

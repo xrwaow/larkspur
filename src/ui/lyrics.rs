@@ -16,22 +16,26 @@
 //! clock and reads the playback position at full resolution rather than waiting
 //! for the playback tick.
 //!
-//! Lines wrap rather than being clipped: GPUI wraps on word boundaries and
-//! breaks a single over-long word per character, which is exactly the fallback
-//! we want. The anchor is kept at 50% by construction rather than by centering a
-//! fixed block, so a wrapped line no longer drags it off centre.
+//! Lines wrap on word boundaries rather than being clipped. The anchor is kept
+//! at 50% by construction rather than by centering a fixed block, so a wrapped
+//! line no longer drags it off centre.
 //!
 //! Lyrics arrive with the rest of a song's metadata, so this panel never loads
-//! anything itself.
+//! anything for the text itself. Its one load is the procedural texture that
+//! fills the panel when a track has no lyrics: the embedded cover is read on a
+//! background thread and the finished texture is cached for the current song
+//! and theme base.
 
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use gpui::{
-    div, prelude::*, px, relative, AnyElement, ClickEvent, Context, Entity, Render, Rgba,
-    Subscription, Window,
+    div, img, prelude::*, px, relative, AnyElement, ClickEvent, Context, Entity, ObjectFit, Render,
+    RenderImage, Rgba, Subscription, Window,
 };
 
-use crate::model::{LyricLine, Lyrics, SongId};
+use crate::model::{DynamicBase, LyricLine, Lyrics, SongId, TextureMode};
 use crate::ui::animation::{Animator, Tween};
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
@@ -61,6 +65,26 @@ const DIM_MAX: f32 = 0.80;
 /// A slide further than this many lines (a seek) snaps instead of scrolling.
 const SNAP_LINES: f32 = 5.0;
 
+/// How many square texture tiles to stack down the panel. The texture is
+/// generated at a fixed square size; tiling it keeps that scale instead of
+/// stretching one copy over the whole (usually tall, narrow) rail. The body
+/// clips any surplus, so this only needs to exceed the tallest panel divided by
+/// its width.
+const TEXTURE_TILES: usize = 32;
+
+/// How much of the texture shows through behind actual lyrics. Enough to read
+/// the procedural surface, faint enough that the text stays the focus.
+const TEXTURE_BEHIND_TEXT_OPACITY: f32 = 0.35;
+
+/// A rendered procedural texture for one cover on one theme base. Rendering
+/// happens off-thread; the panel draws the last completed one while the next
+/// is being prepared.
+struct CachedTexture {
+    song: SongId,
+    base: DynamicBase,
+    image: Arc<RenderImage>,
+}
+
 pub struct LyricsView {
     state: Entity<PlaybackState>,
     /// The shared config, read for the tab strip's height so this panel's
@@ -86,6 +110,16 @@ pub struct LyricsView {
     /// snapshot — only when the controller's generation moves.
     total_secs: u64,
     queue_generation: u64,
+    /// The procedural texture that fills the panel when a track has no lyrics.
+    texture: Option<CachedTexture>,
+    /// A (song, base) pair with a render in flight, so frames don't spawn
+    /// duplicates.
+    texture_attempt: Option<(SongId, DynamicBase)>,
+    /// A (song, base) pair that produced no texture — no embedded art, or art
+    /// too small to quilt. Cached so the panel doesn't retry every frame.
+    texture_failed: Option<(SongId, DynamicBase)>,
+    /// The frame clock, held so a new line's slide can wake it from sleep.
+    animator: Entity<Animator>,
     _observe: Subscription,
     _observe_animator: Subscription,
 }
@@ -109,8 +143,10 @@ impl LyricsView {
                 cx,
             )
         });
-        let observe = cx.observe(&state, |this, _state, cx| {
+        let wake_animator = animator.clone();
+        let observe = cx.observe(&state, move |this, _state, cx| {
             this.sync(cx);
+            wake_animator.read(cx).request();
             cx.notify();
         });
         let observe_animator = cx.observe(&animator, |this, animator, cx| {
@@ -118,6 +154,7 @@ impl LyricsView {
             let moved = this.offset.tick(dt);
             let changed = this.sync(cx);
             if moved || changed {
+                animator.read(cx).request();
                 cx.notify();
             }
         });
@@ -134,11 +171,64 @@ impl LyricsView {
             song: None,
             total_secs: 0,
             queue_generation: 0,
+            texture: None,
+            texture_attempt: None,
+            texture_failed: None,
+            animator,
             _observe: observe,
             _observe_animator: observe_animator,
         };
         this.sync(cx);
         this
+    }
+
+    /// Keep the procedural texture for this cover/base up to date.
+    ///
+    /// Rendering reads and decodes the embedded art, so it runs on the
+    /// background executor; the panel shows its ordinary empty hint until the
+    /// first result lands. A no-op once the texture is cached or known absent.
+    fn ensure_texture(
+        &mut self,
+        song: SongId,
+        path: PathBuf,
+        base: DynamicBase,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (song, base);
+        if self
+            .texture
+            .as_ref()
+            .is_some_and(|cached| cached.song == song && cached.base == base)
+            || self.texture_attempt == Some(key)
+            || self.texture_failed == Some(key)
+        {
+            return;
+        }
+        self.texture_attempt = Some(key);
+
+        cx.spawn(async move |this, cx| {
+            let rendered = cx
+                .background_executor()
+                .spawn(async move { crate::ui::texture::load_for_song(&path, base) })
+                .await;
+
+            this.update(cx, |this, cx| {
+                if this.texture_attempt != Some(key) {
+                    return; // A newer request superseded this one.
+                }
+                this.texture_attempt = None;
+                match rendered {
+                    Some(image) => {
+                        this.texture = Some(CachedTexture { song, base, image });
+                        this.texture_failed = None;
+                    }
+                    None => this.texture_failed = Some(key),
+                }
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
     }
 
     /// Re-read the position and line up the anchor, the highlight, and the
@@ -176,7 +266,7 @@ impl LyricsView {
             let (queue, _) = self.state.read(cx).queue();
             self.total_secs = queue
                 .iter()
-                .filter_map(|(id, _)| library.get(*id))
+                .filter_map(|entry| library.get(entry.song))
                 .map(|song| song.duration.as_secs())
                 .sum();
             changed = true;
@@ -199,6 +289,7 @@ impl LyricsView {
                     if delta.abs() <= line * SNAP_LINES {
                         self.offset.set(delta);
                         self.offset.to(0.0, TRANSITION_SECS);
+                        self.animator.read(cx).request();
                     } else {
                         self.offset.set(0.0);
                     }
@@ -236,122 +327,167 @@ impl Render for LyricsView {
         let metadata = self.state.read(cx).metadata(cx);
         let queue_open = self.state.read(cx).queue_open();
 
+        // The procedural cover-art texture fills the body, according to the
+        // Texture setting: off, only when there are no lyrics, or always. The
+        // queue takes precedence over all of it and still opens as before.
+        let no_lyrics = match metadata.as_ref().map(|m| &m.lyrics) {
+            Some(Lyrics::Plain(text)) => text.trim().is_empty(),
+            Some(Lyrics::Synced(lines)) => lines.is_empty(),
+            Some(Lyrics::None) | None => true,
+        };
+        let texture_mode = self.config.read(cx).lyrics_texture();
+        let texture_wanted = match texture_mode {
+            TextureMode::Off => false,
+            TextureMode::NoLyrics => no_lyrics,
+            TextureMode::Always => true,
+        };
+        let mut texture = None;
+        if texture_wanted && !queue_open {
+            if let Some(song) = metadata.as_ref() {
+                let base = self.config.read(cx).texture_base();
+                self.ensure_texture(song.id, song.path.clone(), base, cx);
+                texture = self
+                    .texture
+                    .as_ref()
+                    .filter(|cached| cached.song == song.id && cached.base == base)
+                    .map(|cached| cached.image.clone());
+            }
+        }
+
         // The header is just a label: "Lyrics" normally, and "Queue" plus the
         // total time and the CLEAR button while the queue is swapped in (the
         // transport's queue button toggles the same shared `queue_open` flag
         // that switches this panel).
 
         // The queue swaps in over the lyrics body. The edge fades belong to
-        // the scrolling lyrics only — the queue has its own viewport.
+        // the lyrics panel itself, so they apply to the texture body too —
+        // the queue has its own viewport.
         let body: AnyElement = if queue_open {
             self.queue.clone().into_any_element()
-        } else { match metadata.as_ref().map(|m| &m.lyrics) {
-            Some(Lyrics::Plain(text)) => div()
-                .id("lyrics-scroll")
-                .size_full()
-                .overflow_y_scroll()
-                .flex()
-                .flex_col()
-                .gap_1()
-                .px_3()
-                .pb_3()
-                .text_size(px(theme.cell_px()))
-                .text_color(theme.text_muted)
-                .children(text.lines().map(|line| {
-                    // `flex_none` stops a wrapped line from being shrunk below
-                    // its content height and drawing over the next one.
-                    div().w_full().flex_none().whitespace_normal().child(line.to_string())
-                }))
-                .into_any_element(),
-            Some(Lyrics::Synced(lines)) if !lines.is_empty() => {
-                // Dim relative to the line actually being sung, not the anchor:
-                // the anchor leads the slide, but the highlighted line is what
-                // the eye calls "current". `progress` carries that line toward
-                // the next one over the same window the highlight crossfades, so
-                // the whole stack breathes in and out rather than snapping dim
-                // levels on each stamp.
-                let current = current_line(lines, position);
-                let progress = transition_progress(lines, current, position, transition);
-                let line = |index: usize, cx: &Context<Self>| -> AnyElement {
-                    let timestamp = lines[index].timestamp;
-                    let resting = dim(
-                        theme.text_faint,
-                        theme.rail_bg,
-                        dim_amount(index, current, progress),
-                    );
-                    let color = blend(
-                        resting,
-                        theme.accent,
-                        highlight_amount(lines, index, position, transition),
-                    );
-                    synced_line(
-                        theme,
-                        index,
-                        &lines[index].text,
-                        color,
-                        cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-                            this.state.update(cx, |state, cx| {
-                                state.seek_to(timestamp);
-                                cx.notify();
-                            });
-                        }),
-                    )
-                };
-
-                let before: Vec<AnyElement> = (0..anchor).map(|index| line(index, cx)).collect();
-                let after: Vec<AnyElement> =
-                    (anchor + 1..lines.len()).map(|index| line(index, cx)).collect();
-
-                // The anchor line is pinned to the middle of the panel no matter
-                // how tall the lines around it are. Each half is exactly half
-                // the panel tall, so centering the stack (`justify_center`) puts
-                // the anchor line's *centre* at 50%: the lines before it hug its
-                // top edge from below, the lines after it flow on beneath. The
-                // halves aren't clipped themselves — the panel is — so the
-                // `offset` above can slide the whole stack without a line
-                // vanishing at the half boundary.
-                div()
+        } else {
+            let content: AnyElement = match metadata.as_ref().map(|m| &m.lyrics) {
+                Some(Lyrics::Plain(text)) if !text.trim().is_empty() => div()
+                    .id("lyrics-scroll")
                     .size_full()
-                    .overflow_hidden()
-                    .child(
+                    .overflow_y_scroll()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .px_3()
+                    .pb_3()
+                    .text_size(px(theme.cell_px()))
+                    .text_color(theme.text_muted)
+                    .children(text.lines().map(|line| {
+                        // `flex_none` stops a wrapped line from being shrunk below
+                        // its content height and drawing over the next one.
                         div()
-                            .relative()
-                            .top(px(offset))
-                            .size_full()
+                            .w_full()
+                            .flex_none()
+                            .whitespace_normal()
                             .flex()
-                            .flex_col()
+                            .items_center()
                             .justify_center()
-                            .gap_1()
-                            .px_3()
-                            .child(
-                                div()
-                                    .w_full()
-                                    .h(relative(0.5))
-                                    .flex_none()
-                                    .flex()
-                                    .flex_col()
-                                    .justify_end()
-                                    .gap_1()
-                                    .children(before),
-                            )
-                            .child(line(anchor, cx))
-                            .child(
-                                div()
-                                    .w_full()
-                                    .h(relative(0.5))
-                                    .flex_none()
-                                    .flex()
-                                    .flex_col()
-                                    .justify_start()
-                                    .gap_1()
-                                    .children(after),
-                            ),
-                    )
-                    .into_any_element()
+                            .child(centered_lyric_text(line))
+                    }))
+                    .into_any_element(),
+                Some(Lyrics::Synced(lines)) if !lines.is_empty() => {
+                    // Dim relative to the line actually being sung, not the anchor:
+                    // the anchor leads the slide, but the highlighted line is what
+                    // the eye calls "current". `progress` carries that line toward
+                    // the next one over the same window the highlight crossfades, so
+                    // the whole stack breathes in and out rather than snapping dim
+                    // levels on each stamp.
+                    let current = current_line(lines, position);
+                    let progress = transition_progress(lines, current, position, transition);
+                    let line = |index: usize, cx: &Context<Self>| -> AnyElement {
+                        let timestamp = lines[index].timestamp;
+                        let resting = dim(
+                            theme.text_faint,
+                            theme.rail_bg,
+                            dim_amount(index, current, progress),
+                        );
+                        let color = blend(
+                            resting,
+                            theme.accent,
+                            highlight_amount(lines, index, position, transition),
+                        );
+                        synced_line(
+                            theme,
+                            index,
+                            &lines[index].text,
+                            color,
+                            cx.listener(move |this, _event: &ClickEvent, _window, cx| {
+                                this.state.update(cx, |state, cx| {
+                                    state.seek_to(timestamp);
+                                    cx.notify();
+                                });
+                            }),
+                        )
+                    };
+
+                    let before: Vec<AnyElement> = (0..anchor).map(|index| line(index, cx)).collect();
+                    let after: Vec<AnyElement> =
+                        (anchor + 1..lines.len()).map(|index| line(index, cx)).collect();
+
+                    // The anchor line is pinned to the middle of the panel no matter
+                    // how tall the lines around it are. Each half is exactly half
+                    // the panel tall, so centering the stack (`justify_center`) puts
+                    // the anchor line's *centre* at 50%: the lines before it hug its
+                    // top edge from below, the lines after it flow on beneath. The
+                    // halves aren't clipped themselves — the panel is — so the
+                    // `offset` above can slide the whole stack without a line
+                    // vanishing at the half boundary.
+                    div()
+                        .size_full()
+                        .overflow_hidden()
+                        .child(
+                            div()
+                                .relative()
+                                .top(px(offset))
+                                .size_full()
+                                .flex()
+                                .flex_col()
+                                .justify_center()
+                                .gap_1()
+                                .px_3()
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .h(relative(0.5))
+                                        .flex_none()
+                                        .flex()
+                                        .flex_col()
+                                        .justify_end()
+                                        .gap_1()
+                                        .children(before),
+                                )
+                                .child(line(anchor, cx))
+                                .child(
+                                    div()
+                                        .w_full()
+                                        .h(relative(0.5))
+                                        .flex_none()
+                                        .flex()
+                                        .flex_col()
+                                        .justify_start()
+                                        .gap_1()
+                                        .children(after),
+                                ),
+                        )
+                        .into_any_element()
+                }
+                _ => empty_lyrics_hint(theme),
+            };
+
+            match texture {
+                // No lyrics: the texture is the body.
+                Some(image) if no_lyrics => tiled_texture(image),
+                // Lyrics: keep them in front, with the texture dimmed behind.
+                Some(image) => texture_behind_text(image, content),
+                // Still rendering, no art to quilt, or the setting is off.
+                None => content,
             }
-            _ => empty_lyrics_hint(theme),
-        }
-        .into_any_element() };
+        };
 
         div()
             .size_full()
@@ -432,6 +568,45 @@ impl Render for LyricsView {
                     }),
             )
     }
+}
+
+/// The panel's empty body: the procedural texture repeated downward at its
+/// natural square scale. Each tile is a full-width square, so adjacent copies
+/// meet seamlessly — the texture itself is tileable.
+fn tiled_texture(image: Arc<RenderImage>) -> AnyElement {
+    // Keep each copy at the rendered image's own pixel size rather than
+    // stretching one over the panel. The texture is square and tileable, so
+    // stacking them downward is seamless.
+    let tile_px = image.size(0).width.0 as f32;
+    let mut column = div().size_full().overflow_hidden().flex().flex_col();
+    for index in 0..TEXTURE_TILES {
+        column = column.child(
+            img(image.clone())
+                .id(("lyrics-texture", index))
+                .w_full()
+                .h(px(tile_px))
+                .flex_none()
+                .object_fit(ObjectFit::Fill),
+        );
+    }
+    column.into_any_element()
+}
+
+/// Lyrics over the texture: the tiled surface sits behind, softened so the
+/// text keeps its contrast, and the content is layered on top at full opacity.
+fn texture_behind_text(image: Arc<RenderImage>, content: AnyElement) -> AnyElement {
+    div()
+        .relative()
+        .size_full()
+        .child(
+            div()
+                .absolute()
+                .inset_0()
+                .opacity(TEXTURE_BEHIND_TEXT_OPACITY)
+                .child(tiled_texture(image)),
+        )
+        .child(div().relative().size_full().child(content))
+        .into_any_element()
 }
 
 /// The panel's empty-state hint, nudged down a touch so the top fade doesn't
@@ -558,14 +733,43 @@ fn synced_line(
         .px_2()
         .py_1()
         .cursor_pointer()
-        // Wrap on word boundaries, breaking a single over-long word per
-        // character — the fallback for a line with no spaces at all.
         .whitespace_normal()
         .text_size(px(theme.cell_px()))
         .text_color(color)
-        .hover(|d| d.bg(theme.row_hover).text_color(theme.text_muted))
+        .flex()
+        .items_center()
+        .justify_center()
         .on_click(on_click)
-        .child(text.to_string())
+        .child(centered_lyric_text(text))
+        .into_any_element()
+}
+
+/// A lyric line centred word by word.
+///
+/// GPUI's `text_align: center` does not move a single-line text node: the node
+/// is only as wide as its content, so centring it inside a full-width block is
+/// a no-op, while stretching the node to full width breaks wrapping. Laying the
+/// words out as shrink-to-fit flex items lets `flex_wrap` do both jobs — a
+/// short line is one centred row, and a long line breaks into centred rows.
+fn centered_lyric_text(text: &str) -> AnyElement {
+    let words: Vec<&str> = text.split_whitespace().collect();
+    let count = words.len();
+    div()
+        .w_full()
+        .flex()
+        .flex_wrap()
+        .items_center()
+        .justify_center()
+        .children(words.into_iter().enumerate().map(move |(index, word)| {
+            // A non-breaking space keeps the gap measurable as its own item;
+            // plain trailing spaces can be trimmed from the item's width.
+            let word = if index + 1 < count {
+                format!("{word}\u{00a0}")
+            } else {
+                word.to_string()
+            };
+            div().flex_none().child(word)
+        }))
         .into_any_element()
 }
 
@@ -706,15 +910,20 @@ mod tests {
         let half = transition / 2;
         let start = Duration::from_secs(10);
 
-        // Long before the next line there's no movement toward it.
-        assert_eq!(transition_progress(&lines, 1, start - half - Duration::from_millis(10), transition), 0.0);
+        // Line 0 is current until line 1's stamp at `start`.
+        assert_eq!(current_line(&lines, start - Duration::from_millis(1)), 0);
+        // Long before line 1 there's no movement toward it.
+        assert_eq!(
+            transition_progress(&lines, 0, start - half - Duration::from_millis(10), transition),
+            0.0
+        );
         // It starts exactly halfway into the slide...
-        assert_eq!(transition_progress(&lines, 1, start - half, transition), 0.0);
-        // ...is half done a quarter before the stamp...
-        let mid = transition_progress(&lines, 1, start - half / 2, transition);
+        assert_eq!(transition_progress(&lines, 0, start - half, transition), 0.0);
+        // ...is half done a quarter before its stamp...
+        let mid = transition_progress(&lines, 0, start - half / 2, transition);
         assert!((mid - 0.5).abs() < 0.02, "progress {mid}");
-        // ...and reaches the next line on its stamp.
-        assert_eq!(transition_progress(&lines, 1, start, transition), 1.0);
+        // ...and reaches line 1 exactly on its stamp.
+        assert_eq!(transition_progress(&lines, 0, start, transition), 1.0);
         // The last line has nowhere to move to.
         assert_eq!(transition_progress(&lines, 2, start + half, transition), 0.0);
     }

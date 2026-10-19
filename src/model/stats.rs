@@ -18,13 +18,12 @@ use std::time::SystemTime;
 use serde::{Deserialize, Serialize};
 
 use super::identity::SongId;
-use super::Library;
 
 /// One song's user-facing statistics.
 ///
 /// Every field defaults independently so a `stats.json` from an older shape
 /// (or a hand-edited one) still parses.
-#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SongStats {
     /// When the song entered the library. `None` for entries that predate the
     /// field (they can still be played).
@@ -48,7 +47,7 @@ impl Stats {
     /// The stats for `id`, or the default (never played) when
     /// the song has none. Never fails, so callers need no `Option` handling.
     pub fn get(&self, id: SongId) -> SongStats {
-        self.0.get(&id).cloned().unwrap_or_default()
+        self.0.get(&id).copied().unwrap_or_default()
     }
 
     /// Whether any song has stats yet — how "first run" is detected for the
@@ -77,12 +76,13 @@ impl Stats {
         }
     }
 
-    /// Drop every entry whose song is no longer in `library` — the stats
-    /// counterpart of [`Library::prune`]. Returns how many entries were
-    /// dropped.
-    pub fn prune(&mut self, library: &Library) -> usize {
+    /// Drop every entry whose song `keep` rejects — the stats counterpart of
+    /// [`Library::prune`](super::library::Library::prune). Takes a predicate so
+    /// this module need not depend on the library. Returns how many entries
+    /// were dropped.
+    pub fn prune(&mut self, mut keep: impl FnMut(SongId) -> bool) -> usize {
         let before = self.0.len();
-        self.0.retain(|id, _| library.get(*id).is_some());
+        self.0.retain(|id, _| keep(*id));
         before - self.0.len()
     }
 }
@@ -91,23 +91,15 @@ impl Stats {
 mod tests {
     use super::*;
     use crate::model::SongMetadata;
+    use crate::model::Library;
     use std::path::PathBuf;
-    use std::time::Duration;
 
     fn song(id: SongId, name: &str) -> SongMetadata {
         SongMetadata {
             id,
             path: PathBuf::from(format!("/music/{name}.flac")),
             song_name: Some(name.to_string()),
-            artists: Vec::new(),
-            album_name: None,
-            album_artist: None,
-            track_position: None,
-            date: None,
-            nominal_bitrate: None,
-            lyrics: crate::model::Lyrics::None,
-            duration: Duration::ZERO,
-            has_art: false,
+            ..Default::default()
         }
     }
 
@@ -118,50 +110,58 @@ mod tests {
     #[test]
     fn missing_entry_is_the_default() {
         let stats = Stats::default();
-        assert_eq!(stats.get(1), SongStats::default());
-        assert_eq!(stats.get(1).plays, 0);
-        assert_eq!(stats.get(1).last_played, None);
+        assert_eq!(stats.get(SongId(1)), SongStats::default());
+        assert_eq!(stats.get(SongId(1)).plays, 0);
+        assert_eq!(stats.get(SongId(1)).last_played, None);
     }
 
     #[test]
     fn record_play_counts_and_stamps() {
         let mut stats = Stats::default();
-        stats.record_play(1, epoch());
-        stats.record_play(1, epoch());
-        let entry = stats.get(1);
+        stats.record_play(SongId(1), epoch());
+        stats.record_play(SongId(1), epoch());
+        let entry = stats.get(SongId(1));
         assert_eq!(entry.plays, 2);
         assert_eq!(entry.last_played, Some(epoch()));
-        assert_eq!(stats.get(2), SongStats::default(), "other songs stay untouched");
+        assert_eq!(stats.get(SongId(2)), SongStats::default(), "other songs stay untouched");
     }
 
     #[test]
     fn ensure_added_stamps_once() {
         let mut stats = Stats::default();
-        stats.ensure_added(1, epoch());
-        stats.ensure_added(1, SystemTime::UNIX_EPOCH);
-        assert_eq!(stats.get(1).added, Some(epoch()), "the first stamp wins");
+        stats.ensure_added(SongId(1), epoch());
+        stats.ensure_added(SongId(1), SystemTime::UNIX_EPOCH);
+        assert_eq!(stats.get(SongId(1)).added, Some(epoch()), "the first stamp wins");
+    }
+
+    #[test]
+    fn old_numeric_stats_json_still_loads() {
+        // `#[serde(transparent)]` on SongId keeps the wire shape a numeric
+        // map key, so a pre-newtype stats.json parses unchanged.
+        let stats: Stats = serde_json::from_str(r#"{"7":{"plays":3}}"#).unwrap();
+        assert_eq!(stats.get(SongId(7)).plays, 3);
     }
 
     #[test]
     fn plays_survive_a_round_trip_of_the_serialized_shape() {
         let mut stats = Stats::default();
-        stats.record_play(1, epoch());
-        stats.ensure_added(1, epoch());
+        stats.record_play(SongId(1), epoch());
+        stats.ensure_added(SongId(1), epoch());
         let bytes = serde_json::to_vec(&stats).unwrap();
         let reloaded: Stats = serde_json::from_slice(&bytes).unwrap();
-        assert_eq!(reloaded.get(1).plays, 1);
-        assert_eq!(reloaded.get(1).last_played, Some(epoch()));
+        assert_eq!(reloaded.get(SongId(1)).plays, 1);
+        assert_eq!(reloaded.get(SongId(1)).last_played, Some(epoch()));
     }
 
     #[test]
     fn prune_drops_entries_whose_song_is_gone() {
         let mut lib = Library::default();
-        lib.insert_song(song(1, "One"));
+        lib.insert_song(song(SongId(1), "One"));
         let mut stats = Stats::default();
-        stats.record_play(1, epoch());
-        stats.record_play(2, epoch());
-        assert_eq!(stats.prune(&lib), 1);
-        assert!(stats.contains(1));
-        assert!(!stats.contains(2));
+        stats.record_play(SongId(1), epoch());
+        stats.record_play(SongId(2), epoch());
+        assert_eq!(stats.prune(|id| lib.get(id).is_some()), 1);
+        assert!(stats.contains(SongId(1)));
+        assert!(!stats.contains(SongId(2)));
     }
 }

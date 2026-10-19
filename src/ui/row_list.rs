@@ -19,9 +19,10 @@ use std::rc::Rc;
 
 use gpui::{px, Bounds, ListAlignment, ListState, Modifiers, Pixels, Window};
 
-use crate::model::{InputAction, PlaylistId, SongId};
+use crate::model::{InputAction, SongId};
 use crate::ui::albums::{
-    self, AlbumSection, Columns, ListItem, RowSelection, MAX_ARTIST_CHARS, MAX_TITLE_CHARS,
+    self, AlbumSection, Columns, ListItem, RowLayout, RowSelection, SectionSource,
+    MAX_ARTIST_CHARS, MAX_TITLE_CHARS,
 };
 use crate::ui::animation::Spring;
 use crate::ui::marquee::{self, Marquee};
@@ -97,8 +98,8 @@ impl Fades {
 
 /// What a [`RowList`] made of an [`InputAction`].
 pub enum RowAction {
-    /// The view should play this playlist from this track index.
-    Play(PlaylistId, usize),
+    /// The view should play this section's source from this track index.
+    Play(SectionSource, usize),
     /// The list handled it; the view should re-render.
     Handled,
     /// Not this list's action — the view (or a parent) may handle it.
@@ -223,12 +224,9 @@ pub struct RowList {
     dirty: bool,
     /// The font size the columns were measured at, so a font change re-measures.
     measured_at: f32,
-    /// Flat mode: sections flatten to track rows only, no album headers — the
-    /// queue panel's list, where every entry is a song.
-    flat: bool,
-    /// Collapse one-track sections into single compact rows — the search
-    /// panel's singles. Off by default: a single draws like any other album.
-    compact_singles: bool,
+    /// How sections flatten into rows — with album headers (default), flat
+    /// (the queue), or with one-track sections collapsed (search).
+    layout: RowLayout,
     /// The title/artist column character counts a flat list was asked to size
     /// to (its panel's width, not the tables' fixed 48).
     title_chars: usize,
@@ -263,8 +261,7 @@ impl RowList {
             scroll: SmoothScroll::default(),
             dirty: true,
             measured_at: 0.0,
-            flat: false,
-            compact_singles: false,
+            layout: RowLayout::default(),
             title_chars: MAX_TITLE_CHARS,
             artist_chars: MAX_ARTIST_CHARS,
             columns_stale: false,
@@ -281,17 +278,12 @@ impl RowList {
         self.dirty
     }
 
-    /// Flatten to track rows only — no album headers. The queue panel's list.
-    pub fn set_flat(&mut self) {
-        self.flat = true;
-        self.mark_dirty();
-    }
-
-    /// Collapse one-track sections into single compact rows — the search
-    /// panel's rendering of a single.
-    pub fn set_compact_singles(&mut self) {
-        self.compact_singles = true;
-        self.mark_dirty();
+    /// Set the flattening layout. Takes effect on the next [`sync`](Self::sync).
+    pub fn set_layout(&mut self, layout: RowLayout) {
+        if self.layout != layout {
+            self.layout = layout;
+            self.mark_dirty();
+        }
     }
 
     /// Size a flat list's columns to explicit character counts — its
@@ -345,13 +337,7 @@ impl RowList {
     }
 
     fn rebuild_rows(&mut self, theme: Theme, window: &Window) {
-        let items = if self.flat {
-            albums::flatten_tracks(&self.sections)
-        } else if self.compact_singles {
-            albums::flatten_search(&self.sections)
-        } else {
-            albums::flatten(&self.sections)
-        };
+        let items = albums::flatten(&self.sections, self.layout);
         if self.item_count != items.len() {
             self.list_state.reset(items.len());
             self.item_count = items.len();
@@ -361,7 +347,7 @@ impl RowList {
     }
 
     fn measure_columns(&mut self, theme: Theme, window: &Window) {
-        self.columns = if self.flat {
+        self.columns = if self.layout == RowLayout::Flat {
             Columns::sized(window, theme, self.title_chars, self.artist_chars)
         } else {
             Columns::measure(window, theme)
@@ -512,9 +498,13 @@ impl RowList {
         };
         let Some(track) = track else { return 0.0 };
         match cell {
-            Cell::Title => marquee::travel_for(&track.title, self.columns.title, self.title_chars),
+            Cell::Title => {
+                let title = track.meta.display_title();
+                marquee::travel_for(&title, self.columns.title, self.title_chars)
+            }
             Cell::Artist => {
-                marquee::travel_for(&track.artist, self.columns.artist, self.artist_chars)
+                let artist = track.meta.artists.join(", ");
+                marquee::travel_for(&artist, self.columns.artist, self.artist_chars)
             }
         }
     }
@@ -662,7 +652,7 @@ impl RowList {
     }
 
     /// The playlist and track index the cursor's row plays from.
-    fn activate_target(&self) -> Option<(PlaylistId, usize)> {
+    fn activate_target(&self) -> Option<(SectionSource, usize)> {
         let cursor = self.cursor?;
         albums::row_target(&self.items, &self.sections, cursor)
     }

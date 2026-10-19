@@ -5,13 +5,13 @@
 //! all the same question with different parameters, so they share this one
 //! entry point rather than each walking the library their own way.
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use super::identity::SongId;
 use super::library::Library;
 use super::playlist::{PlaylistId, PlaylistOrigin};
-use super::search::{AlbumGroup, Query};
+use super::search::{SongGroup, Query};
 use super::view::FolderMode;
 
 /// What a [`Selection`] draws its songs from.
@@ -54,7 +54,7 @@ pub struct Selection {
 impl Library {
     /// The songs `sel` picks out, grouped by album playlist. Groups with no
     /// matching songs are left out.
-    pub fn select(&self, sel: &Selection) -> Vec<AlbumGroup> {
+    pub fn select(&self, sel: &Selection) -> Vec<SongGroup> {
         let mut ids: Vec<PlaylistId> = match &sel.scope {
             Scope::Library => self
                 .playlists()
@@ -85,7 +85,7 @@ impl Library {
                     .copied()
                     .filter(|song| self.get(*song).is_some_and(|song| matcher.matches(song)))
                     .collect();
-                (!songs.is_empty()).then_some(AlbumGroup { playlist: id, songs })
+                (!songs.is_empty()).then_some(SongGroup { playlist: id, songs })
             })
             .collect()
     }
@@ -101,7 +101,7 @@ impl Library {
     /// a covered album is covered whole: no partial albums, and the groups a
     /// folder scope yields are the playlists as-is.
     pub fn albums_under(&self, dir: &Path, mode: FolderMode) -> Vec<PlaylistId> {
-        let mut by_dir: HashMap<&Path, Vec<(&str, PlaylistId)>> = HashMap::new();
+        let mut by_dir: BTreeMap<&Path, Vec<(&str, PlaylistId)>> = BTreeMap::new();
         for playlist in self.playlists() {
             if let Some(PlaylistOrigin::Album { name, dir: album_dir, .. }) = playlist.origin() {
                 let covered = match mode {
@@ -116,9 +116,8 @@ impl Library {
                 }
             }
         }
-        let mut dirs: Vec<_> = by_dir.into_iter().collect();
-        dirs.sort_unstable_by(|a, b| a.0.cmp(b.0));
-        dirs.into_iter()
+        by_dir
+            .into_iter()
             .flat_map(|(_, mut albums)| {
                 albums.sort_unstable();
                 albums.into_iter().map(|(_, id)| id)
@@ -137,7 +136,7 @@ impl Library {
 mod tests {
     use super::*;
     use crate::model::search::parse;
-    use crate::model::{Lyrics, ReleaseDate, SongMetadata};
+    use crate::model::{ReleaseDate, SongMetadata};
     use std::time::Duration;
 
     fn song(id: SongId, title: &str, artist: &str, album: &str, track: u16) -> SongMetadata {
@@ -149,32 +148,29 @@ mod tests {
             album_name: Some(album.into()),
             album_artist: Some(artist.into()),
             track_position: Some(track),
-            date: None,
-            nominal_bitrate: None,
-            lyrics: Lyrics::None,
             duration: Duration::from_secs(180),
-            has_art: false,
+            ..Default::default()
         }
     }
 
     /// Three albums by two artists, in a known order.
     fn library() -> Library {
         let mut library = Library::default();
-        let mut oblivion = song(1, "Oblivion", "Grimes", "Visions", 1);
+        let mut oblivion = song(SongId(1), "Oblivion", "Grimes", "Visions", 1);
         oblivion.date = Some(ReleaseDate::new(2012, None, None));
-        let mut genesis = song(2, "Genesis", "Grimes", "Visions", 2);
+        let mut genesis = song(SongId(2), "Genesis", "Grimes", "Visions", 2);
         genesis.date = Some(ReleaseDate::new(2012, None, None));
-        let mut kvm = song(3, "Kill V. Maim", "Grimes", "Art Angels", 1);
+        let mut kvm = song(SongId(3), "Kill V. Maim", "Grimes", "Art Angels", 1);
         kvm.date = Some(ReleaseDate::new(2015, None, None));
         library.insert_song(oblivion);
         library.insert_song(genesis);
         library.insert_song(kvm);
-        library.insert_song(song(4, "The Night We Met", "Lord Huron", "Vide Noir", 1));
+        library.insert_song(song(SongId(4), "The Night We Met", "Lord Huron", "Vide Noir", 1));
         library.rebuild_auto();
         library
     }
 
-    fn titles(library: &Library, groups: &[AlbumGroup]) -> Vec<String> {
+    fn titles(library: &Library, groups: &[SongGroup]) -> Vec<String> {
         groups.iter().map(|g| library.playlist(g.playlist).unwrap().title().to_string()).collect()
     }
 
@@ -210,11 +206,8 @@ mod tests {
             album_name: Some(album.into()),
             album_artist: Some(artist.into()),
             track_position: Some(track),
-            date: None,
-            nominal_bitrate: None,
-            lyrics: Lyrics::None,
             duration: Duration::from_secs(180),
-            has_art: false,
+            ..Default::default()
         }
     }
 
@@ -223,10 +216,10 @@ mod tests {
     /// them in `/music/B`.
     fn folder_library() -> Library {
         let mut library = Library::default();
-        library.insert_song(song_in(1, "/music/A", "One", "X", "Alpha", 1));
-        library.insert_song(song_in(2, "/music/A", "Two", "X", "Alpha", 2));
-        library.insert_song(song_in(3, "/music/A/live", "Live", "X", "Alpha Live", 1));
-        library.insert_song(song_in(4, "/music/B", "Beta Song", "Y", "Beta", 1));
+        library.insert_song(song_in(SongId(1), "/music/A", "One", "X", "Alpha", 1));
+        library.insert_song(song_in(SongId(2), "/music/A", "Two", "X", "Alpha", 2));
+        library.insert_song(song_in(SongId(3), "/music/A/live", "Live", "X", "Alpha Live", 1));
+        library.insert_song(song_in(SongId(4), "/music/B", "Beta Song", "Y", "Beta", 1));
         library.rebuild_auto();
         library
     }
@@ -239,7 +232,7 @@ mod tests {
             Order::TrackOrder,
         ));
         assert_eq!(titles(&library, &groups), vec!["Alpha", "Alpha Live", "Beta"]);
-        assert_eq!(groups[0].songs, vec![1, 2], "tracks in album order");
+        assert_eq!(groups[0].songs, vec![SongId(1), SongId(2)], "tracks in album order");
     }
 
     #[test]
@@ -260,8 +253,8 @@ mod tests {
     #[test]
     fn albums_in_one_directory_order_by_title() {
         let mut library = Library::default();
-        library.insert_song(song_in(1, "/music/A", "Zed", "X", "Zebra", 1));
-        library.insert_song(song_in(2, "/music/A", "Apple", "Y", "Apricot", 1));
+        library.insert_song(song_in(SongId(1), "/music/A", "Zed", "X", "Zebra", 1));
+        library.insert_song(song_in(SongId(2), "/music/A", "Apple", "Y", "Apricot", 1));
         library.rebuild_auto();
         let groups = library.select(&selection(
             Scope::Folder { dir: "/music/A".into(), mode: FolderMode::Full },
@@ -287,13 +280,13 @@ mod tests {
             order: Order::AlbumTitle,
         });
         assert_eq!(titles(&library, &groups), vec!["Visions"], "albums with no match drop out");
-        assert_eq!(groups[0].songs, vec![2]);
+        assert_eq!(groups[0].songs, vec![SongId(2)]);
     }
 
     #[test]
     fn select_songs_flattens_the_groups() {
         let library = library();
         let songs = library.select_songs(&selection(Scope::Library, Order::AlbumTitle));
-        assert_eq!(songs, vec![3, 4, 1, 2], "album title order, track order within");
+        assert_eq!(songs, vec![SongId(3), SongId(4), SongId(1), SongId(2)], "album title order, track order within");
     }
 }

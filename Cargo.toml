@@ -38,12 +38,19 @@ image = "0.25"
 # Stable, fast hashing for song identity (NOT SipHash — see note in datatypes.rs)
 twox-hash = "1.6"
 
+# Seeds the procedural lyrics-panel texture from the cover bytes
+sha2 = "0.10"
+
 # Playlist / library persistence (JSON cache of scan roots + metadata)
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
 # Error handling
 anyhow = "1"
+
+# Async channels for the idle-aware frame clock (park until a view asks for a
+# frame, instead of waking on a timer forever). Already in the tree via gpui.
+futures = "0.3"
 
 [profile.dev]
 opt-level = 1 # keep our own crate fast to compile

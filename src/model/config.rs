@@ -6,7 +6,7 @@
 //! and mutates plain data; the observable wrapper lives in
 //! [`ui::config_state`](crate::ui::config_state).
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -94,6 +94,24 @@ impl WaveformStyle {
     }
 }
 
+/// When the lyrics panel draws its procedural cover-art texture.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TextureMode {
+    /// Never draw it; no-lyrics tracks get the plain empty hint.
+    Off,
+    /// Draw it only when the track has no lyrics.
+    #[default]
+    NoLyrics,
+    /// Draw it behind lyrics too, dimmed so the text stays readable.
+    Always,
+}
+
+impl TextureMode {
+    /// Every selectable mode, in the order the settings panel lists them.
+    pub const ALL: [TextureMode; 3] =
+        [TextureMode::Off, TextureMode::NoLyrics, TextureMode::Always];
+}
+
 /// A container's built-in font size, in px, when config has no override.
 pub const DEFAULT_FONT_SIZE: f32 = 14.0;
 
@@ -172,40 +190,101 @@ fn default_visualizer() -> bool {
     true
 }
 
+/// One container's presentation overrides. Absent fields fall back to the
+/// container's built-in defaults.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct ContainerStyle {
+    pub font: Option<FontKind>,
+    pub size: Option<f32>,
+}
+
+impl ContainerStyle {
+    fn is_empty(self) -> bool {
+        self.font.is_none() && self.size.is_none()
+    }
+}
+
 /// Runtime configuration, loaded from and saved to disk.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize)]
 pub struct Config {
     /// Which palette to draw with.
     pub theme: ThemeKind,
     /// What the dynamic theme builds on — only read while `theme` is
     /// [`ThemeKind::Dynamic`].
-    #[serde(default)]
     pub dynamic_base: DynamicBase,
-    /// Per-container typeface overrides, keyed by
+    /// Per-container typeface and font-size overrides, keyed by
     /// [`Container::container_id`](crate::ui::container::Container::container_id).
-    /// A container absent here draws with [`FontKind::default`].
-    #[serde(default)]
-    pub fonts: HashMap<String, FontKind>,
-    /// Per-container font-size overrides, keyed by
-    /// [`Container::container_id`](crate::ui::container::Container::container_id).
-    /// A container absent here uses its own built-in default.
-    pub font_sizes: HashMap<String, f32>,
+    /// A container absent here draws with its own defaults.
+    pub styles: BTreeMap<String, ContainerStyle>,
     /// Directories synced into the library. This is the source of truth for
     /// scan roots — the command line only seeds it on a first run.
     pub roots: Vec<PathBuf>,
     /// How the transport bar draws the waveform.
-    #[serde(default)]
     pub waveform: WaveformStyle,
     /// Whether the spectrum-bar band above the lyrics is shown.
-    #[serde(default = "default_visualizer")]
     pub visualizer: bool,
+    /// When the lyrics panel draws its procedural cover-art texture.
+    pub lyrics_texture: TextureMode,
     /// Whether the left library rail is collapsed to its header button.
-    #[serde(default)]
     pub sidebar_minimized: bool,
     /// Where the window was when the app last ran, so it reopens the same
     /// size and position.
-    #[serde(default)]
     pub window: Option<WindowPlacement>,
+}
+
+/// The on-disk shape, accepting the legacy split `fonts` + `font_sizes` maps
+/// and folding them into [`Config::styles`].
+#[derive(Deserialize)]
+struct ConfigWire {
+    #[serde(default)]
+    theme: ThemeKind,
+    #[serde(default)]
+    dynamic_base: DynamicBase,
+    #[serde(default)]
+    styles: BTreeMap<String, ContainerStyle>,
+    #[serde(default)]
+    fonts: BTreeMap<String, FontKind>,
+    #[serde(default)]
+    font_sizes: BTreeMap<String, f32>,
+    #[serde(default)]
+    roots: Vec<PathBuf>,
+    #[serde(default)]
+    waveform: WaveformStyle,
+    #[serde(default = "default_visualizer")]
+    visualizer: bool,
+    #[serde(default)]
+    lyrics_texture: TextureMode,
+    #[serde(default)]
+    sidebar_minimized: bool,
+    #[serde(default)]
+    window: Option<WindowPlacement>,
+}
+
+impl<'de> Deserialize<'de> for Config {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let wire = ConfigWire::deserialize(deserializer)?;
+        let mut styles = wire.styles;
+        // A pre-D5 config kept fonts and sizes in two parallel maps; fold them
+        // in. New keys win if both shapes somehow coexist.
+        for (container, font) in wire.fonts {
+            styles.entry(container).or_default().font = Some(font);
+        }
+        for (container, size) in wire.font_sizes {
+            styles.entry(container).or_default().size = Some(size);
+        }
+        Ok(Self {
+            theme: wire.theme,
+            dynamic_base: wire.dynamic_base,
+            styles,
+            roots: wire.roots,
+            waveform: wire.waveform,
+            visualizer: wire.visualizer,
+            lyrics_texture: wire.lyrics_texture,
+            sidebar_minimized: wire.sidebar_minimized,
+            window: wire.window,
+        })
+    }
 }
 
 impl Default for Config {
@@ -213,11 +292,11 @@ impl Default for Config {
         Self {
             theme: ThemeKind::Dark,
             dynamic_base: DynamicBase::default(),
-            fonts: HashMap::new(),
-            font_sizes: HashMap::new(),
+            styles: BTreeMap::new(),
             roots: Vec::new(),
             waveform: WaveformStyle::default(),
             visualizer: default_visualizer(),
+            lyrics_texture: TextureMode::default(),
             sidebar_minimized: false,
             window: None,
         }
@@ -244,63 +323,60 @@ impl Config {
     /// Load the config at `path`, falling back to defaults when it's missing
     /// or unreadable. A broken config is not fatal — it just means defaults.
     pub fn load(path: &Path) -> Self {
-        std::fs::read(path)
-            .ok()
-            .and_then(|bytes| serde_json::from_slice(&bytes).ok())
-            .unwrap_or_default()
+        super::persist::read_json(path).unwrap_or_default()
     }
 
     /// Persist to `path`, writing via a temp file + rename so a crash mid-write
     /// can't leave a truncated config behind.
     pub fn save(&self, path: &Path) -> anyhow::Result<()> {
-        if let Some(parent) = path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let bytes = serde_json::to_vec_pretty(self)?;
-        let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, bytes)?;
-        std::fs::rename(&tmp, path)?;
-        Ok(())
+        super::persist::write_json_atomic(path, self, true)
     }
 
     /// The effective font size for `container`: its override when set, else
     /// the container's own `default`. Clamped to the settable range.
     pub fn font_size_for(&self, container: &str, default: f32) -> f32 {
-        self.font_sizes
+        self.styles
             .get(container)
-            .copied()
+            .and_then(|style| style.size)
             .unwrap_or(default)
             .clamp(MIN_FONT_SIZE, MAX_FONT_SIZE)
     }
 
+    /// The container's font-size override, if it has one (for change checks).
+    pub fn font_size_override(&self, container: &str) -> Option<f32> {
+        self.styles.get(container).and_then(|style| style.size)
+    }
+
     /// Set (or clear, with `None`) a container's font-size override.
     pub fn set_font_size(&mut self, container: &str, size: Option<f32>) {
-        match size {
-            Some(size) => {
-                self.font_sizes
-                    .insert(container.to_string(), size.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE));
-            }
-            None => {
-                self.font_sizes.remove(container);
-            }
-        }
+        self.update_style(container, |style| {
+            style.size = size.map(|s| s.clamp(MIN_FONT_SIZE, MAX_FONT_SIZE));
+        });
     }
 
     /// The effective typeface for `container`: its override when set, else
     /// `default`.
     pub fn font_for(&self, container: &str, default: FontKind) -> FontKind {
-        self.fonts.get(container).copied().unwrap_or(default)
+        self.styles.get(container).and_then(|style| style.font).unwrap_or(default)
+    }
+
+    /// The container's typeface override, if it has one (for change checks).
+    pub fn font_override(&self, container: &str) -> Option<FontKind> {
+        self.styles.get(container).and_then(|style| style.font)
     }
 
     /// Set (or clear, with `None`) a container's typeface override.
     pub fn set_font(&mut self, container: &str, font: Option<FontKind>) {
-        match font {
-            Some(font) => {
-                self.fonts.insert(container.to_string(), font);
-            }
-            None => {
-                self.fonts.remove(container);
-            }
+        self.update_style(container, |style| style.font = font);
+    }
+
+    /// Apply `change` to a container's style, dropping the entry when nothing
+    /// is overridden any more so the saved file stays minimal.
+    fn update_style(&mut self, container: &str, change: impl FnOnce(&mut ContainerStyle)) {
+        let style = self.styles.entry(container.to_string()).or_default();
+        change(style);
+        if style.is_empty() {
+            self.styles.remove(container);
         }
     }
 
@@ -377,6 +453,32 @@ mod tests {
         assert!(!config.add_root(PathBuf::from("/music/a")), "duplicate is ignored");
         assert!(config.remove_root(Path::new("/music/a")));
         assert!(!config.remove_root(Path::new("/music/a")), "already gone");
+    }
+
+    #[test]
+    fn legacy_split_font_maps_merge_into_styles() {
+        let json = r#"{"theme":"Dark","fonts":{"browse":"Inter"},"font_sizes":{"browse":18.0,"lyrics":16.0},"roots":[]}"#;
+        let config: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(config.font_for("browse", FontKind::Tx02), FontKind::Inter);
+        assert_eq!(config.font_size_for("browse", 14.0), 18.0);
+        assert_eq!(config.font_size_for("lyrics", 14.0), 16.0);
+        // Saving writes the new single-map shape, not the legacy fields.
+        let out = serde_json::to_value(&config).unwrap();
+        assert!(out.get("styles").is_some());
+        assert!(out.get("fonts").is_none());
+        assert!(out.get("font_sizes").is_none());
+    }
+
+    #[test]
+    fn clearing_both_overrides_drops_the_style_entry() {
+        let mut config = Config::default();
+        config.set_font("browse", Some(FontKind::Inter));
+        config.set_font_size("browse", Some(18.0));
+        assert_eq!(config.styles.len(), 1);
+        config.set_font("browse", None);
+        assert_eq!(config.styles.len(), 1, "size override remains");
+        config.set_font_size("browse", None);
+        assert!(config.styles.is_empty(), "empty overrides are dropped");
     }
 
     #[test]
@@ -460,6 +562,22 @@ mod tests {
         let json = r#"{"theme":"Dark","font_sizes":{},"roots":[]}"#;
         let config: Config = serde_json::from_str(json).unwrap();
         assert!(config.visualizer);
+    }
+
+    #[test]
+    fn lyrics_texture_defaults_to_no_lyrics_and_round_trips() {
+        assert_eq!(Config::default().lyrics_texture, TextureMode::NoLyrics);
+
+        let mut config = Config::default();
+        config.lyrics_texture = TextureMode::Always;
+        let bytes = serde_json::to_vec(&config).unwrap();
+        let back: Config = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.lyrics_texture, TextureMode::Always);
+
+        // An older config predates the field; it keeps the previous behavior.
+        let json = r#"{"theme":"Dark","font_sizes":{},"roots":[]}"#;
+        let old: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(old.lyrics_texture, TextureMode::NoLyrics);
     }
 
     #[test]

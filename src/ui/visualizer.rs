@@ -68,6 +68,8 @@ pub struct VisualizerView {
     /// The running reference peak the bars are scaled against.
     gain_peak: f32,
     _observe_animator: Subscription,
+    _observe_state: Subscription,
+    _observe_config: Subscription,
 }
 
 impl VisualizerView {
@@ -78,9 +80,28 @@ impl VisualizerView {
         cx: &mut Context<Self>,
     ) -> Self {
         let observe_animator = cx.observe(&animator, |this, animator, cx| {
-            if this.tick(animator.read(cx).dt(), cx) {
+            let moved = this.tick(animator.read(cx).dt(), cx);
+            // While audio is playing the bars must keep sampling even through
+            // a silent passage (where nothing "moved" this frame), so the
+            // clock stays awake for as long as the view is active.
+            let active = this.config.read(cx).visualizer()
+                && this.state.read(cx).is_playing();
+            if active {
+                animator.read(cx).request();
+            }
+            if moved {
                 cx.notify();
             }
+        });
+        // The clock sleeps between animations, so starting playback (or
+        // turning the visualizer on mid-track) has to wake it explicitly.
+        let wake_animator = animator.clone();
+        let observe_state = cx.observe(&state, move |_this, _state, cx| {
+            wake_animator.read(cx).request();
+        });
+        let wake_animator = animator.clone();
+        let observe_config = cx.observe(&config, move |_this, _config, cx| {
+            wake_animator.read(cx).request();
         });
         Self {
             state,
@@ -92,6 +113,8 @@ impl VisualizerView {
             samples: Vec::with_capacity(FFT_SIZE),
             gain_peak: GAIN_FLOOR,
             _observe_animator: observe_animator,
+            _observe_state: observe_state,
+            _observe_config: observe_config,
         }
     }
 
