@@ -380,7 +380,17 @@ impl LibraryState {
         playback: &Entity<PlaybackState>,
         cx: &mut Context<Self>,
     ) {
-        let entries = self.queue_entries(songs);
+        Self::start_queue(playback, self.queue_entries(songs), start, cx);
+    }
+
+    /// Hand `entries` to playback, starting at `start`, and notify only if the
+    /// queue actually changed. Empty input is a no-op.
+    fn start_queue(
+        playback: &Entity<PlaybackState>,
+        entries: Vec<QueueEntry>,
+        start: usize,
+        cx: &mut Context<Self>,
+    ) {
         if entries.is_empty() {
             return;
         }
@@ -400,15 +410,7 @@ impl LibraryState {
         playback: &Entity<PlaybackState>,
         cx: &mut Context<Self>,
     ) {
-        let entries = self.ensure_songs(&paths);
-        if entries.is_empty() {
-            return;
-        }
-        playback.update(cx, |playback, cx| {
-            if playback.play_paths(entries, start, cx) {
-                cx.notify();
-            }
-        });
+        Self::start_queue(playback, self.ensure_songs(&paths), start, cx);
     }
 
     /// Ensure every path is in the library (loading tags for any that aren't),

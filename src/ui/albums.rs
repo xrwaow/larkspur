@@ -942,20 +942,25 @@ fn track_row(
             })
             .children(cover.map(|cover| thumbnail(theme, Some(cover), theme.cover_col())))
         })
-        .child(title_cell(
+        .child(text_cell(
             theme,
-            track,
-            playing,
-            columns,
+            ("row-title", track.song.get()),
+            &track.meta.display_title(),
+            columns.title,
+            columns.title_chars,
             paint.title_offset,
+            if playing { theme.accent } else { theme.text },
             background,
             handlers.on_title_hover,
         ))
-        .child(artist_cell(
+        .child(text_cell(
             theme,
-            track,
-            columns,
+            ("row-artist", track.song.get()),
+            &track.meta.artists.join(", "),
+            columns.artist,
+            columns.artist_chars,
             paint.artist_offset,
+            theme.text_muted,
             background,
             handlers.on_artist_hover,
         ))
@@ -981,57 +986,7 @@ fn track_row(
         .into_any_element()
 }
 
-/// The title cell: a fixed column that fades and slides when it overflows.
-#[allow(clippy::too_many_arguments)]
-fn title_cell(
-    theme: Theme,
-    track: &TrackRow,
-    playing: bool,
-    columns: &Columns,
-    offset: f32,
-    background: Rgba,
-    on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
-) -> AnyElement {
-    let title = track.meta.display_title();
-    text_cell(
-        theme,
-        ("row-title", track.song.get()),
-        &title,
-        columns.title,
-        columns.title_chars,
-        offset,
-        if playing { theme.accent } else { theme.text },
-        background,
-        on_hover,
-    )
-}
-
-/// The artist cell: a fixed column that fades and slides when it overflows.
-#[allow(clippy::too_many_arguments)]
-fn artist_cell(
-    theme: Theme,
-    track: &TrackRow,
-    columns: &Columns,
-    offset: f32,
-    background: Rgba,
-    on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
-) -> AnyElement {
-    let artist = track.meta.artists.join(", ");
-    text_cell(
-        theme,
-        ("row-artist", track.song.get()),
-        &artist,
-        columns.artist,
-        columns.artist_chars,
-        offset,
-        theme.text_muted,
-        background,
-        on_hover,
-    )
-}
-
-/// A marquee text cell of fixed width, the shared body of the title and artist
-/// columns.
+/// A marquee text cell of fixed width.
 #[allow(clippy::too_many_arguments)]
 fn text_cell(
     theme: Theme,

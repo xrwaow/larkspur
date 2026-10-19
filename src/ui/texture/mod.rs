@@ -817,7 +817,6 @@ fn gaussian_blur_radius(radius: f32, passes: i32) -> f32 {
 fn blur_line(line_in: &[[u8; 3]], line_out: &mut [[u8; 3]], radius: i32, ww: u32, fw: u32) {
     let lastx = line_in.len() as i32 - 1;
     let edge_a = (radius + 1).min(lastx + 1);
-    let edge_b = (lastx - radius).max(0);
 
     let mut acc = [0u32; 3];
     for c in 0..3 {
@@ -847,57 +846,17 @@ fn blur_line(line_in: &[[u8; 3]], line_out: &mut [[u8; 3]], radius: i32, ww: u32
         }
     };
 
-    // Pillow's edge handling: move the accumulator, then save.
-    if edge_a <= edge_b {
-        for x in 0..edge_a {
-            let sub = line_in[0];
-            let add = line_in[(x + radius) as usize];
-            for c in 0..3 {
-                acc[c] = acc[c].wrapping_add(add[c] as u32).wrapping_sub(sub[c] as u32);
-            }
-            save(x, &mut acc, line_out);
+    // Pillow's edge handling: move the accumulator, then save. Over every x the
+    // removed sample is the one leaving the window (clamped to the first) and
+    // the added sample is the one entering it (clamped to the last), which is
+    // all six of the original edge/body/edge ranges collapsed into one.
+    for x in 0..=lastx {
+        let sub = line_in[(x - radius - 1).max(0) as usize];
+        let add = line_in[(x + radius).min(lastx) as usize];
+        for c in 0..3 {
+            acc[c] = acc[c].wrapping_add(add[c] as u32).wrapping_sub(sub[c] as u32);
         }
-        for x in edge_a..edge_b {
-            let sub = line_in[(x - radius - 1) as usize];
-            let add = line_in[(x + radius) as usize];
-            for c in 0..3 {
-                acc[c] = acc[c].wrapping_add(add[c] as u32).wrapping_sub(sub[c] as u32);
-            }
-            save(x, &mut acc, line_out);
-        }
-        for x in edge_b..=lastx {
-            let sub = line_in[(x - radius - 1) as usize];
-            let add = line_in[lastx as usize];
-            for c in 0..3 {
-                acc[c] = acc[c].wrapping_add(add[c] as u32).wrapping_sub(sub[c] as u32);
-            }
-            save(x, &mut acc, line_out);
-        }
-    } else {
-        for x in 0..edge_b {
-            let sub = line_in[0];
-            let add = line_in[(x + radius) as usize];
-            for c in 0..3 {
-                acc[c] = acc[c].wrapping_add(add[c] as u32).wrapping_sub(sub[c] as u32);
-            }
-            save(x, &mut acc, line_out);
-        }
-        for x in edge_b..edge_a {
-            let sub = line_in[0];
-            let add = line_in[lastx as usize];
-            for c in 0..3 {
-                acc[c] = acc[c].wrapping_add(add[c] as u32).wrapping_sub(sub[c] as u32);
-            }
-            save(x, &mut acc, line_out);
-        }
-        for x in edge_a..=lastx {
-            let sub = line_in[(x - radius - 1) as usize];
-            let add = line_in[lastx as usize];
-            for c in 0..3 {
-                acc[c] = acc[c].wrapping_add(add[c] as u32).wrapping_sub(sub[c] as u32);
-            }
-            save(x, &mut acc, line_out);
-        }
+        save(x, &mut acc, line_out);
     }
 }
 

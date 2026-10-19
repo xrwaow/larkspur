@@ -881,6 +881,31 @@ enum RailRow {
     NoMatches,
 }
 
+/// Shared chrome for the rail's small icon buttons: a padded, hover-highlighted
+/// box around a `size`-px glyph.
+fn rail_icon_button(
+    theme: Theme,
+    id: impl Into<ElementId>,
+    path: &'static str,
+    size: f32,
+    cx: &mut Context<PlaylistsView>,
+    on_click: impl Fn(&mut PlaylistsView, &ClickEvent, &mut Window, &mut Context<PlaylistsView>) + 'static,
+) -> AnyElement {
+    div()
+        .id(id)
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .p_1()
+        .rounded_md()
+        .cursor_pointer()
+        .hover(|d| d.bg(theme.row_hover))
+        .on_click(cx.listener(on_click))
+        .child(svg_icon(size, size, path, theme.text_muted))
+        .into_any_element()
+}
+
 /// The header button that collapses or expands the rail. It carries the
 /// expand-left glyph while the rail is open (pointing the way it will shrink)
 /// and expand-right while minimized.
@@ -894,25 +919,13 @@ fn rail_toggle_button(
     } else {
         "assets/expand-left.svg"
     };
-    div()
-        .id("toggle-sidebar")
-        .flex_none()
-        .flex()
-        .items_center()
-        .justify_center()
-        .p_1()
-        .rounded_md()
-        .cursor_pointer()
-        .hover(|d| d.bg(theme.row_hover))
-        .on_click(cx.listener(move |this, _event: &ClickEvent, _window, cx| {
-            let minimized = this.config.read(cx).sidebar_minimized();
-            this.config
-                .update(cx, |config, cx| config.set_sidebar_minimized(!minimized, cx));
-        }))
-        // The same 14 px box a group header's chevron uses, so the expand
-        // glyph sits in the same vertical column as the chevrons below.
-        .child(svg_icon(14.0, 14.0, icon_path, theme.text_muted))
-        .into_any_element()
+    // The 14 px box matches a group header's chevron, so the expand glyph sits
+    // in the same vertical column as the chevrons below.
+    rail_icon_button(theme, "toggle-sidebar", icon_path, 14.0, cx, |this, _event, _window, cx| {
+        let minimized = this.config.read(cx).sidebar_minimized();
+        this.config
+            .update(cx, |config, cx| config.set_sidebar_minimized(!minimized, cx));
+    })
 }
 
 /// The rail's header band, sized to the tab strip beside it so the title and
@@ -979,17 +992,13 @@ fn collapsed_group_icons(theme: Theme, cx: &mut Context<PlaylistsView>) -> AnyEl
         .border_color(theme.border)
         .children([Group::Albums, Group::Artists, Group::Folders].map(|group| {
             let path = group.icon_path().expect("library group without an icon");
-            div()
-                .id(("collapsed-group", group as u64))
-                .flex_none()
-                .flex()
-                .items_center()
-                .justify_center()
-                .p_1()
-                .rounded_md()
-                .cursor_pointer()
-                .hover(|d| d.bg(theme.row_hover))
-                .on_click(cx.listener(move |this, _event, _window, cx| {
+            rail_icon_button(
+                theme,
+                ("collapsed-group", group as u64),
+                path,
+                20.0,
+                cx,
+                move |this, _event, _window, cx| {
                     // Expanding the rail alone would land on whatever folds
                     // happened to be open, so open the group the icon names.
                     match group {
@@ -1003,8 +1012,8 @@ fn collapsed_group_icons(theme: Theme, cx: &mut Context<PlaylistsView>) -> AnyEl
                         config.set_sidebar_minimized(false, cx);
                     });
                     cx.notify();
-                }))
-                .child(svg_icon(20.0, 20.0, path, theme.text_muted))
+                },
+            )
         }))
         .into_any_element()
 }

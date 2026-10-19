@@ -91,12 +91,7 @@ impl BrowseView {
 
     /// Scope the library to `artist`'s discography (or clear the scope).
     pub fn set_artist_filter(&mut self, artist: Option<String>, cx: &mut Context<Self>) {
-        let scope = artist.map_or(Scope::Library, Scope::Artist);
-        if self.scope != scope {
-            self.scope = scope;
-            self.list.rows_mut().mark_dirty();
-            cx.notify();
-        }
+        self.set_scope(artist.map_or(Scope::Library, Scope::Artist), cx);
     }
 
     /// Scope the view to a folder — the albums and singles under it, flattened
@@ -104,7 +99,11 @@ impl BrowseView {
     /// against the library, so a rescan updates the tab instead of stranding
     /// it; re-playing the same folder in the other mode re-scopes it.
     pub fn set_folder_scope(&mut self, dir: PathBuf, mode: FolderMode, cx: &mut Context<Self>) {
-        let scope = Scope::Folder { dir, mode };
+        self.set_scope(Scope::Folder { dir, mode }, cx);
+    }
+
+    /// Swap the scope, rebuilding the rows only when it actually changed.
+    fn set_scope(&mut self, scope: Scope, cx: &mut Context<Self>) {
         if self.scope != scope {
             self.scope = scope;
             self.list.rows_mut().mark_dirty();
@@ -233,8 +232,7 @@ impl Render for BrowseView {
                 // the whole library; an artist tab, their discography; a
                 // folder view, the folder's albums and singles as they stand
                 // right now.
-                matches!(self.scope, Scope::Library | Scope::Artist(_) | Scope::Folder { .. })
-                    .then(|| {
+                Some({
                     // Fixed-width: the albums·songs readout changes with the
                     // filter, and a flexed box would resize on every keystroke.
                     div()
@@ -257,8 +255,7 @@ impl Render for BrowseView {
                         ))
                         .into_any_element()
                 }),
-                matches!(self.scope, Scope::Library | Scope::Artist(_) | Scope::Folder { .. })
-                    .then(|| {
+                Some({
                     div()
                         .id("shuffle")
                         .flex_none()

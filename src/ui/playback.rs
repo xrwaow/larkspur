@@ -10,7 +10,7 @@ use gpui::{
 use crate::audio::RepeatMode;
 use crate::model::config::WaveformStyle;
 use crate::model::InputAction;
-use crate::ui::animation::Animator;
+use crate::ui::animation::{ease_out_cubic, Animator};
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::format::format_duration;
@@ -160,12 +160,6 @@ impl PlaybackView {
             cx.notify();
         });
     }
-}
-
-/// Fast at the start, easing to a stop — the standard "settle" curve.
-fn ease_out_cubic(t: f32) -> f32 {
-    let inv = 1.0 - t;
-    1.0 - inv * inv * inv
 }
 
 impl Container for PlaybackView {

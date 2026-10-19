@@ -182,6 +182,24 @@ impl SettingsView {
         }
     }
 
+    /// One setting row wrapping `segment`'s segmented bar. The label column and
+    /// the per-group focus handle live here, so the five callers stay one line.
+    fn segment_row(
+        &self,
+        theme: Theme,
+        segment: Segmented,
+        label: &str,
+        active: usize,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let focus = self.segment_focus[&segment].clone();
+        setting_row(
+            theme,
+            label,
+            segmented_control(theme, segment, active, self.hovered_segment, &focus, cx),
+        )
+    }
+
     /// Add whatever path is typed in the box, then clear it.
     fn add_path(&mut self, cx: &mut Context<Self>) {
         let path = self.path.value.trim();
@@ -240,22 +258,12 @@ impl Render for SettingsView {
         let theme = self.themed.theme();
         let config = self.config.read(cx);
         let theme_kind = config.theme_kind();
-        let waveform = config.waveform();
-        let dynamic_base = config.dynamic_base();
         let visualizer_on = config.visualizer();
-        let lyrics_texture = config.lyrics_texture();
-        let theme_active = ThemeKind::ALL.iter().position(|kind| *kind == theme_kind).unwrap_or(0);
-        let base_active = DynamicBase::ALL
-            .iter()
-            .position(|base| *base == dynamic_base)
-            .unwrap_or(0);
-        let waveform_active =
-            WaveformStyle::ALL.iter().position(|style| *style == waveform).unwrap_or(0);
+        let theme_active = self.segment_active(Segmented::Theme, cx);
+        let base_active = self.segment_active(Segmented::DynamicBase, cx);
+        let waveform_active = self.segment_active(Segmented::Waveform, cx);
         let visualizer_active = usize::from(!visualizer_on);
-        let texture_active = TextureMode::ALL
-            .iter()
-            .position(|mode| *mode == lyrics_texture)
-            .unwrap_or(0);
+        let texture_active = self.segment_active(Segmented::Texture, cx);
         let roots: Vec<PathBuf> = config.roots().to_vec();
         let rows: Vec<ContainerRow> = containers()
             .into_iter()
@@ -271,81 +279,33 @@ impl Render for SettingsView {
         let mut items: Vec<AnyElement> = Vec::new();
 
         // --- theme ---
-        let theme_focus = self.segment_focus[&Segmented::Theme].clone();
-        items.push(setting_row(
-            theme,
-            "Theme",
-            segmented_control(
-                theme,
-                Segmented::Theme,
-                theme_active,
-                self.hovered_segment,
-                &theme_focus,
-                cx,
-            ),
-        ));
+        items.push(self.segment_row(theme, Segmented::Theme, "Theme", theme_active, cx));
 
         // --- dynamic base (only while Dynamic is selected) ---
         if theme_kind == ThemeKind::Dynamic {
-            let base_focus = self.segment_focus[&Segmented::DynamicBase].clone();
-            items.push(setting_row(
+            items.push(self.segment_row(
                 theme,
+                Segmented::DynamicBase,
                 "Cover base",
-                segmented_control(
-                    theme,
-                    Segmented::DynamicBase,
-                    base_active,
-                    self.hovered_segment,
-                    &base_focus,
-                    cx,
-                ),
+                base_active,
+                cx,
             ));
         }
 
         // --- waveform style ---
-        let waveform_focus = self.segment_focus[&Segmented::Waveform].clone();
-        items.push(setting_row(
-            theme,
-            "Waveform",
-            segmented_control(
-                theme,
-                Segmented::Waveform,
-                waveform_active,
-                self.hovered_segment,
-                &waveform_focus,
-                cx,
-            ),
-        ));
+        items.push(self.segment_row(theme, Segmented::Waveform, "Waveform", waveform_active, cx));
 
         // --- visualizer band ---
-        let visualizer_focus = self.segment_focus[&Segmented::Visualizer].clone();
-        items.push(setting_row(
+        items.push(self.segment_row(
             theme,
+            Segmented::Visualizer,
             "Visualizer",
-            segmented_control(
-                theme,
-                Segmented::Visualizer,
-                visualizer_active,
-                self.hovered_segment,
-                &visualizer_focus,
-                cx,
-            ),
+            visualizer_active,
+            cx,
         ));
 
         // --- procedural lyrics texture ---
-        let texture_focus = self.segment_focus[&Segmented::Texture].clone();
-        items.push(setting_row(
-            theme,
-            "Texture",
-            segmented_control(
-                theme,
-                Segmented::Texture,
-                texture_active,
-                self.hovered_segment,
-                &texture_focus,
-                cx,
-            ),
-        ));
+        items.push(self.segment_row(theme, Segmented::Texture, "Texture", texture_active, cx));
 
         // --- typeface + font size, per container, as a table ---
         items.push(section_header(theme, "Font"));
@@ -744,7 +704,6 @@ fn font_table_row(
                         theme,
                         ("font-reset", index),
                         "assets/undo.svg",
-                        "Reset typeface and size",
                         cx.listener(move |this, _event: &ClickEvent, _window, cx| {
                             this.config.update(cx, |config, cx| {
                                 config.reset_font_size(id, cx);
@@ -851,7 +810,6 @@ fn icon_button(
     theme: Theme,
     id: impl Into<gpui::ElementId>,
     path: &'static str,
-    _label: &str,
     on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     div()

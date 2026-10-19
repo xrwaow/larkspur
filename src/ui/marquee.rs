@@ -321,6 +321,15 @@ pub fn marquee_text(
 mod tests {
     use super::*;
 
+    /// Run `slide` to rest (or up to a generous frame cap).
+    fn settle(slide: &mut Slide) {
+        for _ in 0..600 {
+            if !slide.tick(1.0 / 60.0) {
+                break;
+            }
+        }
+    }
+
     #[test]
     fn a_short_text_has_no_travel() {
         // 10 chars in a 20-char column: nothing to slide.
@@ -354,11 +363,7 @@ mod tests {
         // No overshoot at the end: it lands on the target and stays.
         let mut slide = Slide::new();
         slide.aim(-100.0);
-        for _ in 0..600 {
-            if !slide.tick(1.0 / 60.0) {
-                break;
-            }
-        }
+        settle(&mut slide);
         assert_eq!(slide.offset(), -100.0);
         assert!(!slide.is_animating());
     }
@@ -368,11 +373,7 @@ mod tests {
         // The snap back overshoots zero (pushing the text right) before settling.
         let mut slide = Slide::new();
         slide.aim(-100.0);
-        for _ in 0..600 {
-            if !slide.tick(1.0 / 60.0) {
-                break;
-            }
-        }
+        settle(&mut slide);
         slide.aim(0.0);
         let mut peak: f32 = 0.0;
         for _ in 0..600 {

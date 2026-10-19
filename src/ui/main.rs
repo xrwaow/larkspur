@@ -284,21 +284,20 @@ fn main() {
     });
 }
 
-/// Where the library cache and cover thumbnails live, following the XDG cache
-/// convention.
-fn cache_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CACHE_HOME")
+/// A per-user data directory for `larkspur`, following the XDG convention: the
+/// `var` directory if set, else `$HOME/fallback`, else the current directory.
+fn xdg_dir(var: &str, fallback: &str) -> PathBuf {
+    std::env::var_os(var)
         .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".cache")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("larkspur")
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(fallback)))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("larkspur")
 }
 
-/// Where the config lives, following the XDG config convention.
+fn cache_dir() -> PathBuf {
+    xdg_dir("XDG_CACHE_HOME", ".cache")
+}
+
 fn config_dir() -> PathBuf {
-    let base = std::env::var_os("XDG_CONFIG_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join("larkspur")
+    xdg_dir("XDG_CONFIG_HOME", ".config")
 }

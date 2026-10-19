@@ -238,7 +238,7 @@ impl Tween {
 }
 
 /// Fast at the start, easing to a stop — the standard "settle" curve.
-fn ease_out_cubic(t: f32) -> f32 {
+pub(crate) fn ease_out_cubic(t: f32) -> f32 {
     let inv = 1.0 - t;
     1.0 - inv * inv * inv
 }
