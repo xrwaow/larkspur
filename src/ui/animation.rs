@@ -1,25 +1,28 @@
 //! The shared frame clock, and the tween helper views animate with.
 //!
 //! One `Entity<Animator>` exists per window. Views that need per-frame motion
-//! (a highlight fading in, lyrics scrolling) hold a clone and **observe** it;
-//! on each frame the observer ticks its own [`Tween`]s, re-renders only while
-//! something is actually moving, and calls [`WakeHandle::request`] to keep the
-//! clock running for another frame. When nothing asks for a frame the clock
-//! parks on a channel instead of waking on a timer, so an idle UI draws (and
-//! burns) exactly nothing.
+//! (a highlight fading in, lyrics scrolling) plug into it with [`animate`]: it
+//! installs the observer, steps the view, re-renders only while something is
+//! actually moving, and asks for another frame while the animation is live.
+//! When nothing asks for a frame the clock parks on a channel instead of waking
+//! on a timer, so an idle UI draws (and burns) exactly nothing.
 //!
-//! Anything that *starts* an animation must call [`WakeHandle::request`] too —
-//! otherwise the clock stays parked and the first tick never arrives. Views
-//! keep a [`WakeHandle`] (it needs no `Context`) and call it from the listener
-//! or render path where the motion begins.
+//! Anything that *starts* an animation must ask for a frame too — otherwise
+//! the clock stays parked and the first tick never arrives. Views keep a
+//! [`WakeHandle`] (it needs no `Context`) and call it from the listener or
+//! render path where the motion begins.
 //!
-//! Coarse values that don't need per-frame updates — the transport's time
-//! readout, the waveform progress, the live bitrate — are deliberately *not*
-//! driven by this clock. They update on the slow tick instead (see
-//! `PlaybackState`), which is what keeps a playing track from re-rendering the
-//! whole UI every frame.
+//! There are exactly three cadences, and nothing in between:
 //!
-//! The two rates are plain constants so they're easy to tune.
+//! - [`SLOW_FPS`] (1) — coarse readouts: the transport's time labels, the
+//!   waveform progress, the live bitrate. Deliberately *not* driven by this
+//!   clock; they update on the playback tick instead (see `PlaybackState`),
+//!   which keeps a playing track from re-rendering the UI every frame.
+//! - [`SMOOTH_FPS`] (144) — continuous animation. A view uses [`animate`], which
+//!   installs the observer, steps it, re-renders only while it moved, and keeps
+//!   asking for frames only while it's still animating.
+//! - Per-request — a view that needs a single frame (a texture landed, a size
+//!   changed) calls [`WakeHandle::request`] and stops. Nothing keeps ticking.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -27,16 +30,64 @@ use std::time::{Duration, Instant};
 
 use futures::channel::mpsc;
 use futures::StreamExt;
-use gpui::Context;
+use gpui::{Context, Entity, Subscription};
 
 /// Frames per second for coarse, non-animated readouts: the transport's time
 /// labels, the waveform progress, the live bitrate. Low on purpose — these
 /// change slowly and re-rendering the UI for them is wasteful.
 pub const SLOW_FPS: f32 = 1.0;
 
-/// Frames per second for animations: selection fades, lyric scrolling. Raise
-/// toward 144 on a high-refresh display.
+/// Frames per second for animation: selection fades, bar motion, lyric
+/// scrolling. Raise toward 144 on a high-refresh display.
 pub const SMOOTH_FPS: f32 = 144.0;
+
+/// What one animation step needs from the clock.
+///
+/// `redraw` separates "the view changed" from `awake`: a playing visualizer
+/// has to keep sampling even through a silent passage where no bar moved, but
+/// it doesn't need to re-render until one does.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Advance {
+    /// The view's visible state changed, so it has to re-render.
+    pub redraw: bool,
+    /// The animation isn't finished: ask for another frame even without a
+    /// redraw (otherwise a silent sampler would stall itself).
+    pub awake: bool,
+}
+
+impl Advance {
+    /// Nothing moved, nothing pending.
+    pub const IDLE: Self = Self { redraw: false, awake: false };
+    /// Pixels changed, so draw and keep going.
+    pub const MOVED: Self = Self { redraw: true, awake: true };
+    /// No pixels changed, but the animation still needs frames (sampling).
+    pub const BUSY: Self = Self { redraw: false, awake: true };
+}
+
+/// Drive a view's continuous animation from the shared clock (144 Hz).
+///
+/// The observer boilerplate every animated view used to repeat — read `dt`,
+/// tick, ask for another frame, re-render — lives here once. `step` advances
+/// the view and reports what it needs; the helper takes care of the rest, and
+/// when every stepper settles it simply stops asking, so the clock parks
+/// itself. A view that only ever needs one frame should not subscribe this
+/// way: use [`WakeHandle::request`] instead.
+pub fn animate<V: 'static>(
+    animator: &Entity<Animator>,
+    cx: &mut Context<V>,
+    mut step: impl FnMut(&mut V, f32, &mut Context<V>) -> Advance + 'static,
+) -> Subscription {
+    cx.observe(animator, move |this, animator, cx| {
+        let dt = animator.read(cx).dt();
+        let advance = step(this, dt, cx);
+        if advance.awake {
+            animator.read(cx).request();
+        }
+        if advance.redraw {
+            cx.notify();
+        }
+    })
+}
 
 /// A cheap, clonable way to ask the frame clock for another frame.
 ///
@@ -79,8 +130,8 @@ impl WakeHandle {
 ///
 /// Sits parked on a channel until something calls [`WakeHandle::request`], then
 /// ticks at [`SMOOTH_FPS`] and notifies its observers each frame while any of
-/// them asks for another. Views observe it and advance their own animations by
-/// [`dt`](Self::dt).
+/// them asks for another. Views advance their own animations by
+/// [`dt`](Self::dt); prefer [`animate`] over observing the clock by hand.
 pub struct Animator {
     /// Seconds since the previous frame, clamped so a stalled frame can't jump
     /// an animation to its end.

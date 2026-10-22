@@ -28,7 +28,7 @@ use gpui::{
 use crate::model::{PlaylistId, QueueEntry};
 use crate::ui::album_list::{self, AlbumList, AlbumListSubs, AlbumListView, Play};
 use crate::ui::albums::{AlbumSection, RowActions, RowLayout, SectionSource, TrackRow};
-use crate::ui::animation::Animator;
+use crate::ui::animation::{animate, Advance, Animator};
 use crate::ui::browse::BrowseView;
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
@@ -103,12 +103,11 @@ impl QueueView {
         // the ghost renders at SMOOTH_FPS between the pointer's bursty events.
         // The rows tick through the album-list subscription, so only this is
         // handled here.
-        cx.observe(&animator, |this, animator, cx| {
-            let dt = animator.read(cx).dt();
-            let drag = this.drag.tick(dt);
-            if drag {
-                animator.read(cx).request();
-                cx.notify();
+        animate(&animator, cx, |this, dt, _cx| {
+            if this.drag.tick(dt) {
+                Advance::MOVED
+            } else {
+                Advance::IDLE
             }
         })
         .detach();

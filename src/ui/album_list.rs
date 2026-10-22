@@ -18,7 +18,7 @@ use gpui::{canvas, div, prelude::*, px, Context, Entity, KeyDownEvent, Render, S
 use crate::model::select::{Order, Scope, Selection};
 use crate::model::{search, InputAction, Library, PlaylistId, SongId};
 use crate::ui::albums::{self, AlbumSection, RowActions, SectionSource};
-use crate::ui::animation::{Animator, WakeHandle};
+use crate::ui::animation::{animate, Advance, Animator, WakeHandle};
 use crate::ui::cover_store::CoverStore;
 use crate::ui::drag::DragInfo;
 use crate::ui::format::format_bitrate;
@@ -419,19 +419,15 @@ pub fn observe<V: AlbumList>(
     });
     let _playback = playback.map(|playback| cx.observe(playback, |_this, _state, cx| cx.notify()));
     let _covers = cx.observe(covers, |_this, _state, cx| cx.notify());
-    let _animator = cx.observe(animator, |this, animator, cx| {
-        let dt = animator.read(cx).dt();
+    let _animator = animate(animator, cx, |this, dt, cx| {
         let moved = this.list_mut().rows.tick(dt);
         // The icon grid's eased scroll advances on the same clock.
         let scrolled = this.list_mut().tick_icon_scroll(dt);
         // Keep the playing row's equalizer moving even when nothing else is.
         let playing = this.list().playback().read(cx).is_playing();
-        if moved || scrolled || playing {
-            // Keep the clock awake while a fade/scroll is in flight, and while
-            // a playing row's equalizer is running.
-            this.list().request_frame();
-            cx.notify();
-        }
+        // The equalizer icon's phase comes from the clock at render time, so a
+        // playing row needs the list redrawn along with the extra frames.
+        Advance { redraw: moved || scrolled || playing, awake: moved || scrolled || playing }
     });
     AlbumListSubs { _library, _playback, _covers, _animator }
 }

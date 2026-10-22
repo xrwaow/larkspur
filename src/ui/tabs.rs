@@ -26,7 +26,7 @@ use gpui::{
 };
 
 use crate::model::{FolderMode, InputAction, PlaylistId, SongId, TabId};
-use crate::ui::animation::Animator;
+use crate::ui::animation::{animate, Advance, Animator};
 use crate::ui::browse::BrowseView;
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
@@ -137,15 +137,14 @@ impl TabsView {
                 cx.notify();
             }
         });
-        let observe_animator = cx.observe(&animator, |this, animator, cx| {
-            let dt = animator.read(cx).dt();
-            let moved = this
-                .marquees
-                .values_mut()
-                .any(|marquee| marquee.tick(dt));
+        let observe_animator = animate(&animator, cx, |this, dt, _cx| {
+            let moved = this.marquees.values_mut().fold(false, |moved, marquee| {
+                marquee.tick(dt) | moved
+            });
             if moved {
-                animator.read(cx).request();
-                cx.notify();
+                Advance::MOVED
+            } else {
+                Advance::IDLE
             }
         });
         let themed = Themed::new(&config, cx);

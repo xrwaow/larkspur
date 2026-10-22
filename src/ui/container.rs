@@ -5,7 +5,7 @@ use gpui::{
     Window,
 };
 
-use crate::ui::animation::{Animator, Tween};
+use crate::ui::animation::{animate, Advance, Animator, Tween};
 use crate::ui::config_state::{ConfigState, Themed};
 
 /// Seconds the left rail takes to slide between its open and collapsed
@@ -279,12 +279,12 @@ impl Workspace {
     /// after construction; an idle workspace costs nothing because a settled
     /// tween asks for no frames.
     pub fn attach_animator(&mut self, animator: Entity<Animator>, cx: &mut Context<Self>) {
-        let observe = cx.observe(&animator, |this, animator, cx| {
-            let dt = animator.read(cx).dt();
+        let observe = animate(&animator, cx, |this, dt, _cx| {
             if this.rail.tick(dt) {
-                animator.read(cx).request();
                 set_module_px(&mut this.plan, "playlists", this.rail.value());
-                cx.notify();
+                Advance::MOVED
+            } else {
+                Advance::IDLE
             }
         });
         self._observe_animator = Some(observe);

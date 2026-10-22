@@ -10,7 +10,7 @@ use gpui::{
 use crate::audio::RepeatMode;
 use crate::model::config::{TransportLayout, WaveformStyle};
 use crate::model::InputAction;
-use crate::ui::animation::{ease_out_cubic, Animator};
+use crate::ui::animation::{animate, ease_out_cubic, Advance, Animator};
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::format::{format_duration, format_duration_fixed};
@@ -74,10 +74,11 @@ impl PlaybackView {
             cx.notify();
         });
         // The waveform's chunk animations run on the shared frame clock.
-        let observe_animator = cx.observe(&animator, |this, animator, cx| {
-            if this.tick(animator.read(cx).dt(), cx) {
-                animator.read(cx).request();
-                cx.notify();
+        let observe_animator = animate(&animator, cx, |this, dt, cx| {
+            if this.tick(dt, cx) {
+                Advance::MOVED
+            } else {
+                Advance::IDLE
             }
         });
         let themed = Themed::new(&config, cx);

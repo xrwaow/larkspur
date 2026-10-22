@@ -22,7 +22,7 @@ use std::sync::Arc;
 use gpui::{canvas, div, prelude::*, px, Context, Entity, Render, Subscription, Window};
 
 use crate::analysis::{SpectrumAnalyzer, BAND_COUNT, FFT_SIZE};
-use crate::ui::animation::Animator;
+use crate::ui::animation::{animate, Advance, Animator};
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::playback_state::PlaybackState;
@@ -80,19 +80,14 @@ impl VisualizerView {
         animator: Entity<Animator>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let observe_animator = cx.observe(&animator, |this, animator, cx| {
-            let moved = this.tick(animator.read(cx).dt(), cx);
+        let observe_animator = animate(&animator, cx, |this, dt, cx| {
+            let moved = this.tick(dt, cx);
             // While audio is playing the bars must keep sampling even through
             // a silent passage (where nothing "moved" this frame), so the
             // clock stays awake for as long as the view is active.
             let active = this.config.read(cx).visualizer()
                 && this.state.read(cx).is_playing();
-            if active {
-                animator.read(cx).request();
-            }
-            if moved {
-                cx.notify();
-            }
+            Advance { redraw: moved, awake: moved || active }
         });
         // The clock sleeps between animations, so starting playback (or
         // turning the visualizer on mid-track) has to wake it explicitly.

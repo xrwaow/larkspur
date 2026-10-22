@@ -42,7 +42,7 @@ use crate::ui::container::Container;
 use crate::ui::cover_store::{CoverImage, CoverStore};
 use crate::ui::input::action_for_key;
 use crate::ui::library_state::{subdirs, LibraryState, Request};
-use crate::ui::animation::Animator;
+use crate::ui::animation::{animate, Advance, Animator};
 use crate::ui::menu::{context_menu, MenuHandler, MenuItem};
 use crate::ui::marquee::{self, Marquee};
 use crate::ui::playback::{icon, svg_icon};
@@ -230,12 +230,14 @@ impl PlaylistsView {
             cx.notify();
         });
         let observe_covers = cx.observe(&covers, |_this, _covers, cx| cx.notify());
-        let observe_animator = cx.observe(&animator, |this, animator, cx| {
-            let dt = animator.read(cx).dt();
-            let moved = this.marquees.values_mut().any(|marquee| marquee.tick(dt));
+        let observe_animator = animate(&animator, cx, |this, dt, _cx| {
+            let moved = this.marquees.values_mut().fold(false, |moved, marquee| {
+                marquee.tick(dt) | moved
+            });
             if moved {
-                animator.read(cx).request();
-                cx.notify();
+                Advance::MOVED
+            } else {
+                Advance::IDLE
             }
         });
         let themed = Themed::new(&config, cx);
