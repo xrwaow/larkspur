@@ -60,6 +60,25 @@ pub fn sidecar_path(audio: &Path) -> PathBuf {
     audio.with_extension("lrc")
 }
 
+/// Render lyrics as LRC text — timestamped lines for [`Lyrics::Synced`], the
+/// plain block for [`Lyrics::Plain`]. `None` when there are no lyrics to write.
+pub fn to_lrc(lyrics: &Lyrics) -> Option<String> {
+    match lyrics {
+        Lyrics::None => None,
+        Lyrics::Plain(text) => Some(format!("{}\n", text.trim_end())),
+        Lyrics::Synced(lines) => {
+            let mut out = String::new();
+            for line in lines {
+                let millis = line.timestamp.as_millis();
+                let minutes = millis / 60_000;
+                let seconds = (millis % 60_000) as f64 / 1000.0;
+                out.push_str(&format!("[{minutes:02}:{seconds:05.2}]{}\n", line.text));
+            }
+            Some(out)
+        }
+    }
+}
+
 /// Load synced lyrics from a `.lrc` sidecar next to `audio`, if one is there.
 ///
 /// A sidecar wins over embedded lyrics: it's the only source that reliably
@@ -230,6 +249,17 @@ mod tests {
         assert_eq!(parse_timestamp_tag("00:01"), Some(at(0, 1.0)));
         assert_eq!(parse_timestamp_tag("01:02.50"), Some(at(1, 2.5)));
         assert_eq!(parse_timestamp_tag("ti:Title"), None);
+    }
+
+    #[test]
+    fn renders_lrc_for_embedding() {
+        let lyrics = Lyrics::Synced(vec![
+            LyricLine { timestamp: at(0, 1.0), text: "first".into() },
+            LyricLine { timestamp: at(1, 2.5), text: "second".into() },
+        ]);
+        assert_eq!(to_lrc(&lyrics).unwrap(), "[00:01.00]first\n[01:02.50]second\n");
+        assert_eq!(to_lrc(&Lyrics::Plain("one\ntwo".into())).unwrap(), "one\ntwo\n");
+        assert_eq!(to_lrc(&Lyrics::None), None);
     }
 
     #[test]

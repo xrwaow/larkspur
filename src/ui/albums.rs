@@ -1021,6 +1021,11 @@ fn number_cell(theme: Theme, number: usize) -> AnyElement {
         .w(px(theme.number_col()))
         .flex_none()
         .text_left()
+        // The column is sized to exactly three glyphs. Without nowrap, a
+        // layout that rounds the advance even slightly wider wraps `01.` onto
+        // two lines, making every idle row taller than the playing one (whose
+        // equalizer has no text) once the font grows.
+        .whitespace_nowrap()
         .text_size(px(theme.small_px()))
         .text_color(theme.text_faint)
         .child(format!("{number:02}."))
@@ -1122,6 +1127,9 @@ fn right_cell(theme: Theme, width: f32, label: impl Into<SharedString>) -> AnyEl
         .w(px(width))
         .flex_none()
         .text_right()
+        // Numeric columns stay on one line: a wrapped bitrate would make a
+        // playing row (which shows the live value) taller than its neighbours.
+        .whitespace_nowrap()
         .text_size(px(theme.small_px()))
         .text_color(theme.text_faint)
         .child(label.into())

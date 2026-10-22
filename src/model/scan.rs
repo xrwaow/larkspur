@@ -267,6 +267,17 @@ impl LibraryCache {
         }
     }
 
+    /// Replace one cached song and refresh its modification stamp.
+    ///
+    /// Used when a single entry changes outside a scan — accepting downloaded
+    /// lyrics embeds them in the audio file, whose new mtime is what the next
+    /// incremental sync compares against. Without the refreshed stamp that
+    /// sync would re-parse the file it already has.
+    pub fn update_song(&mut self, song: Arc<SongMetadata>) {
+        let modified = source_stamp(&song.path).unwrap_or_else(SystemTime::now);
+        self.entries.insert(song.id, CachedSong { song, modified });
+    }
+
     /// Persist the cached song metadata and directory stamps to disk.
     pub fn save(&self) -> anyhow::Result<()> {
         let mut songs: Vec<CachedSong> = self.entries.values().cloned().collect();

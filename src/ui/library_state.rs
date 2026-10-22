@@ -26,8 +26,8 @@ use gpui::{Context, Entity, Subscription};
 
 use crate::model::search::Query;
 use crate::model::{
-    shuffle, FolderMode, Library, LibraryCache, Order, PlaylistId, QueueEntry, Scope, Selection,
-    SongId, UserStore,
+    shuffle, FolderMode, Library, LibraryCache, Lyrics, Order, PlaylistId, QueueEntry, Scope,
+    Selection, SongId, UserStore,
 };
 use crate::ui::config_state::ConfigState;
 use crate::ui::menu::SongMenuRequest;
@@ -488,6 +488,25 @@ impl LibraryState {
             .ok();
         })
         .detach();
+    }
+
+    /// Replace one song's lyrics and sync just that entry.
+    ///
+    /// The caller embeds the lyrics in the audio file first; this clones the
+    /// song's metadata, swaps the lyrics in, updates the cache entry's
+    /// modification stamp, and persists the cache. It avoids a filesystem
+    /// rescan, which would re-read every root to learn one file.
+    pub fn set_lyrics(&mut self, id: SongId, lyrics: Lyrics, cx: &mut Context<Self>) {
+        let Some(existing) = self.library.get_arc(id) else { return };
+        let mut song = (*existing).clone();
+        song.lyrics = lyrics;
+        let song = std::sync::Arc::new(song);
+        if let Some(cache) = self.cache.as_mut() {
+            cache.update_song(song.clone());
+        }
+        self.library.insert_song((*song).clone());
+        self.persist_songs();
+        cx.notify();
     }
 
     /// Persist the user-owned playlists and stats — what a playlist edit or a

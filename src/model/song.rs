@@ -2,6 +2,7 @@ use std::borrow::Cow;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
+use lofty::config::WriteOptions;
 use lofty::file::{AudioFile, TaggedFileExt};
 use lofty::probe::Probe;
 use lofty::tag::{Accessor, ItemKey, Tag};
@@ -9,7 +10,7 @@ use serde::{Deserialize, Serialize};
 
 use super::format::AudioFormat;
 use super::identity::SongId;
-use super::lyrics::{load_sidecar, looks_like_lrc, parse_lrc, Lyrics};
+use super::lyrics::{load_sidecar, looks_like_lrc, parse_lrc, to_lrc, Lyrics};
 
 /// A release date packed as `YYYYMMDD` (e.g. `20230501`), with zeros for
 /// unknown components: `20030000` is year-only, `20030500` is year + month.
@@ -231,6 +232,27 @@ impl SongMetadata {
             duration: self.duration,
         }
     }
+}
+
+/// Embed `lyrics` in the audio file's tag, replacing any lyrics already there.
+///
+/// Synced lyrics are stored in LRC form inside the tag, which is what the scan
+/// recognises via [`looks_like_lrc`] when the file is read again. Plain lyrics
+/// are stored as-is. The file's own tag type is used, so this works for ID3,
+/// Vorbis, and MP4 tags alike.
+pub fn embed_lyrics(audio: &Path, lyrics: &Lyrics) -> anyhow::Result<()> {
+    let text = to_lrc(lyrics).ok_or_else(|| anyhow::anyhow!("no lyrics to embed"))?;
+    let mut tagged_file = Probe::open(audio)?.guess_file_type()?.read()?;
+    if tagged_file.primary_tag_mut().is_none() {
+        let tag_type = tagged_file.primary_tag_type();
+        tagged_file.insert_tag(Tag::new(tag_type));
+    }
+    let tag = tagged_file
+        .primary_tag_mut()
+        .ok_or_else(|| anyhow::anyhow!("no writable tag block"))?;
+    tag.insert_text(ItemKey::Lyrics, text);
+    tagged_file.save_to_path(audio, WriteOptions::default())?;
+    Ok(())
 }
 
 /// A path-independent identity for reconciliation: what a moved file still

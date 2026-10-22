@@ -14,6 +14,7 @@ pub mod format;
 pub mod identity;
 pub mod input;
 pub mod library;
+pub mod lrclib;
 pub mod lyrics;
 pub mod persist;
 pub mod playlist;

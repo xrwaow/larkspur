@@ -35,7 +35,7 @@ use gpui::{
     RenderImage, Rgba, Subscription, Window,
 };
 
-use crate::model::{DynamicBase, LyricLine, Lyrics, SongId, TextureMode};
+use crate::model::{lrclib, DynamicBase, LyricLine, Lyrics, SongId, TextureMode};
 use crate::ui::animation::{Animator, Tween};
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
@@ -76,6 +76,23 @@ const TEXTURE_TILES: usize = 32;
 /// How much of the texture shows through behind actual lyrics. Enough to read
 /// the procedural surface, faint enough that the text stays the focus.
 const TEXTURE_BEHIND_TEXT_OPACITY: f32 = 0.35;
+
+/// An in-flight or completed LRCLIB lookup for one song.
+///
+/// A preview is deliberately not written to disk: it is shown in place of the
+/// current lyrics until the user accepts it. Keeping the song id here lets a
+/// lookup that finishes after a track change be discarded instead of showing
+/// the wrong track's lyrics.
+struct LyricsFetch {
+    song: SongId,
+    state: FetchState,
+}
+
+enum FetchState {
+    Loading,
+    Preview(Lyrics),
+    Failed,
+}
 
 /// A rendered procedural texture for one cover on one theme base. Rendering
 /// happens off-thread; the panel draws the last completed one while the next
@@ -125,7 +142,11 @@ pub struct LyricsView {
     texture_failed: Option<(SongId, DynamicBase)>,
     /// The frame clock, held so a new line's slide can wake it from sleep.
     animator: Entity<Animator>,
+    /// The current LRCLIB lookup or its unsaved preview. Only rendered when it
+    /// belongs to the playing song.
+    fetch: Option<LyricsFetch>,
     _observe: Subscription,
+    _observe_library: Subscription,
     _observe_animator: Subscription,
 }
 
@@ -154,6 +175,12 @@ impl LyricsView {
             wake_animator.read(cx).request();
             cx.notify();
         });
+        // Accepting lyrics replaces the library's metadata for this track; the
+        // panel re-syncs and redraws from the new value.
+        let observe_library = cx.observe(&library, |this, _library, cx| {
+            this.sync(cx);
+            cx.notify();
+        });
         let observe_animator = cx.observe(&animator, |this, animator, cx| {
             let dt = animator.read(cx).dt();
             let moved = this.offset.tick(dt);
@@ -180,7 +207,9 @@ impl LyricsView {
             texture_attempt: None,
             texture_failed: None,
             animator,
+            fetch: None,
             _observe: observe,
+            _observe_library: observe_library,
             _observe_animator: observe_animator,
         };
         this.sync(cx);
@@ -268,7 +297,10 @@ impl LyricsView {
             let state = self.state.read(cx);
             let metadata = state.metadata(cx);
             let position = state.live_position();
-            let (anchor, fading) = match metadata.as_ref().map(|m| &m.lyrics) {
+            let song = metadata.as_ref().map(|m| m.id);
+            let lyrics = preview_lyrics(&self.fetch, song)
+                .or_else(|| metadata.as_ref().map(|m| &m.lyrics));
+            let (anchor, fading) = match lyrics {
                 Some(Lyrics::Synced(lines)) if !lines.is_empty() => (
                     Some(anchor_at(lines, position, transition)),
                     // Keep re-rendering while a colour is crossing, so the fade
@@ -277,7 +309,7 @@ impl LyricsView {
                 ),
                 _ => (None, false),
             };
-            (metadata.map(|m| m.id), position, anchor, fading)
+            (song, position, anchor, fading)
         };
 
         let mut changed = fading;
@@ -301,6 +333,11 @@ impl LyricsView {
             self.song = song;
             self.anchor = None;
             self.offset.set(0.0);
+            // A lookup for the previous track is useless now, even if it's
+            // still in flight (its completion checks the song before landing).
+            if self.fetch.as_ref().is_some_and(|fetch| Some(fetch.song) != song) {
+                self.fetch = None;
+            }
             changed = true;
         }
 
@@ -327,6 +364,82 @@ impl LyricsView {
 
         changed
     }
+
+    /// Ask LRCLIB for the playing track's lyrics and hold the result as an
+    /// unsaved preview. The request runs on the background executor; the
+    /// completion is dropped unless it still belongs to the current lookup.
+    fn fetch_lyrics(&mut self, cx: &mut Context<Self>) {
+        let Some(song) = self.state.read(cx).metadata(cx) else { return };
+        let id = song.id;
+        self.fetch = Some(LyricsFetch { song: id, state: FetchState::Loading });
+        cx.notify();
+
+        cx.spawn(async move |this, cx| {
+            let result = cx
+                .background_executor()
+                .spawn(async move { lrclib::lookup(&song) })
+                .await;
+            this.update(cx, |this, cx| {
+                if !matches!(&this.fetch, Some(fetch) if fetch.song == id) {
+                    return; // Superseded by another lookup or a track change.
+                }
+                let state = match result {
+                    Ok(Some(lyrics)) => FetchState::Preview(lyrics),
+                    Ok(None) => FetchState::Failed,
+                    Err(error) => {
+                        eprintln!("lrclib: {error:#}");
+                        FetchState::Failed
+                    }
+                };
+                this.fetch = Some(LyricsFetch { song: id, state });
+                this.sync(cx);
+                this.animator.read(cx).request();
+                cx.notify();
+            })
+            .ok();
+        })
+        .detach();
+    }
+
+    /// Embed the previewed lyrics in the song's tag, then sync just this
+    /// library entry — no filesystem rescan.
+    fn accept_lyrics(&mut self, cx: &mut Context<Self>) {
+        let Some(song) = self.state.read(cx).metadata(cx) else { return };
+        let Some(LyricsFetch { song: fetched, state: FetchState::Preview(lyrics) }) =
+            self.fetch.as_ref()
+        else {
+            return;
+        };
+        if *fetched != song.id {
+            return;
+        }
+        let lyrics = lyrics.clone();
+        let path = song.path.clone();
+
+        match crate::model::song::embed_lyrics(&path, &lyrics) {
+            Ok(()) => {
+                self.fetch = None;
+                self.library.update(cx, |library, cx| {
+                    library.set_lyrics(song.id, lyrics, cx);
+                });
+                self.sync(cx);
+                cx.notify();
+            }
+            Err(error) => {
+                eprintln!("failed to embed lyrics in {}: {error}", path.display());
+                self.fetch = Some(LyricsFetch { song: song.id, state: FetchState::Failed });
+                cx.notify();
+            }
+        }
+    }
+
+    /// Discard the preview without touching disk; the previous lyrics (if any)
+    /// come straight back.
+    fn reject_lyrics(&mut self, cx: &mut Context<Self>) {
+        self.fetch = None;
+        self.sync(cx);
+        cx.notify();
+    }
 }
 
 impl Container for LyricsView {
@@ -351,14 +464,16 @@ impl Render for LyricsView {
         // per frame — the click handlers only need `cx` immutably.
         let metadata = self.state.read(cx).metadata(cx);
         let queue_open = self.state.read(cx).queue_open();
+        let current_song = metadata.as_ref().map(|m| m.id);
 
         // The procedural cover-art texture fills the body, according to the
         // Texture setting: off, only when there are no lyrics, or always. The
         // queue takes precedence over all of it and still opens as before.
-        let no_lyrics = match metadata.as_ref().map(|m| &m.lyrics) {
-            Some(Lyrics::Plain(text)) => text.trim().is_empty(),
-            Some(Lyrics::Synced(lines)) => lines.is_empty(),
-            Some(Lyrics::None) | None => true,
+        // A preview counts as "lyrics" here, so the texture steps aside while
+        // the user is deciding whether to keep it.
+        let no_lyrics = {
+            let preview = preview_lyrics(&self.fetch, current_song);
+            !has_lyrics(preview.or_else(|| metadata.as_ref().map(|m| &m.lyrics)))
         };
         let texture_mode = self.config.read(cx).lyrics_texture();
         let texture_wanted = match texture_mode {
@@ -390,7 +505,9 @@ impl Render for LyricsView {
         let body: AnyElement = if queue_open {
             self.queue.clone().into_any_element()
         } else {
-            let content: AnyElement = match metadata.as_ref().map(|m| &m.lyrics) {
+            let shown = preview_lyrics(&self.fetch, current_song)
+                .or_else(|| metadata.as_ref().map(|m| &m.lyrics));
+            let content: AnyElement = match shown {
                 Some(Lyrics::Plain(text)) if !text.trim().is_empty() => div()
                     .id("lyrics-scroll")
                     .size_full()
@@ -566,11 +683,69 @@ impl Render for LyricsView {
                             ),
                     )
             } else {
+                let fetch = self
+                    .fetch
+                    .as_ref()
+                    .filter(|fetch| Some(fetch.song) == current_song);
+                // The search icon covers both actions: a fresh lookup, and
+                // looking for a better version when lyrics already exist.
+                let get = |cx: &mut Context<Self>| {
+                    header_icon_button(theme, "lyrics-get", "assets/search.svg", theme.text_muted)
+                        .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
+                            this.fetch_lyrics(cx);
+                        }))
+                        .into_any_element()
+                };
+                let right: AnyElement = match fetch.map(|fetch| &fetch.state) {
+                    Some(FetchState::Loading) => div()
+                        .flex_none()
+                        .opacity(0.4)
+                        .child(svg_icon(
+                            theme.small_px(),
+                            theme.small_px(),
+                            "assets/search.svg",
+                            theme.text_muted,
+                        ))
+                        .into_any_element(),
+                    Some(FetchState::Preview(_)) => div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(
+                            header_icon_button(
+                                theme,
+                                "lyrics-accept",
+                                "assets/accept.svg",
+                                theme.accent,
+                            )
+                            .on_click(cx.listener(
+                                |this, _event: &ClickEvent, _window, cx| {
+                                    this.accept_lyrics(cx);
+                                },
+                            )),
+                        )
+                        .child(
+                            header_icon_button(
+                                theme,
+                                "lyrics-cancel",
+                                "assets/cancel.svg",
+                                theme.text,
+                            )
+                            .on_click(cx.listener(
+                                |this, _event: &ClickEvent, _window, cx| {
+                                    this.reject_lyrics(cx);
+                                },
+                            )),
+                        )
+                        .into_any_element(),
+                    Some(FetchState::Failed) | None => get(cx),
+                };
                 div()
                     .h(px(header_h))
                     .pt_1()
                     .flex()
                     .items_center()
+                    .justify_between()
                     .px_4()
                     .border_b_1()
                     .border_color(theme.border)
@@ -580,6 +755,7 @@ impl Render for LyricsView {
                             .text_color(theme.text)
                             .child("Lyrics"),
                     )
+                    .child(right)
             })
             .child(
                 div()
@@ -593,6 +769,42 @@ impl Render for LyricsView {
                     }),
             )
     }
+}
+
+/// One clickable header icon. The caller attaches the click handler, which
+/// keeps the search/accept/cancel actions visually identical.
+fn header_icon_button(
+    theme: Theme,
+    id: &'static str,
+    icon: &'static str,
+    color: Rgba,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .flex_none()
+        .cursor_pointer()
+        .child(svg_icon(theme.small_px(), theme.small_px(), icon, color))
+}
+
+/// Whether lyrics have anything to show — used for the texture decision.
+fn has_lyrics(lyrics: Option<&Lyrics>) -> bool {
+    match lyrics {
+        Some(Lyrics::Plain(text)) => !text.trim().is_empty(),
+        Some(Lyrics::Synced(lines)) => !lines.is_empty(),
+        Some(Lyrics::None) | None => false,
+    }
+}
+
+/// The unsaved preview for `song`, if the active lookup has finished and
+/// belongs to that song.
+fn preview_lyrics(fetch: &Option<LyricsFetch>, song: Option<SongId>) -> Option<&Lyrics> {
+    fetch
+        .as_ref()
+        .filter(|fetch| Some(fetch.song) == song)
+        .and_then(|fetch| match &fetch.state {
+            FetchState::Preview(lyrics) => Some(lyrics),
+            _ => None,
+        })
 }
 
 /// The panel's empty body: the procedural texture repeated downward at its

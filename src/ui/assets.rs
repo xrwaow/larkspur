@@ -26,6 +26,9 @@ impl Assets {
         ("assets/artists.svg", include_bytes!("../../assets/artists.svg")),
         ("assets/folders.svg", include_bytes!("../../assets/folders.svg")),
         ("assets/clear_queue.svg", include_bytes!("../../assets/clear_queue.svg")),
+        ("assets/search.svg", include_bytes!("../../assets/search.svg")),
+        ("assets/accept.svg", include_bytes!("../../assets/accept.svg")),
+        ("assets/cancel.svg", include_bytes!("../../assets/cancel.svg")),
     ];
 }
 
