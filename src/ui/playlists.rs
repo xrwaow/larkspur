@@ -886,8 +886,8 @@ enum RailRow {
     NoMatches,
 }
 
-/// Shared chrome for the rail's small icon buttons: a padded, hover-highlighted
-/// box around a `size`-px glyph.
+/// Shared chrome for the rail's small icon buttons: a padded box around a
+/// `size`-px glyph that dims on hover.
 fn rail_icon_button(
     theme: Theme,
     id: impl Into<ElementId>,
@@ -905,7 +905,7 @@ fn rail_icon_button(
         .p_1()
         .rounded_md()
         .cursor_pointer()
-        .hover(|d| d.bg(theme.row_hover))
+        .hover(|d| d.opacity(0.5))
         .on_click(cx.listener(on_click))
         .child(svg_icon(size, size, path, theme.text_muted))
         .into_any_element()
@@ -924,13 +924,26 @@ fn rail_toggle_button(
     } else {
         "assets/expand-left.svg"
     };
-    // The 14 px box matches a group header's chevron, so the expand glyph sits
-    // in the same vertical column as the chevrons below.
-    rail_icon_button(theme, "toggle-sidebar", icon_path, 14.0, cx, |this, _event, _window, cx| {
-        let minimized = this.config.read(cx).sidebar_minimized();
-        this.config
-            .update(cx, |config, cx| config.set_sidebar_minimized(!minimized, cx));
-    })
+    // The 25 px glyph matches the collapsed rail's group icons; the expanded
+    // header adjusts its padding so the button still centres on the chevron
+    // column below. Unlike the group buttons it dims on hover rather than
+    // gaining a background.
+    div()
+        .id("toggle-sidebar")
+        .flex_none()
+        .flex()
+        .items_center()
+        .justify_center()
+        .p_1()
+        .cursor_pointer()
+        .hover(|d| d.opacity(0.5))
+        .on_click(cx.listener(|this, _event, _window, cx| {
+            let minimized = this.config.read(cx).sidebar_minimized();
+            this.config
+                .update(cx, |config, cx| config.set_sidebar_minimized(!minimized, cx));
+        }))
+        .child(svg_icon(25.0, 25.0, icon_path, theme.text_muted))
+        .into_any_element()
 }
 
 /// The rail's header band, sized to the tab strip beside it so the title and
@@ -947,8 +960,8 @@ fn library_header(
         .pl_4()
         // The list has `px_2` and each group header `pr_2`, so its chevron's
         // centre sits 23 px from the rail's right edge (8 + 8 + half of 14).
-        // `pr_3` + the toggle's `p_1` + the same 14 px box lands on it.
-        .pr_3()
+        // `pr` + the toggle's `p_1` + half of its 25 px box lands on it.
+        .pr(px(6.5))
         .flex()
         .items_center()
         .justify_between()
@@ -1001,7 +1014,7 @@ fn collapsed_group_icons(theme: Theme, cx: &mut Context<PlaylistsView>) -> AnyEl
                 theme,
                 ("collapsed-group", group as u64),
                 path,
-                20.0,
+                25.0,
                 cx,
                 move |this, _event, _window, cx| {
                     // Expanding the rail alone would land on whatever folds
@@ -1043,7 +1056,7 @@ fn settings_button(
         .py_1()
         .rounded_md()
         .cursor_pointer()
-        .hover(|d| d.bg(theme.row_hover))
+        .hover(|d| d.opacity(0.5))
         .on_click(cx.listener(|this, _event, window, cx| {
             this.tabs.update(cx, |tabs, cx| tabs.open_settings(window, cx));
         }))
@@ -1067,7 +1080,7 @@ fn settings_button(
 }
 
 impl Render for PlaylistsView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.themed.theme();
         let scanning = self.library.read(cx).is_scanning();
         let selected = self.library.read(cx).selected();
@@ -1339,6 +1352,7 @@ impl Render for PlaylistsView {
                     root = root.child(context_menu(
                         theme,
                         position,
+                        window,
                         vec![
                             MenuItem::action("Rename", rename),
                             MenuItem::action("Delete", delete),
@@ -1389,6 +1403,7 @@ impl Render for PlaylistsView {
                     root = root.child(context_menu(
                         theme,
                         position,
+                        window,
                         items,
                         &hover_path,
                         hover,

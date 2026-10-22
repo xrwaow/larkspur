@@ -263,7 +263,7 @@ impl Render for BrowseView {
                         .py_1()
                         .rounded_md()
                         .cursor_pointer()
-                        .hover(|d| d.bg(theme.row_hover))
+                        .hover(|d| d.opacity(0.5))
                         .on_click(cx.listener(|this, _event, _window, cx| {
                             let playback = this.list.playback().clone();
                             let scope = this.scope.clone();

@@ -390,7 +390,7 @@ fn play_button(playing: bool, ended: bool, theme: Theme, cx: &mut Context<Playba
         .items_center()
         .justify_center()
         .bg(theme.text_muted)
-        .when(!ended, |d| d.hover(|d| d.bg(theme.accent)))
+        .when(!ended, |d| d.hover(|d| d.opacity(0.5)))
         .on_click(cx.listener(|this, _event, _window, cx| {
             this.dispatch(InputAction::TogglePause, cx);
         }))

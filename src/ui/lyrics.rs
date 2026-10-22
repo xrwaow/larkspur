@@ -77,6 +77,10 @@ const TEXTURE_TILES: usize = 32;
 /// the procedural surface, faint enough that the text stays the focus.
 const TEXTURE_BEHIND_TEXT_OPACITY: f32 = 0.35;
 
+/// How long a new cover's texture takes to crossfade in over the previous one,
+/// so a track change doesn't snap the panel to a different surface.
+const TEXTURE_FADE_SECS: f32 = 0.5;
+
 /// An in-flight or completed LRCLIB lookup for one song.
 ///
 /// A preview is deliberately not written to disk: it is shown in place of the
@@ -140,6 +144,10 @@ pub struct LyricsView {
     /// A (song, base) pair that produced no texture — no embedded art, or art
     /// too small to quilt. Cached so the panel doesn't retry every frame.
     texture_failed: Option<(SongId, DynamicBase)>,
+    /// The texture being faded out while a new one crossfades in.
+    texture_previous: Option<Arc<RenderImage>>,
+    /// Crossfade progress: 0 shows `texture_previous`, 1 the current texture.
+    texture_fade: Tween,
     /// The frame clock, held so a new line's slide can wake it from sleep.
     animator: Entity<Animator>,
     /// The current LRCLIB lookup or its unsaved preview. Only rendered when it
@@ -184,8 +192,13 @@ impl LyricsView {
         let observe_animator = cx.observe(&animator, |this, animator, cx| {
             let dt = animator.read(cx).dt();
             let moved = this.offset.tick(dt);
+            let faded = this.texture_fade.tick(dt);
+            if faded && !this.texture_fade.is_animating() {
+                // The swap has landed: stop drawing the outgoing texture.
+                this.texture_previous = None;
+            }
             let changed = this.sync(cx);
-            if moved || changed {
+            if moved || faded || changed {
                 animator.read(cx).request();
                 cx.notify();
             }
@@ -206,6 +219,8 @@ impl LyricsView {
             texture: None,
             texture_attempt: None,
             texture_failed: None,
+            texture_previous: None,
+            texture_fade: Tween::new(1.0),
             animator,
             fetch: None,
             _observe: observe,
@@ -268,13 +283,31 @@ impl LyricsView {
                         this.texture_failed = None;
                     }
                     Some(LoadedTexture::Rendered { seed, image }) => {
-                        this.texture = Some(CachedTexture { song, seed, base, image });
+                        let replaced = this.texture.replace(CachedTexture {
+                            song,
+                            seed,
+                            base,
+                            image: image.clone(),
+                        });
+                        // Crossfade from whatever was on screen. A new texture
+                        // for a track with the same art arrives as `Unchanged`
+                        // instead, so this only fires on an actual swap.
+                        if let Some(old) = replaced {
+                            if !Arc::ptr_eq(&old.image, &image) {
+                                this.texture_previous = Some(old.image);
+                                this.texture_fade.set(0.0);
+                                this.texture_fade.to(1.0, TEXTURE_FADE_SECS);
+                                this.animator.read(cx).request();
+                            }
+                        }
                         this.texture_failed = None;
                     }
                     None => {
                         // Don't leave the previous song's texture standing in
                         // for art that couldn't be read.
                         this.texture = None;
+                        this.texture_previous = None;
+                        this.texture_fade.set(1.0);
                         this.texture_failed = Some(key);
                     }
                 }
@@ -482,6 +515,8 @@ impl Render for LyricsView {
             TextureMode::Always => true,
         };
         let mut texture = None;
+        let mut previous_texture = None;
+        let mut texture_fade = 1.0;
         if texture_wanted && !queue_open {
             if let Some(song) = metadata.as_ref() {
                 let base = self.config.read(cx).texture_base();
@@ -491,6 +526,10 @@ impl Render for LyricsView {
                     .as_ref()
                     .filter(|cached| cached.base == base)
                     .map(|cached| cached.image.clone());
+                if self.texture_fade.is_animating() {
+                    previous_texture = self.texture_previous.clone();
+                    texture_fade = self.texture_fade.value();
+                }
             }
         }
 
@@ -623,9 +662,13 @@ impl Render for LyricsView {
 
             match texture {
                 // No lyrics: the texture is the body.
-                Some(image) if no_lyrics => tiled_texture(image),
+                Some(image) if no_lyrics => {
+                    crossfade_texture(image, previous_texture, texture_fade)
+                }
                 // Lyrics: keep them in front, with the texture dimmed behind.
-                Some(image) => texture_behind_text(image, content),
+                Some(image) => {
+                    texture_behind_text(image, previous_texture, texture_fade, content)
+                }
                 // Still rendering, no art to quilt, or the setting is off.
                 None => content,
             }
@@ -690,7 +733,7 @@ impl Render for LyricsView {
                 // The search icon covers both actions: a fresh lookup, and
                 // looking for a better version when lyrics already exist.
                 let get = |cx: &mut Context<Self>| {
-                    header_icon_button(theme, "lyrics-get", "assets/search.svg", theme.text_muted)
+                    header_icon_button(theme, "lyrics-get", "assets/search.svg")
                         .on_click(cx.listener(|this, _event: &ClickEvent, _window, cx| {
                             this.fetch_lyrics(cx);
                         }))
@@ -699,12 +742,11 @@ impl Render for LyricsView {
                 let right: AnyElement = match fetch.map(|fetch| &fetch.state) {
                     Some(FetchState::Loading) => div()
                         .flex_none()
-                        .opacity(0.4)
                         .child(svg_icon(
                             theme.small_px(),
                             theme.small_px(),
                             "assets/search.svg",
-                            theme.text_muted,
+                            theme.accent,
                         ))
                         .into_any_element(),
                     Some(FetchState::Preview(_)) => div()
@@ -712,12 +754,7 @@ impl Render for LyricsView {
                         .items_center()
                         .gap_3()
                         .child(
-                            header_icon_button(
-                                theme,
-                                "lyrics-accept",
-                                "assets/accept.svg",
-                                theme.accent,
-                            )
+                            header_icon_button(theme, "lyrics-accept", "assets/accept.svg")
                             .on_click(cx.listener(
                                 |this, _event: &ClickEvent, _window, cx| {
                                     this.accept_lyrics(cx);
@@ -725,12 +762,7 @@ impl Render for LyricsView {
                             )),
                         )
                         .child(
-                            header_icon_button(
-                                theme,
-                                "lyrics-cancel",
-                                "assets/cancel.svg",
-                                theme.text,
-                            )
+                            header_icon_button(theme, "lyrics-cancel", "assets/cancel.svg")
                             .on_click(cx.listener(
                                 |this, _event: &ClickEvent, _window, cx| {
                                     this.reject_lyrics(cx);
@@ -777,13 +809,13 @@ fn header_icon_button(
     theme: Theme,
     id: &'static str,
     icon: &'static str,
-    color: Rgba,
 ) -> gpui::Stateful<gpui::Div> {
     div()
         .id(id)
         .flex_none()
         .cursor_pointer()
-        .child(svg_icon(theme.small_px(), theme.small_px(), icon, color))
+        .hover(|d| d.opacity(0.5))
+        .child(svg_icon(theme.small_px(), theme.small_px(), icon, theme.text))
 }
 
 /// Whether lyrics have anything to show — used for the texture decision.
@@ -829,9 +861,45 @@ fn tiled_texture(image: Arc<RenderImage>) -> AnyElement {
     column.into_any_element()
 }
 
+/// The tiled surface, crossfading from `previous` into `image` as `fade` runs
+/// 0 → 1. With no outgoing texture (a first render, or the swap already
+/// landed) this is just the tiled image.
+fn crossfade_texture(
+    image: Arc<RenderImage>,
+    previous: Option<Arc<RenderImage>>,
+    fade: f32,
+) -> AnyElement {
+    match previous {
+        Some(previous) if fade < 1.0 => div()
+            .relative()
+            .size_full()
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .opacity(1.0 - fade)
+                    .child(tiled_texture(previous)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .inset_0()
+                    .opacity(fade)
+                    .child(tiled_texture(image)),
+            )
+            .into_any_element(),
+        _ => tiled_texture(image),
+    }
+}
+
 /// Lyrics over the texture: the tiled surface sits behind, softened so the
 /// text keeps its contrast, and the content is layered on top at full opacity.
-fn texture_behind_text(image: Arc<RenderImage>, content: AnyElement) -> AnyElement {
+fn texture_behind_text(
+    image: Arc<RenderImage>,
+    previous: Option<Arc<RenderImage>>,
+    fade: f32,
+    content: AnyElement,
+) -> AnyElement {
     div()
         .relative()
         .size_full()
@@ -840,7 +908,7 @@ fn texture_behind_text(image: Arc<RenderImage>, content: AnyElement) -> AnyEleme
                 .absolute()
                 .inset_0()
                 .opacity(TEXTURE_BEHIND_TEXT_OPACITY)
-                .child(tiled_texture(image)),
+                .child(crossfade_texture(image, previous, fade)),
         )
         .child(div().relative().size_full().child(content))
         .into_any_element()

@@ -445,12 +445,13 @@ type HoverHandler = Rc<dyn Fn(&Option<Vec<usize>>, &mut Window, &mut App)>;
 type DismissHandler = Rc<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>;
 
 /// Build one menu panel: a column of rows, with any open submenu attached to
-/// the right of its parent row. Recurses for nested submenus.
+/// whichever side of its parent row has room. Recurses for nested submenus.
 fn menu_panel(
     theme: Theme,
     items: Vec<MenuItem>,
     path: &[usize],
     open: &[usize],
+    open_left: bool,
     on_hover: &HoverHandler,
     on_dismiss: &DismissHandler,
 ) -> Div {
@@ -499,35 +500,51 @@ fn menu_panel(
                     .py_1()
                     .flex()
                     .items_center()
-                    .justify_between()
                     .gap_2()
                     .cursor_pointer()
                     .text_size(px(theme.cell_px()))
                     .text_color(theme.text)
+                    // A left-opening submenu puts its chevron on the left, so
+                    // keep the label beside it instead of pushing it across.
+                    .when(open_left, |d| d.justify_start())
+                    .when(!open_left, |d| d.justify_between())
                     .hover(|d| d.bg(theme.row_hover))
                     .on_hover(move |hovered, window, cx| {
                         if *hovered {
                             hover(&Some(sub_path.clone()), window, cx);
                         }
-                    })
-                    .child(label)
-                    .child(
+                    });
+
+                let chevron = if open_left { "‹" } else { "›" };
+                let row = if open_left {
+                    row.child(
                         div()
                             .flex_none()
                             .text_color(theme.text_faint)
-                            .child("›"),
-                    );
+                            .child(chevron),
+                    )
+                    .child(label)
+                } else {
+                    row.child(label).child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.text_faint)
+                            .child(chevron),
+                    )
+                };
 
                 if is_open {
-                    row.child(
-                        menu_panel(theme, items, &item_path, open, on_hover, on_dismiss)
+                    let panel =
+                        menu_panel(theme, items, &item_path, open, open_left, on_hover, on_dismiss)
                             .absolute()
-                            .left_full()
-                            // Cover the parent's right border instead of
-                            // drawing a second one beside it.
-                            .ml(px(-1.0))
-                            .top_0(),
-                    )
+                            .top_0();
+                    row.child(if open_left {
+                        // Cover the parent's edge instead of drawing a
+                        // second border beside it.
+                        panel.right_full().mr(px(-1.0))
+                    } else {
+                        panel.left_full().ml(px(-1.0))
+                    })
                 } else {
                     row
                 }
@@ -572,6 +589,7 @@ fn menu_panel(
 pub fn context_menu(
     theme: Theme,
     position: Point<Pixels>,
+    window: &Window,
     items: Vec<MenuItem>,
     open: &[usize],
     on_hover: impl Fn(&Option<Vec<usize>>, &mut Window, &mut App) + 'static,
@@ -580,9 +598,19 @@ pub fn context_menu(
     let on_hover: HoverHandler = Rc::new(on_hover);
     let on_dismiss: DismissHandler = Rc::new(on_dismiss);
     let open = open.to_vec();
-    let menu = menu_panel(theme, items, &[], &open, &on_hover, &on_dismiss);
 
-    deferred(anchored().position(position).anchor(Corner::TopLeft).child(menu))
+    // Submenus need room for themselves and their descendants. When the click
+    // is close enough to the right edge that a chain of panels would overflow,
+    // open the menu and every submenu to the left instead. The reserve scales
+    // with the UI font but never eats more than half a narrow window.
+    let viewport_width = window.viewport_size().width;
+    let reserve = px((theme.font_size * 30.0).min(f32::from(viewport_width) * 0.5));
+    let open_left = position.x > viewport_width - reserve;
+    let anchor = if open_left { Corner::TopRight } else { Corner::TopLeft };
+
+    let menu = menu_panel(theme, items, &[], &open, open_left, &on_hover, &on_dismiss);
+
+    deferred(anchored().position(position).anchor(anchor).child(menu))
         .with_priority(100)
         .into_any_element()
 }

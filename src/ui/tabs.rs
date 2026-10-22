@@ -657,6 +657,7 @@ impl Render for TabsView {
             context_menu(
                 theme,
                 menu.position,
+                window,
                 items,
                 &self.menu_hover,
                 hover,
@@ -822,7 +823,7 @@ fn tab_button(
                     .rounded_sm()
                     .text_size(px(tab_px))
                     .text_color(theme.text_faint)
-                    .hover(|d| d.bg(theme.row_playing).text_color(theme.text))
+                    .hover(|d| d.opacity(0.5))
                     .on_click(on_close)
                     .child("×"),
             )

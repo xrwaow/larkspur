@@ -236,7 +236,7 @@ pub fn search_box(
                 .cursor_pointer()
                 .text_size(px(theme.small_px()))
                 .text_color(theme.text_faint)
-                .hover(|d| d.bg(theme.row_hover).text_color(theme.text))
+                .hover(|d| d.opacity(0.5))
                 .on_mouse_down(MouseButton::Left, move |event, window, cx| {
                     on_clear(event, window, cx)
                 })

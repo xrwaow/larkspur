@@ -616,7 +616,7 @@ fn font_menu(
     theme: Theme,
     menu: &FontMenu,
     current: FontKind,
-    _window: &Window,
+    window: &Window,
     cx: &mut Context<SettingsView>,
 ) -> AnyElement {
     let container = menu.container;
@@ -643,6 +643,7 @@ fn font_menu(
     context_menu(
         theme,
         menu.position,
+        window,
         items,
         &[],
         |_: &Option<Vec<usize>>, _: &mut Window, _: &mut App| {},
@@ -760,7 +761,7 @@ fn font_table_row(
                 .font_family(font.family())
                 .text_size(px(theme.small_px()))
                 .text_color(if font_overridden { theme.accent } else { theme.text })
-                .hover(|d| d.bg(theme.row_hover))
+                .hover(|d| d.opacity(0.5))
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
@@ -808,8 +809,8 @@ fn root_row(theme: Theme, index: usize, root: PathBuf, cx: &mut Context<Settings
         .into_any_element()
 }
 
-/// A bare glyph stepper button: no filled surface, just the mark and the rail's
-/// hover wash.
+/// A bare glyph stepper button: no filled surface, just the mark, dimmed on
+/// hover.
 fn step_button(
     theme: Theme,
     id: impl Into<gpui::ElementId>,
@@ -828,7 +829,7 @@ fn step_button(
         .when(enabled, |d| {
             d.cursor_pointer()
                 .text_color(theme.text)
-                .hover(|d| d.bg(theme.row_hover))
+                .hover(|d| d.opacity(0.5))
                 .on_click(on_click)
         })
         .when(!enabled, |d| d.text_color(theme.text_faint))
@@ -853,7 +854,7 @@ fn icon_button(
         .justify_center()
         .rounded_md()
         .cursor_pointer()
-        .hover(|d| d.bg(theme.row_hover))
+        .hover(|d| d.opacity(0.5))
         .on_click(on_click)
         .child(svg_icon(
             theme.small_px(),
@@ -864,7 +865,7 @@ fn icon_button(
         .into_any_element()
 }
 
-/// Flat action text (Add, Remove) — no filled pill, same hover as rail rows.
+/// Flat action text (Add, Remove) — no filled pill, dimmed on hover.
 fn action_button(
     theme: Theme,
     id: impl Into<gpui::ElementId>,
@@ -880,7 +881,7 @@ fn action_button(
         .cursor_pointer()
         .text_size(px(theme.small_px()))
         .text_color(theme.text)
-        .hover(|d| d.bg(theme.row_hover))
+        .hover(|d| d.opacity(0.5))
         .on_click(on_click)
         .child(label.to_string())
         .into_any_element()
