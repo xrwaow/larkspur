@@ -976,16 +976,35 @@ fn bayer8() -> [[f32; 8]; 8] {
     out
 }
 
+/// Bayer coordinate for pixel `i` along an axis of `n` pixels that will be
+/// tiled end to end.
+///
+/// The 8-pixel dither pattern does not divide `n` (the quilted canvas is 225px),
+/// so it has to restart at the seam. When `n % 8 == 1` the phase at the last
+/// pixel is the same as the phase at the first pixel of the next tile, which
+/// duplicates one dither line along every tile join — visible as a thin,
+/// suspiciously clean stripe. Nudge just that final line to the next phase so
+/// the wrap does not land on a repeated phase. Interior pixels are untouched.
+#[inline]
+fn bayer_coord(i: usize, n: usize) -> usize {
+    if n % 8 == 1 && i + 1 == n {
+        (i + 1) % 8
+    } else {
+        i % 8
+    }
+}
+
 fn posterize(v: &[f32], w: usize, levels: i32, bayer: &[[f32; 8]; 8]) -> Vec<f32> {
     if levels < 2 {
         return v.to_vec();
     }
+    let h = v.len() / w;
     (0..v.len())
         .map(|i| {
             let val = v[i];
             let y = i / w;
             let x = i % w;
-            let t = bayer[y % 8][x % 8];
+            let t = bayer[bayer_coord(y, h)][bayer_coord(x, w)];
             let q = (val * (levels - 1) as f32 + t).floor();
             q.clamp(0.0, (levels - 1) as f32) / (levels - 1) as f32
         })
@@ -1035,6 +1054,30 @@ mod tests {
         let a = render_raster(&img, 99, DynamicBase::Black).unwrap().1;
         let b = render_raster(&img, 99, DynamicBase::Black).unwrap().1;
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn the_seam_does_not_repeat_the_dither_line() {
+        let img = cover(180, 160);
+        let (size, out) = render_raster(&img, 5, DynamicBase::Black).unwrap();
+        let eq_cols = |x: usize| {
+            (0..size)
+                .filter(|&y| out[y * size + x] == out[y * size + (x + size - 1) % size])
+                .count()
+        };
+        let eq_rows = |y: usize| {
+            (0..size)
+                .filter(|&x| out[y * size + x] == out[((y + size - 1) % size) * size + x])
+                .count()
+        };
+        let seam = eq_cols(0) + eq_rows(0);
+        // The texture is seamless, so the join should dither like any other
+        // neighbouring line — not like a duplicated one.
+        let typical = (eq_cols(size / 2) + eq_rows(size / 2)) * 2;
+        assert!(
+            seam <= typical,
+            "seam repeats {seam} pixels but a typical line repeats {typical}"
+        );
     }
 
     #[test]
