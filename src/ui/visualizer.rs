@@ -32,18 +32,15 @@ use crate::ui::widgets;
 /// lyrics panel.
 pub const BAND_HEIGHT: f32 = 64.0;
 
-/// How many bars the strip draws — one per frequency band, bass on the left.
-/// The rail is 240 px wide, so this lands just under 3 px per bar — thin, like
-/// the classic spectrum displays.
-const BAR_COUNT: usize = BAND_COUNT;
-
 /// Exponential fall time constant, in seconds. A bar whose target dropped to
 /// zero falls ~63% of the way in this long — slow enough to read as decay,
 /// fast enough to keep up with the music.
 const FALL_SECS: f32 = 0.22;
 
 /// Below this height a bar counts as settled and stops asking for frames.
-const SETTLE: f32 = 0.001;
+/// Half a pixel of the 64 px band — below what the eye resolves, but high
+/// enough that a decaying tail stops in ~0.8 s instead of creeping for ~1.5 s.
+const SETTLE: f32 = 0.008;
 
 /// Auto-gain release time constant, in seconds: how slowly the reference peak
 /// decays once the music gets quieter. Long enough that the bars don't pump,
@@ -61,10 +58,14 @@ pub struct VisualizerView {
     /// Smoothed bar heights (0.0–1.0), bass on the left.
     bars: Vec<f32>,
     /// The real-time spectrum core, rebuilt if the track's sample rate changes.
-    analyzer: Option<SpectrumAnalyzer>,
+    analyzer: SpectrumAnalyzer,
     analyzer_rate: u32,
     /// Scratch for the tap's most recent samples, reused each frame.
     samples: Vec<f32>,
+    /// Last analyzed column and the tap sequence it came from: between audio
+    /// flushes a frame reuses it instead of re-transforming identical samples.
+    column: [f32; BAND_COUNT],
+    last_seq: u64,
     /// The running reference peak the bars are scaled against.
     gain_peak: f32,
     _observe_animator: Subscription,
@@ -107,10 +108,12 @@ impl VisualizerView {
             state,
             config: config.clone(),
             themed: Themed::new(&config, cx),
-            bars: vec![0.0; BAR_COUNT],
-            analyzer: None,
+            bars: vec![0.0; BAND_COUNT],
+            analyzer: SpectrumAnalyzer::new(44_100),
             analyzer_rate: 0,
             samples: Vec::with_capacity(FFT_SIZE),
+            column: [0.0; BAND_COUNT],
+            last_seq: u64::MAX,
             gain_peak: GAIN_FLOOR,
             _observe_animator: observe_animator,
             _observe_state: observe_state,
@@ -139,26 +142,29 @@ impl VisualizerView {
         // spectrogram: this is the whole difference from the old visualizer.
         let tap = self.state.read(cx).sample_tap();
         let rate = tap.sample_rate();
-        if self.analyzer.is_none() || self.analyzer_rate != rate {
-            self.analyzer = Some(SpectrumAnalyzer::new(rate));
+        if self.analyzer_rate != rate {
+            self.analyzer = SpectrumAnalyzer::new(rate);
             self.analyzer_rate = rate;
+            self.last_seq = u64::MAX;
         }
-        tap.copy_recent(&mut self.samples, FFT_SIZE);
-        let column = self
-            .analyzer
-            .as_mut()
-            .map(|analyzer| analyzer.bands(&self.samples));
+        // The tap flushes once per audio buffer (~11.6 ms), so most 144 fps
+        // frames carry no new samples; those just keep decaying the bars.
+        if let Some(seq) = tap.copy_recent_since(&mut self.samples, FFT_SIZE, self.last_seq) {
+            self.last_seq = seq;
+            self.column = self.analyzer.bands(&self.samples);
+        }
+        let column = self.column;
 
         // Auto-gain: track the loudest band, decaying slowly, so a quiet
         // passage still uses the height without the bars pumping.
-        let peak = column.map_or(0.0, |c| c.iter().copied().fold(0f32, f32::max));
+        let peak = column.iter().copied().fold(0f32, f32::max);
         let decay = (-dt / GAIN_RELEASE_SECS).exp();
         self.gain_peak = (self.gain_peak * decay).max(peak).max(GAIN_FLOOR);
         let inv = 1.0 / self.gain_peak;
 
         let mut moved = false;
         for (i, bar) in self.bars.iter_mut().enumerate() {
-            let target = column.map_or(0.0, |c| (c[i] * inv).sqrt().min(1.0));
+            let target = (column[i] * inv).sqrt().min(1.0);
             let next = fall_toward(*bar, target, dt);
             if (next - *bar).abs() > SETTLE {
                 moved = true;
@@ -205,12 +211,20 @@ impl Render for VisualizerView {
 /// Chase `target` from `current`: rise instantly, fall exponentially (so the
 /// decay is frame-rate independent). This asymmetry is the classic visualizer
 /// feel — bars snap up with the music and melt back down.
+///
+/// A fall that lands within [`SETTLE`] snaps to the target, so a decaying bar
+/// reaches rest instead of asymptotically creeping toward zero forever.
 fn fall_toward(current: f32, target: f32, dt: f32) -> f32 {
     if target >= current || dt <= 0.0 {
         return target;
     }
     let k = (-dt / FALL_SECS).exp();
-    target + (current - target) * k
+    let next = target + (current - target) * k;
+    if next - target <= SETTLE {
+        target
+    } else {
+        next
+    }
 }
 
 #[cfg(test)]
@@ -223,5 +237,7 @@ mod tests {
         let dropped = fall_toward(1.0, 0.0, FALL_SECS);
         assert!((dropped - 1.0f32 / std::f32::consts::E).abs() < 0.01, "{}", dropped);
         assert_eq!(fall_toward(0.5, 0.5, 1.0 / 60.0), 0.5, "at rest stays at rest");
+        // A near-settled fall lands exactly on the target instead of creeping.
+        assert_eq!(fall_toward(SETTLE * 0.5, 0.0, 1.0 / 60.0), 0.0);
     }
 }

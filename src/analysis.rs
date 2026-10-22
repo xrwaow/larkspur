@@ -34,9 +34,10 @@ const PEAK_WINDOW: usize = 512;
 /// beat.
 pub const FFT_SIZE: usize = 4096;
 
-/// Log-spaced frequency bands per spectrum frame, low → high. Also the
-/// visualizer's bar count: one bar per band, bass on the left.
-pub const BAND_COUNT: usize = 128;
+/// Log-spaced frequency bands per spectrum frame, low → high; also the
+/// visualizer's bar count. `paint_bars` needs 3 px per bar, so a 240 px rail
+/// only ever shows ~74 — more bands than that are merged away and wasted.
+pub const BAND_COUNT: usize = 64;
 
 /// The band edges span this range, geometrically spaced so the bass (where
 /// music lives on a linear scale) doesn't crush into the leftmost bars.
@@ -78,8 +79,13 @@ pub struct SpectrumAnalyzer {
     hann: Vec<f32>,
     /// Per band: the inclusive FFT-bin range it folds, low → high.
     bands: Vec<(usize, usize)>,
+    /// Even samples in the real part, odd in the imaginary; after the
+    /// transform, the low half of the spectrum.
     re: Vec<f32>,
     im: Vec<f32>,
+    /// `e^{-2πi t / FFT_SIZE}` for `t` in `0..FFT_SIZE / 2`: twiddles for the
+    /// half-size FFT, which the real-input split step also reads.
+    roots: Vec<(f32, f32)>,
 }
 
 impl SpectrumAnalyzer {
@@ -90,6 +96,8 @@ impl SpectrumAnalyzer {
                 0.5 * (1.0 - (std::f32::consts::TAU * i as f32 / (FFT_SIZE - 1) as f32).cos())
             })
             .collect();
+        let half = FFT_SIZE / 2;
+        let roots = roots(FFT_SIZE);
         // Geometric band edges from F_MIN to F_MAX (capped at Nyquist), mapped
         // to FFT bins. A band always covers at least one bin, and never runs
         // past the last one.
@@ -105,23 +113,36 @@ impl SpectrumAnalyzer {
                 (start, end)
             })
             .collect();
-        Self { hann, bands, re: vec![0.0; FFT_SIZE], im: vec![0.0; FFT_SIZE] }
+        Self {
+            hann,
+            bands,
+            re: vec![0.0; half],
+            im: vec![0.0; half],
+            roots,
+        }
     }
 
     /// Raw band magnitudes for `mono`, the most recent samples (newest last).
     /// A slice shorter than [`FFT_SIZE`] is zero-padded at the front, so the
     /// newest sample stays at the end of the window.
     pub fn bands(&mut self, mono: &[f32]) -> [f32; BAND_COUNT] {
+        // Pack the windowed samples straight into the complex buffer: even
+        // samples real, odd samples imaginary. That's a real-input signal in
+        // half the space, so the complex FFT runs at half the size.
         let take = mono.len().min(FFT_SIZE);
         let pad = FFT_SIZE - take;
-        for slot in &mut self.re[..pad] {
-            *slot = 0.0;
-        }
+        self.re.fill(0.0);
+        self.im.fill(0.0);
         for (i, &sample) in mono[mono.len() - take..].iter().enumerate() {
-            self.re[pad + i] = sample * self.hann[pad + i];
+            let t = pad + i;
+            let value = sample * self.hann[t];
+            if t & 1 == 0 {
+                self.re[t / 2] = value;
+            } else {
+                self.im[t / 2] = value;
+            }
         }
-        self.im.iter_mut().for_each(|v| *v = 0.0);
-        fft_in_place(&mut self.re, &mut self.im);
+        real_fft(&mut self.re, &mut self.im, &self.roots);
 
         let mut column = [0.0; BAND_COUNT];
         for (band, &(start, end)) in self.bands.iter().enumerate() {
@@ -359,8 +380,50 @@ impl PeakBuckets {
     }
 }
 
+/// `e^{-2πi t / n}` for `t` in `0..n / 2`.
+fn roots(n: usize) -> Vec<(f32, f32)> {
+    (0..n / 2)
+        .map(|t| {
+            let ang = -std::f32::consts::TAU * t as f32 / n as f32;
+            (ang.cos(), ang.sin())
+        })
+        .collect()
+}
+
+/// Turn a real signal of `2 * re.len()` samples, packed as (even, odd) complex
+/// pairs in `re`/`im`, into the low half of its spectrum, in place.
+///
+/// The upper half is conjugate-symmetric and the band fold never reads it, so a
+/// half-size complex FFT plus one split step is enough.
+fn real_fft(re: &mut [f32], im: &mut [f32], roots: &[(f32, f32)]) {
+    let m = re.len();
+    fft_in_place(re, im, roots);
+
+    // For k in 1..=m/2 the pair (Z[k], Z[m-k]) yields bins k and m-k; write
+    // them together, before either can be overwritten.
+    let (z0r, z0i) = (re[0], im[0]);
+    re[0] = z0r + z0i;
+    im[0] = 0.0;
+    for k in 1..=m / 2 {
+        let (ar, ai) = (re[k], im[k]);
+        let (br, bi) = (re[m - k], -im[m - k]);
+        // Ze = (a + conj(b))/2, Zo = (a - conj(b))/2i.
+        let (zer, zei) = (0.5 * (ar + br), 0.5 * (ai + bi));
+        let (zor, zoi) = (0.5 * (ai - bi), -0.5 * (ar - br));
+        // X[k] = Ze + W·Zo, X[m-k] = conj(Ze - W·Zo).
+        let (wr, wi) = roots[k];
+        let (qr, qi) = (wr * zor - wi * zoi, wr * zoi + wi * zor);
+        re[k] = zer + qr;
+        im[k] = zei + qi;
+        if k != m - k {
+            re[m - k] = zer - qr;
+            im[m - k] = -(zei - qi);
+        }
+    }
+}
+
 /// In-place iterative radix-2 Cooley–Tukey FFT, `n` a power of two.
-fn fft_in_place(re: &mut [f32], im: &mut [f32]) {
+fn fft_in_place(re: &mut [f32], im: &mut [f32], roots: &[(f32, f32)]) {
     let n = re.len();
     debug_assert_eq!(n, im.len());
     debug_assert!(n.is_power_of_two());
@@ -382,22 +445,20 @@ fn fft_in_place(re: &mut [f32], im: &mut [f32]) {
 
     let mut len = 2;
     while len <= n {
-        let ang = -std::f32::consts::TAU / len as f32;
-        let (step_re, step_im) = (ang.cos(), ang.sin());
+        let half = len / 2;
+        // W_len^k = e^{-2πik/len} = roots[2·k·n/len] (roots are over 2n).
+        let step = 2 * n / len;
         for start in (0..n).step_by(len) {
-            let (mut w_re, mut w_im) = (1.0f32, 0.0f32);
-            for k in 0..len / 2 {
+            for k in 0..half {
                 let a = start + k;
-                let b = a + len / 2;
+                let b = a + half;
+                let (w_re, w_im) = roots[k * step];
                 let t_re = re[b] * w_re - im[b] * w_im;
                 let t_im = re[b] * w_im + im[b] * w_re;
                 re[b] = re[a] - t_re;
                 im[b] = im[a] - t_im;
                 re[a] += t_re;
                 im[a] += t_im;
-                let next_re = w_re * step_re - w_im * step_im;
-                w_im = w_re * step_im + w_im * step_re;
-                w_re = next_re;
             }
         }
         len <<= 1;
@@ -409,20 +470,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fft_matches_the_naive_dft() {
-        // A small random signal, compared bin-by-bin against the O(n²) DFT.
+    fn real_fft_matches_the_naive_dft() {
+        // A small real signal, compared bin-by-bin against the O(n²) DFT.
         let n = 64;
-        let re: Vec<f32> = (0..n).map(|i| (i as f32 * 0.37).sin() + (i as f32 * 1.7).cos() * 0.3).collect();
-        let mut im = vec![0.0f32; n];
-        let mut spectrum = re.clone();
-        fft_in_place(&mut spectrum, &mut im);
-        for k in 0..n {
+        let m = n / 2;
+        let signal: Vec<f32> = (0..n)
+            .map(|i| (i as f32 * 0.37).sin() + (i as f32 * 1.7).cos() * 0.3)
+            .collect();
+        let mut re: Vec<f32> = (0..m).map(|k| signal[2 * k]).collect();
+        let mut im: Vec<f32> = (0..m).map(|k| signal[2 * k + 1]).collect();
+        let roots = roots(n);
+        real_fft(&mut re, &mut im, &roots);
+
+        for k in 0..m {
             let (expect_re, expect_im) = (0..n).fold((0.0f32, 0.0f32), |(er, ei), t| {
                 let ang = -std::f32::consts::TAU * t as f32 * k as f32 / n as f32;
-                (er + re[t] * ang.cos(), ei + re[t] * ang.sin())
+                (er + signal[t] * ang.cos(), ei + signal[t] * ang.sin())
             });
-            assert!((spectrum[k] - expect_re).abs() < 1e-3, "bin {k} real");
-            assert!((im[k] - expect_im).abs() < 1e-3, "bin {k} imag");
+            assert!((re[k] - expect_re).abs() < 2e-2, "bin {k} real");
+            assert!((im[k] - expect_im).abs() < 2e-2, "bin {k} imag");
         }
     }
 
@@ -447,12 +513,12 @@ mod tests {
         };
 
         let (low_band, low) = band_of(tone(100.0));
-        // 100 Hz sits in band ~18 of the 40 Hz–16 kHz geometric ladder.
-        assert!((17..=19).contains(&low_band), "100 Hz in band {low_band}");
+        // 100 Hz sits in band ~9 of the 64-band 40 Hz–16 kHz geometric ladder.
+        assert!((8..=10).contains(&low_band), "100 Hz in band {low_band}");
         assert!(low[40..].iter().all(|&v| v < 0.05 * low[low_band]), "no energy in the highs");
 
         let (high_band, high) = band_of(tone(8_000.0));
-        assert!((112..=114).contains(&high_band), "8 kHz in band {high_band}");
+        assert!((55..=57).contains(&high_band), "8 kHz in band {high_band}");
         assert!(high[..30].iter().all(|&v| v < 0.05 * high[high_band]), "the tone leaves the bass alone");
     }
 

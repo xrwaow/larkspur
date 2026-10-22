@@ -61,6 +61,9 @@ struct TapRing {
     /// Mono samples, oldest first, newest last.
     samples: VecDeque<f32>,
     sample_rate: u32,
+    /// Bumped whenever the tap's contents change, so the visualizer can skip a
+    /// transform when it lands between audio flushes.
+    seq: u64,
 }
 
 impl SampleTap {
@@ -69,6 +72,7 @@ impl SampleTap {
             inner: Mutex::new(TapRing {
                 samples: VecDeque::with_capacity(TAP_CAPACITY),
                 sample_rate: 44_100,
+                seq: 0,
             }),
         }
     }
@@ -78,14 +82,20 @@ impl SampleTap {
         self.inner.lock().unwrap().sample_rate
     }
 
-    /// Copy the most recent `n` mono samples (oldest first) into `out`, reusing
-    /// its allocation. Fewer if the tap hasn't filled yet.
-    pub fn copy_recent(&self, out: &mut Vec<f32>, n: usize) {
+    /// Copy the most recent `n` mono samples (oldest first) into `out`, but
+    /// only if the tap changed since `last`; returns the new sequence number,
+    /// or `None` when the samples are the ones `last` already saw. Check and
+    /// copy share one lock, so a flush can't slip between them.
+    pub fn copy_recent_since(&self, out: &mut Vec<f32>, n: usize, last: u64) -> Option<u64> {
         let ring = self.inner.lock().unwrap();
+        if ring.seq == last {
+            return None;
+        }
         let len = ring.samples.len();
         let take = n.min(len);
         out.clear();
         out.extend(ring.samples.iter().skip(len - take).copied());
+        Some(ring.seq)
     }
 
     fn configure(&self, sample_rate: u32) {
@@ -100,10 +110,13 @@ impl SampleTap {
             }
             ring.samples.push_back(sample);
         }
+        ring.seq = ring.seq.wrapping_add(1);
     }
 
     fn clear(&self) {
-        self.inner.lock().unwrap().samples.clear();
+        let mut ring = self.inner.lock().unwrap();
+        ring.samples.clear();
+        ring.seq = ring.seq.wrapping_add(1);
     }
 }
 
