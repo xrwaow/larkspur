@@ -137,7 +137,7 @@ fn main() {
                 cx.on_app_quit({
                     let library_state = library_state.clone();
                     move |cx| {
-                        library_state.update(cx, |state, _cx| state.save_stats());
+                        library_state.update(cx, |state, _cx| state.persist_stats());
                         async {}
                     }
                 })

@@ -110,12 +110,12 @@ impl PlaylistView {
                 .map(|p| p.song_ids.iter().copied().collect())
                 .unwrap_or_default();
             let (query, _) = search::parse(&self.add_query.value);
-            let mut results: Vec<(SongId, SharedString, SharedString)> = library.select_songs(&Selection { scope: Scope::Library, query: query.clone(), order: Order::AlbumTitle })
+            let scope = Scope::Library;
+            let mut results: Vec<(SongId, SharedString, SharedString)> = library.select(&Selection { scope: &scope, query: &query, order: Order::AlbumTitle })
                 .into_iter()
-                .filter(|id| !present.contains(id))
-                .filter_map(|id| {
-                    library.get(id).map(|song| (id, song.display_title().into_owned().into(), song.artists.join(", ").into()))
-                })
+                .flat_map(|group| group.songs)
+                .filter(|song| !present.contains(&song.id))
+                .map(|song| (song.id, song.display_title().into_owned().into(), song.artists.join(", ").into()))
                 .collect();
             results.truncate(ADD_LIST_CAP);
             results

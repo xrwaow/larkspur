@@ -241,7 +241,7 @@ impl PlaybackController {
         // An empty queue is valid: the app may launch with only a directory to
         // scan, and a track gets queued once the library is up.
         if let Some(entry) = this.queue.get(0) {
-            let parts = Self::track_parts(&entry.path)?;
+            let parts = Self::track_parts(entry.path())?;
             this.start_track(0, parts);
         }
         Ok(this)
@@ -255,7 +255,7 @@ impl PlaybackController {
     pub fn set_queue(&mut self, queue: Vec<QueueEntry>, start: usize) -> anyhow::Result<()> {
         anyhow::ensure!(!queue.is_empty(), "empty queue");
         let start = start.min(queue.len() - 1);
-        let parts = Self::track_parts(&queue[start].path)?;
+        let parts = Self::track_parts(queue[start].path())?;
         self.queue.replace(queue, start);
         self.start_track(start, parts);
         Ok(())
@@ -275,7 +275,7 @@ impl PlaybackController {
 
     fn load_track(&mut self, index: usize) -> anyhow::Result<()> {
         let entry = self.queue.get(index).expect("queue index checked by caller");
-        let parts = Self::track_parts(&entry.path)?;
+        let parts = Self::track_parts(entry.path())?;
         self.start_track(index, parts);
         Ok(())
     }
@@ -309,7 +309,7 @@ impl PlaybackController {
         if self.repeat == RepeatMode::Once {
             if let Some(i) = self.queue.current() {
                 if let Some(entry) = self.queue.get(i) {
-                    if let Ok(parts) = Self::track_parts(&entry.path) {
+                    if let Ok(parts) = Self::track_parts(entry.path()) {
                         self.repeat = RepeatMode::Off;
                         self.start_track(i, parts);
                         return true;
@@ -342,7 +342,7 @@ impl PlaybackController {
         if next >= self.queue.len() {
             return false;
         }
-        let path = self.queue.get(next).expect("index in range").path.clone();
+        let path = self.queue.get(next).expect("index in range").path().to_path_buf();
         match Self::track_parts(&path) {
             Ok(parts) => {
                 self.start_track(next, parts);
@@ -430,7 +430,7 @@ impl PlaybackController {
         anyhow::ensure!(!entries.is_empty(), "no tracks to queue");
         let first = self.queue.extend(entries);
         if self.queue.current().is_none() && self.player.empty() {
-            let path = self.queue.get(first).expect("just appended").path.clone();
+            let path = self.queue.get(first).expect("just appended").path().to_path_buf();
             let parts = Self::track_parts(&path)?;
             self.start_track(first, parts);
             return Ok(true);
@@ -452,7 +452,7 @@ impl PlaybackController {
             Removal::Unchanged | Removal::Shifted => false,
             Removal::Reload => {
                 let current = self.queue.current().expect("reload implies a slot");
-                let path = self.queue.get(current).expect("current in range").path.clone();
+                let path = self.queue.get(current).expect("current in range").path().to_path_buf();
                 match Self::track_parts(&path) {
                     Ok(parts) => self.start_track(current, parts),
                     Err(e) => {
@@ -496,7 +496,7 @@ impl PlaybackController {
     /// Path of the currently-loaded track, for the UI to load the waveform
     /// (and later, cover art) from without touching the decoder.
     pub fn current_path(&self) -> Option<&Path> {
-        self.queue.current_entry().map(|entry| entry.path.as_path())
+        self.queue.current_entry().map(|entry| entry.path())
     }
 
     /// The loaded track's [`SongId`], if any — the UI resolves its metadata
@@ -553,7 +553,7 @@ impl PlaybackController {
         if self.player.empty() {
             let Some(current) = self.queue.current() else { return };
             if let Err(e) = self.load_track(current) {
-                let path = self.queue.get(current).map(|e| e.path.clone());
+                let path = self.queue.get(current).map(|e| e.path().to_path_buf());
                 eprintln!("failed to reload {path:?} for seek: {e}");
                 return;
             }

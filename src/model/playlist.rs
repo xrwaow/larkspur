@@ -6,10 +6,18 @@
 //! derived from song tags and read-only, custom ones are user-owned and
 //! persisted.
 //!
+//! [`PlaylistStore`] separates the three lifetimes a playlist can have:
+//! persisted content (albums + custom playlists), ephemeral snapshots (the
+//! ad-hoc "play these songs" views), and the three built-in smart views. Only
+//! persisted content participates in indexing or persistence; the separation
+//! makes that a property of the store rather than a filter every caller has to
+//! remember.
+//!
 //! An *artist* is not a playlist — it's a list of playlists (their albums).
 //! Those groupings are derived on demand from [`Library`](super::library::Library)
 //! rather than stored, so there's exactly one song store to keep in sync.
 
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -20,37 +28,26 @@ use super::stats::{SongStats, Stats};
 
 /// Stable playlist identity.
 ///
-/// The id space is split so a derived playlist never aliases a user one:
-///
-/// - `0..2^62`: custom and temporary playlists, from a persisted monotonic
-///   counter. Deliberately not a title hash — two playlists may share a name.
-///   Never reused, so a deleted playlist's id can't resolve to a new one.
-/// - `2^63..2^63 + 2^62`: autogen albums, derived from a stable hash of their
-///   [`PlaylistOrigin`] (top bit set).
-/// - the top three `u64` values: the built-in smart playlists.
-///
-/// Albums are stable across rescans without an origin-matching pass, and the
-/// disjoint ranges mean a hash can never collide with a counter id.
+/// Persisted playlists (custom and album) allocate from a monotonic counter
+/// stored with the user data, so an id is never reused even after a delete.
+/// The three smart views use the top `u64` values, which no allocator can
+/// reach.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(transparent)]
 pub struct PlaylistId(pub u64);
 
 impl PlaylistId {
-    /// Top bit set: the autogen-album range.
-    pub(crate) const ALBUM_TAG: u64 = 1 << 63;
-    /// Mask for the stable album hash, keeping it below the tag bit.
-    const ALBUM_MASK: u64 = (1 << 62) - 1;
     /// Reserved ids for [`SmartKind::ALL`], counting down from `u64::MAX`.
-    const SMART_BASE: u64 = u64::MAX - (SmartKind::ALL.len() as u64 - 1);
+    pub(crate) const SMART_BASE: u64 = u64::MAX - (SmartKind::ALL.len() as u64 - 1);
 }
 
 /// Whether a playlist is derived from the library or owned by the user, plus
 /// the data only that variant carries.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum PlaylistKind {
-    /// Rebuilt from song tags on every rescan; read-only. The [`PlaylistOrigin`]
+    /// Rebuilt from song tags on every rescan; read-only. The [`AlbumOrigin`]
     /// is the natural key a rescan matches on, so a rebuilt album keeps its id.
-    Auto(PlaylistOrigin),
+    Auto(AlbumOrigin),
     /// User-owned: add/remove/rename/delete; persisted.
     Custom { title: String },
     /// Created on the fly (a multi-row selection played as one). Never
@@ -110,14 +107,18 @@ impl SmartKind {
         }
     }
 
+    fn slot(self) -> usize {
+        match self {
+            SmartKind::RecentlyAdded => 0,
+            SmartKind::RecentlyPlayed => 1,
+            SmartKind::MostPlayed => 2,
+        }
+    }
+
     /// The reserved id for this kind, so a rebuild never has to match by kind
     /// or allocate a counter value.
     pub fn id(self) -> PlaylistId {
-        let slot = SmartKind::ALL
-            .iter()
-            .position(|kind| *kind == self)
-            .unwrap_or(0) as u64;
-        PlaylistId(PlaylistId::SMART_BASE + slot)
+        PlaylistId(PlaylistId::SMART_BASE + self.slot() as u64)
     }
 
     /// Pick and order the songs this kind stands for, from the library's
@@ -131,8 +132,8 @@ impl SmartKind {
         stats: &Stats,
     ) -> Vec<SongId> {
         // Decorate each entry with its stats and display title once, so the
-        // sort comparators only read precomputed values (and a Cow makes the
-        // title borrow rather than allocate).
+        // comparators only read precomputed values (and a Cow makes the title
+        // borrow rather than allocate).
         let mut entries: Vec<(&'a SongMetadata, SongStats, std::borrow::Cow<'a, str>)> = songs
             .map(|song| (song, stats.get(song.id), song.display_title()))
             .filter(|(_, s, _)| match self {
@@ -142,66 +143,61 @@ impl SmartKind {
             })
             .collect();
 
-        // `Reverse` on an `Option` sorts the stamps descending and pushes
-        // `None` (never added/played) below every stamp — the stable place
-        // for "unknown". The tiebreak is title, then id.
-        match self {
-            SmartKind::MostPlayed => entries.sort_by(|(a, sa, ta), (b, sb, tb)| {
-                sb.plays.cmp(&sa.plays).then_with(|| ta.cmp(tb)).then(a.id.cmp(&b.id))
-            }),
-            SmartKind::RecentlyAdded => entries.sort_by(|(a, sa, ta), (b, sb, tb)| {
-                sb.added.cmp(&sa.added).then_with(|| ta.cmp(tb)).then(a.id.cmp(&b.id))
-            }),
-            SmartKind::RecentlyPlayed => entries.sort_by(|(a, sa, ta), (b, sb, tb)| {
-                sb.last_played
+        // `None` stamps sort below every stamp (the stable place for
+        // "unknown"); every ordering has the same title-then-id tiebreak so
+        // equal plays or equal stamps never reshuffle between rebuilds.
+        let compare = |(a, sa, ta): &(&SongMetadata, SongStats, std::borrow::Cow<'_, str>),
+                       (b, sb, tb): &(&SongMetadata, SongStats, std::borrow::Cow<'_, str>)| {
+            match self {
+                SmartKind::MostPlayed => sb
+                    .plays
+                    .cmp(&sa.plays)
+                    .then_with(|| ta.cmp(tb))
+                    .then(a.id.cmp(&b.id)),
+                SmartKind::RecentlyAdded => sb
+                    .added
+                    .cmp(&sa.added)
+                    .then_with(|| ta.cmp(tb))
+                    .then(a.id.cmp(&b.id)),
+                SmartKind::RecentlyPlayed => sb
+                    .last_played
                     .cmp(&sa.last_played)
                     .then_with(|| ta.cmp(tb))
-                    .then(a.id.cmp(&b.id))
-            }),
-        }
+                    .then(a.id.cmp(&b.id)),
+            }
+        };
 
-        entries.truncate(SMART_CAP);
+        // Only the best `SMART_CAP` are ever shown. Partition first so a
+        // 50k-song library costs O(n) plus a 100-entry sort per rebuild,
+        // rather than a full O(n log n) sort of every song.
+        if entries.len() > SMART_CAP {
+            entries.select_nth_unstable_by(SMART_CAP, |a, b| compare(a, b));
+            entries.truncate(SMART_CAP);
+        }
+        entries.sort_by(compare);
+
         entries.into_iter().map(|(song, _, _)| song.id).collect()
     }
 }
 
 /// The natural key an autogen playlist is matched by on rescan, so a rebuilt
 /// album keeps its [`PlaylistId`] instead of churning a new one each launch.
-#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-pub enum PlaylistOrigin {
-    /// One playlist per album tag. `artist` is part of the key so two albums
-    /// that share a title don't collide, and `dir` so two *releases* with the
-    /// same title and artist (e.g. an original and a re-release, each in its
-    /// own folder) stay separate instead of merging into one.
-    Album { name: String, artist: String, dir: PathBuf },
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct AlbumOrigin {
+    /// The album title.
+    pub name: String,
+    /// The album artist. Part of the key so two albums that share a title
+    /// don't collide.
+    pub artist: String,
+    /// The album's directory. Part of the key so two *releases* with the same
+    /// title and artist (an original and a re-release, each in its own folder)
+    /// stay separate instead of merging into one.
+    pub dir: PathBuf,
 }
 
-impl PlaylistOrigin {
-    /// A stable id for this origin, in the autogen-album range.
-    ///
-    /// The hash is FNV-1a over the fields, not `DefaultHasher`, so an album
-    /// keeps its id across runs and compiler upgrades. Two distinct origins
-    /// can in principle hash alike; the disjoint range only guarantees they
-    /// can't collide with custom or smart playlists.
-    pub fn id(&self) -> PlaylistId {
-        let mut hash = 0xcbf2_9ce4_8422_2325u64;
-        let mut write = |bytes: &[u8]| {
-            for &byte in bytes {
-                hash ^= u64::from(byte);
-                hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-            }
-        };
-        match self {
-            PlaylistOrigin::Album { name, artist, dir } => {
-                write(b"album\0");
-                write(name.as_bytes());
-                write(b"\0");
-                write(artist.as_bytes());
-                write(b"\0");
-                write(dir.as_os_str().as_encoded_bytes());
-            }
-        }
-        PlaylistId(PlaylistId::ALBUM_TAG | (hash & PlaylistId::ALBUM_MASK))
+impl AlbumOrigin {
+    pub fn new(name: impl Into<String>, artist: impl Into<String>, dir: PathBuf) -> Self {
+        Self { name: name.into(), artist: artist.into(), dir }
     }
 }
 
@@ -219,7 +215,7 @@ impl Playlist {
     /// fixed kind title, or a custom/temporary playlist's stored title.
     pub fn title(&self) -> &str {
         match &self.kind {
-            PlaylistKind::Auto(PlaylistOrigin::Album { name, .. }) => name,
+            PlaylistKind::Auto(origin) => &origin.name,
             PlaylistKind::Smart(kind) => kind.title(),
             PlaylistKind::Custom { title } | PlaylistKind::Temporary { title } => title,
         }
@@ -228,13 +224,13 @@ impl Playlist {
     /// The album artist, for an autogen album playlist.
     pub fn artist(&self) -> Option<&str> {
         match &self.kind {
-            PlaylistKind::Auto(PlaylistOrigin::Album { artist, .. }) => Some(artist),
+            PlaylistKind::Auto(origin) => Some(&origin.artist),
             _ => None,
         }
     }
 
     /// The natural key a rescan matches an autogen playlist on.
-    pub fn origin(&self) -> Option<&PlaylistOrigin> {
+    pub fn origin(&self) -> Option<&AlbumOrigin> {
         match &self.kind {
             PlaylistKind::Auto(origin) => Some(origin),
             _ => None,
@@ -271,6 +267,151 @@ impl Playlist {
 
     pub fn len(&self) -> usize {
         self.song_ids.len()
+    }
+}
+
+/// The three playlist lifetimes, held apart so indexing and persistence can
+/// never accidentally see the wrong one.
+pub struct PlaylistStore {
+    /// Autogen albums and user-owned playlists. The only content that is
+    /// indexed, listed in the rail, or saved.
+    persisted: HashMap<PlaylistId, Playlist>,
+    /// Ad-hoc snapshots. Reachable by id, but never indexed or persisted.
+    ephemeral: HashMap<PlaylistId, Playlist>,
+    /// The three built-in views, updated from [`Stats`].
+    smart: [Playlist; SmartKind::ALL.len()],
+    /// Stable album id per origin, persisted with the user data so an album
+    /// keeps its id across rescans and launches.
+    album_ids: BTreeMap<AlbumOrigin, PlaylistId>,
+    /// Monotonic allocator for persisted/ephemeral playlist ids.
+    next_id: u64,
+}
+
+impl Default for PlaylistStore {
+    fn default() -> Self {
+        let smart = SmartKind::ALL.map(|kind| Playlist {
+            id: kind.id(),
+            kind: PlaylistKind::Smart(kind),
+            song_ids: Vec::new(),
+        });
+        Self {
+            persisted: HashMap::new(),
+            ephemeral: HashMap::new(),
+            smart,
+            album_ids: BTreeMap::new(),
+            next_id: 0,
+        }
+    }
+}
+
+impl PlaylistStore {
+    pub fn next_id(&self) -> u64 {
+        self.next_id
+    }
+
+    pub fn album_ids(&self) -> &BTreeMap<AlbumOrigin, PlaylistId> {
+        &self.album_ids
+    }
+
+    pub fn set_album_ids(&mut self, album_ids: BTreeMap<AlbumOrigin, PlaylistId>) {
+        self.album_ids = album_ids;
+    }
+
+    pub fn load_persisted(
+        &mut self,
+        playlists: impl IntoIterator<Item = Playlist>,
+        next_id: u64,
+    ) {
+        self.persisted = playlists.into_iter().map(|playlist| (playlist.id, playlist)).collect();
+        self.next_id = next_id;
+    }
+
+    /// Every playlist by id — persisted, ephemeral, or smart.
+    pub fn get(&self, id: PlaylistId) -> Option<&Playlist> {
+        self.persisted
+            .get(&id)
+            .or_else(|| self.ephemeral.get(&id))
+            .or_else(|| self.smart.iter().find(|p| p.id == id))
+    }
+
+    pub fn get_persisted(&self, id: PlaylistId) -> Option<&Playlist> {
+        self.persisted.get(&id)
+    }
+
+    pub fn get_persisted_mut(&mut self, id: PlaylistId) -> Option<&mut Playlist> {
+        self.persisted.get_mut(&id)
+    }
+
+    /// Persisted playlists only: the content that is indexed and saved.
+    pub fn iter_persisted(&self) -> impl Iterator<Item = &Playlist> {
+        self.persisted.values()
+    }
+
+    pub fn insert_persisted(&mut self, playlist: Playlist) -> Option<Playlist> {
+        self.persisted.insert(playlist.id, playlist)
+    }
+
+    pub fn insert_ephemeral(&mut self, playlist: Playlist) -> Option<Playlist> {
+        self.ephemeral.insert(playlist.id, playlist)
+    }
+
+    pub fn remove(&mut self, id: PlaylistId) -> Option<Playlist> {
+        self.persisted.remove(&id).or_else(|| self.ephemeral.remove(&id))
+    }
+
+    pub fn drop_ephemeral(&mut self) {
+        self.ephemeral.clear();
+    }
+
+    pub fn custom_playlists(&self) -> Vec<&Playlist> {
+        let mut custom: Vec<&Playlist> =
+            self.persisted.values().filter(|p| p.is_custom()).collect();
+        custom.sort_by_key(|p| p.id.0);
+        custom
+    }
+
+    pub fn smart_playlists(&self) -> &[Playlist] {
+        &self.smart
+    }
+
+    pub fn smart_mut(&mut self, kind: SmartKind) -> &mut Playlist {
+        &mut self.smart[kind.slot()]
+    }
+
+    pub fn album_id(&self, origin: &AlbumOrigin) -> Option<PlaylistId> {
+        self.album_ids.get(origin).copied()
+    }
+
+    pub fn insert_album_id(&mut self, origin: AlbumOrigin, id: PlaylistId) -> Option<PlaylistId> {
+        self.album_ids.insert(origin, id)
+    }
+
+    pub fn remove_album_id(&mut self, origin: &AlbumOrigin) -> Option<PlaylistId> {
+        self.album_ids.remove(origin)
+    }
+
+    pub fn alloc_id(&mut self) -> PlaylistId {
+        let id = PlaylistId(self.next_id);
+        self.next_id += 1;
+        id
+    }
+
+    /// Remove song references that no longer resolve. Returns how many
+    /// references were dropped.
+    pub fn prune(&mut self, mut keep: impl FnMut(SongId) -> bool) -> usize {
+        let mut dropped = 0;
+        for playlist in self.persisted.values_mut().chain(self.ephemeral.values_mut()) {
+            let before = playlist.song_ids.len();
+            playlist.song_ids.retain(|id| keep(*id));
+            dropped += before - playlist.song_ids.len();
+        }
+        dropped
+    }
+
+    /// The user-owned playlists that are saved. Autogen albums are rebuilt
+    /// from tags and smart views from stats, so neither is persisted.
+    pub fn user_playlists(&self) -> Vec<Playlist> {
+        self.custom_playlists().into_iter().cloned().collect()
     }
 }
 
@@ -409,5 +550,28 @@ mod tests {
         assert_eq!(playlist.title(), "Most Played");
         assert!(!playlist.is_auto());
         assert!(!playlist.is_custom());
+    }
+
+    #[test]
+    fn store_keeps_the_three_lifetimes_apart() {
+        let mut store = PlaylistStore::default();
+        let id = store.alloc_id();
+        store.insert_persisted(Playlist {
+            id,
+            kind: PlaylistKind::Custom { title: "Faves".into() },
+            song_ids: vec![SongId(1)],
+        });
+        let temp = store.alloc_id();
+        store.insert_ephemeral(Playlist {
+            id: temp,
+            kind: PlaylistKind::Temporary { title: "Mix".into() },
+            song_ids: vec![SongId(1)],
+        });
+
+        assert_eq!(store.custom_playlists().len(), 1);
+        assert!(store.get(temp).is_some());
+        assert_eq!(store.user_playlists().len(), 1, "only the custom one is saved");
+        store.drop_ephemeral();
+        assert!(store.get(temp).is_none());
     }
 }

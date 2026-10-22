@@ -18,17 +18,16 @@
 //! selected belongs to the playlist tab showing it, since each tab keeps its
 //! own.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
 use std::time::SystemTime;
 
 use gpui::{Context, Entity, Subscription};
 
 use crate::model::search::Query;
 use crate::model::{
-    generate_song_id, shuffle, FolderMode, Library, LibraryCache, Order, PlaylistId, QueueEntry,
-    Scope, Selection, SongId, SongMetadata, Stats,
+    shuffle, FolderMode, Library, LibraryCache, Order, PlaylistId, QueueEntry, Scope, Selection,
+    SongId, UserStore,
 };
 use crate::ui::config_state::ConfigState;
 use crate::ui::menu::SongMenuRequest;
@@ -53,21 +52,16 @@ pub enum Request {
 
 pub struct LibraryState {
     library: Library,
-    /// Per-user song statistics (plays, added stamps). Kept beside
-    /// the library, not in it: it's user state with the playlists' lifetime,
-    /// not the scan's.
-    stats: Stats,
-    /// Taken out while a scan is in flight, restored when it completes.
+    /// The disposable, file-derived song cache. Taken out while a scan is in
+    /// flight; user writes go through [`UserStore`] and never touch it.
     cache: Option<LibraryCache>,
+    /// The user-owned files (playlists, stats, identities) beside the cache.
+    store: UserStore,
     /// The synced-path list, mirrored from the config so the scan and the
     /// cache-pruning agree on what's covered.
     roots: Vec<PathBuf>,
     /// The playlist whose tab is active, for the rail's highlight.
     selected: Option<PlaylistId>,
-    /// Bumped whenever the songs or playlists actually change, so views can
-    /// tell a real edit from a highlight-only notification and skip a needless
-    /// rebuild.
-    revision: u64,
     /// Cross-view intents a row raised (open a playlist/artist/folder, show a
     /// song menu). The tab container drains them.
     requests: VecDeque<Request>,
@@ -87,18 +81,19 @@ impl LibraryState {
         // a previous run left behind that no configured root covers.
         let mut cache = cache;
         cache.retain_roots(&roots);
+        let store = UserStore::open(cache.path());
         let mut library = Library::default();
-        cache.install(&mut library);
-        // Playlists live in their own file, so they're loaded separately.
-        let (playlists, next_playlist_id) = cache.load_playlists();
-        library.replace_playlists(playlists, next_playlist_id);
-        // Stats too — a sibling file with the same lifetime.
-        let mut stats = cache.load_stats();
-        stats.prune(|id| library.get(id).is_some());
-        // Smart playlists are views over the stats, so they exist as soon as
-        // the cached library does — the sidebar can list them before any
-        // scan finishes.
-        library.rebuild_smart(&stats);
+        // One batch: the cache install and the user-data load each refresh on
+        // their own — collapsed to a single rebuild at the close of the batch.
+        {
+            let mut batch = library.batch();
+            cache.install(&mut batch);
+            batch.install_identities(store.load_identities());
+            batch.install_user_data(store.load_user());
+            // Cached songs from a root no longer configured, or user
+            // references to songs the cache no longer holds.
+            batch.prune();
+        }
 
         let observe_config = cx.observe(&config, |this, config, cx| {
             let roots = config.read(cx).roots().to_vec();
@@ -107,11 +102,10 @@ impl LibraryState {
 
         let mut this = Self {
             library,
-            stats,
             cache: Some(cache),
+            store,
             roots,
             selected: None,
-            revision: 0,
             requests: VecDeque::new(),
             scanning: false,
             rescan_pending: false,
@@ -136,7 +130,7 @@ impl LibraryState {
     /// to their last-seen value, so a highlight-only notification (a tab
     /// switch) doesn't trigger a rebuild.
     pub fn revision(&self) -> u64 {
-        self.revision
+        self.library.revision()
     }
 
     pub fn is_scanning(&self) -> bool {
@@ -185,7 +179,6 @@ impl LibraryState {
     pub fn new_playlist(&mut self, cx: &mut Context<Self>) -> PlaylistId {
         let id = self.library.create_custom("New Playlist");
         self.selected = Some(id);
-        self.revision += 1;
         self.persist();
         cx.notify();
         id
@@ -193,7 +186,6 @@ impl LibraryState {
 
     pub fn add_song(&mut self, playlist: PlaylistId, song: SongId, cx: &mut Context<Self>) {
         if self.library.add_song(playlist, song) {
-            self.revision += 1;
             self.persist();
             cx.notify();
         }
@@ -202,7 +194,6 @@ impl LibraryState {
     /// Add several songs to a custom playlist at once (a bulk selection).
     pub fn add_songs(&mut self, playlist: PlaylistId, songs: Vec<SongId>, cx: &mut Context<Self>) {
         if self.library.add_songs(playlist, &songs) {
-            self.revision += 1;
             self.persist();
             cx.notify();
         }
@@ -210,7 +201,6 @@ impl LibraryState {
 
     pub fn remove_song(&mut self, playlist: PlaylistId, song: SongId, cx: &mut Context<Self>) {
         if self.library.remove_song(playlist, song) {
-            self.revision += 1;
             self.persist();
             cx.notify();
         }
@@ -224,7 +214,6 @@ impl LibraryState {
         cx: &mut Context<Self>,
     ) {
         if self.library.remove_songs(playlist, &songs) {
-            self.revision += 1;
             self.persist();
             cx.notify();
         }
@@ -237,7 +226,6 @@ impl LibraryState {
         self.library.add_songs(id, &songs);
         self.selected = Some(id);
         self.requests.push_back(Request::OpenPlaylist(id));
-        self.revision += 1;
         self.persist();
         cx.notify();
         id
@@ -259,7 +247,6 @@ impl LibraryState {
         let id = self.library.create_temporary(format!("{count} songs"), songs.clone());
         self.play(&songs, 0, playback, cx);
         self.requests.push_back(Request::OpenPlaylist(id));
-        self.revision += 1;
         cx.notify();
     }
 
@@ -275,9 +262,10 @@ impl LibraryState {
         playback: &Entity<PlaybackState>,
         cx: &mut Context<Self>,
     ) -> bool {
+        let scope = Scope::Folder { dir: dir.to_path_buf(), mode };
         let songs = self.library.select_songs(&Selection {
-            scope: Scope::Folder { dir: dir.to_path_buf(), mode },
-            query: Query::default(),
+            scope: &scope,
+            query: &Query::default(),
             order: Order::TrackOrder,
         });
         if songs.is_empty() {
@@ -289,7 +277,6 @@ impl LibraryState {
 
     pub fn rename_playlist(&mut self, playlist: PlaylistId, title: String, cx: &mut Context<Self>) {
         if self.library.rename(playlist, title) {
-            self.revision += 1;
             self.persist();
             cx.notify();
         }
@@ -297,7 +284,6 @@ impl LibraryState {
 
     pub fn delete_playlist(&mut self, playlist: PlaylistId, cx: &mut Context<Self>) {
         if self.library.remove_playlist(playlist).is_some() {
-            self.revision += 1;
             self.ensure_selection();
             self.persist();
             cx.notify();
@@ -308,17 +294,15 @@ impl LibraryState {
     /// stats. Called once per playback — the caller owns the 30-seconds-or-
     /// half-duration rule — never per tick.
     pub fn record_play(&mut self, song: SongId, cx: &mut Context<Self>) {
-        self.stats.record_play(song, SystemTime::now());
-        self.library.rebuild_smart(&self.stats);
-        self.revision += 1;
+        self.library.record_play(song, SystemTime::now());
         self.persist_stats();
         cx.notify();
     }
 
     /// Save the stats — also called on app exit, so a play counted in the
     /// last seconds still lands on disk.
-    pub fn save_stats(&mut self) {
-        self.persist_stats();
+    pub fn persist_stats(&mut self) {
+        self.persist();
     }
 
     /// Replace the play queue with a playlist's songs, starting at `start`.
@@ -347,25 +331,22 @@ impl LibraryState {
         cx: &mut Context<Self>,
     ) {
         let mut songs = self.library.select_songs(&Selection {
-            scope,
-            query: Query::default(),
+            scope: &scope,
+            query: &Query::default(),
             order: Order::TrackOrder,
         });
         shuffle(&mut songs);
         self.play(&songs, 0, playback, cx);
     }
 
-    /// Resolve song ids to queue entries (id + path). Ids the library no
-    /// longer holds (a moved or deleted file) are skipped rather than yielding
-    /// a dangling entry. This is the one id→path resolver for the controller.
+    /// Resolve song ids to queue entries (id + shared metadata). Ids the
+    /// library no longer holds (a moved or deleted file) are skipped rather
+    /// than yielding a dangling entry.
     pub fn queue_entries(&self, songs: &[SongId]) -> Vec<QueueEntry> {
         songs
             .iter()
             .filter_map(|id| {
-                self.library.get(*id).map(|song| QueueEntry {
-                    song: song.id,
-                    path: song.path.clone(),
-                })
+                self.library.get_arc(*id).map(|meta| QueueEntry { song: meta.id, meta })
             })
             .collect()
     }
@@ -418,18 +399,14 @@ impl LibraryState {
     /// metadata.
     fn ensure_songs(&mut self, paths: &[PathBuf]) -> Vec<QueueEntry> {
         let mut entries = Vec::new();
-        let mut missing = Vec::new();
         for path in paths {
-            let Ok(id) = generate_song_id(path) else { continue };
-            if self.library.get(id).is_none() {
-                if let Ok(song) = SongMetadata::load(path) {
-                    missing.push(song);
-                }
+            // `load_song` canonicalizes, reuses a known id, or allocates one
+            // and reads the tags. A file that can't be read is skipped.
+            let Ok(id) = self.library.load_song(path) else { continue };
+            if let Some(meta) = self.library.get_arc(id) {
+                entries.push(QueueEntry { song: id, meta });
             }
-            entries.push(QueueEntry { song: id, path: path.clone() });
         }
-        // One reindex for every file loaded, not one per file.
-        self.library.insert_songs(missing);
         entries
     }
 
@@ -460,24 +437,11 @@ impl LibraryState {
         }
     }
 
-    /// Apply a scan's song set in place, keeping the user's custom playlists
-    /// and playlist id counter — which the scan never touches, but which may
-    /// have been edited while it ran. Album playlists are rebuilt from the new
-    /// tags; ids stay disjoint from the custom ones because the counter is
-    /// never reset.
-    fn adopt_scanned(&mut self, songs: HashMap<SongId, Arc<SongMetadata>>) {
-        {
-            let mut batch = self.library.batch();
-            batch.replace_songs(songs);
-            // Custom playlists may reference songs the scan dropped (e.g. a
-            // removed root), so drop those references too. Temporary views are
-            // snapshots a rescan invalidates.
-            batch.prune();
-            batch.drop_temporary();
-            batch.rebuild_auto();
-        }
-        self.stats.prune(|id| self.library.get(id).is_some());
-        self.library.rebuild_smart(&self.stats);
+    /// Apply a scan's result in place, keeping the user's custom playlists,
+    /// stats, and playlist id counter — the scan never touches them, and
+    /// writes made while it ran are merged here, not overwritten.
+    fn adopt_scanned(&mut self, result: crate::model::ScanResult) {
+        self.library.adopt_scan(result.songs, result.identities, result.added);
     }
 
     fn rescan(&mut self, cx: &mut Context<Self>) {
@@ -487,32 +451,31 @@ impl LibraryState {
         };
         self.scanning = true;
         let roots = self.roots.clone();
-        let stats = self.stats.clone();
+        let identities = self.library.identities();
 
         cx.spawn(async move |this, cx| {
             let scanned = cx
                 .background_executor()
                 .spawn(async move {
                     let mut cache = cache;
-                    let mut stats = stats;
-                    let (songs, report) = cache.sync(&roots, false, &mut stats);
-                    (cache, songs, stats, report)
+                    let result = cache.sync(&roots, false, &identities);
+                    (cache, result)
                 })
                 .await;
 
             this.update(cx, |state, cx| {
-                let (cache, songs, stats, report) = scanned;
+                let (cache, result) = scanned;
                 state.cache = Some(cache);
-                state.stats = stats;
-                state.adopt_scanned(songs);
+                let report = result.report.clone();
+                state.adopt_scanned(result);
                 state.scanning = false;
-                state.revision += 1;
                 // The synced-path list may have changed while we were scanning.
                 if let Some(cache) = state.cache.as_mut() {
                     cache.retain_roots(&state.roots);
                 }
                 state.ensure_selection();
                 state.persist_songs();
+                state.persist_stats();
                 if !report.errors.is_empty() {
                     eprintln!("scan: {} file(s) could not be read", report.errors.len());
                 }
@@ -527,36 +490,25 @@ impl LibraryState {
         .detach();
     }
 
-    /// Persist the user-owned playlists — what a playlist edit writes. Small,
-    /// so it's fine on the UI thread; the song cache is written separately.
+    /// Persist the user-owned playlists and stats — what a playlist edit or a
+    /// counted play writes. Small, so it's fine on the UI thread; the song
+    /// cache and identities are written separately.
     fn persist(&mut self) {
-        // Field-split so the mutable cache and the immutable library don't
-        // borrow all of `self` at once.
-        let Self { cache, library, .. } = self;
-        if let Some(cache) = cache.as_ref() {
-            if let Err(e) = cache.save_playlists(library) {
-                eprintln!("failed to save playlists: {e}");
-            }
+        if let Err(e) = self.store.save_user(&self.library.user_data()) {
+            eprintln!("failed to save user data: {e}");
         }
     }
 
-    /// Persist the scanned song cache — written after a scan, not per edit.
+    /// Persist the scanned song cache and the path→id map — written after a
+    /// scan, not per edit.
     fn persist_songs(&mut self) {
         if let Some(cache) = self.cache.as_ref() {
             if let Err(e) = cache.save() {
                 eprintln!("failed to save library cache: {e}");
             }
         }
-    }
-
-    /// Persist the per-user song stats — written when a play is counted,
-    /// never per tick.
-    pub fn persist_stats(&mut self) {
-        let Self { cache, stats, .. } = self;
-        if let Some(cache) = cache.as_ref() {
-            if let Err(e) = cache.save_stats(stats) {
-                eprintln!("failed to save stats: {e}");
-            }
+        if let Err(e) = self.store.save_identities(&self.library.identities()) {
+            eprintln!("failed to save song identities: {e}");
         }
     }
 }

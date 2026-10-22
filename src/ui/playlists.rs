@@ -43,7 +43,7 @@ use crate::ui::cover_store::{CoverImage, CoverStore};
 use crate::ui::input::action_for_key;
 use crate::ui::library_state::{subdirs, LibraryState, Request};
 use crate::ui::animation::Animator;
-use crate::ui::menu::{context_menu, MenuHandler};
+use crate::ui::menu::{context_menu, MenuHandler, MenuItem};
 use crate::ui::marquee::{self, Marquee};
 use crate::ui::playback::{icon, svg_icon};
 use crate::ui::row_list::OVERDRAW_PX;
@@ -78,6 +78,9 @@ struct LabelBits {
 struct RailMenu {
     position: Point<Pixels>,
     target: MenuTarget,
+    /// The path of the submenu currently expanded (rail menus are flat for
+    /// now, so this stays empty; it keeps the menu API uniform).
+    hover: Vec<usize>,
 }
 
 /// What the open rail menu acts on.
@@ -692,6 +695,7 @@ impl PlaylistsView {
                             this.menu = Some(RailMenu {
                                 position: event.position,
                                 target: MenuTarget::Playlist(id),
+                                hover: Vec::new(),
                             });
                             cx.notify();
                         }),
@@ -808,6 +812,7 @@ impl PlaylistsView {
                                     here,
                                     sub,
                                 },
+                                hover: Vec::new(),
                             });
                             cx.notify();
                         }
@@ -1288,10 +1293,25 @@ impl Render for PlaylistsView {
 
         if let Some(menu) = &self.menu {
             let position = menu.position;
+            let hover_path = menu.hover.clone();
             let dismiss = cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
                 this.menu = None;
                 cx.notify();
             });
+            let hover = cx.listener(
+                |this: &mut PlaylistsView,
+                 path: &Option<Vec<usize>>,
+                 _window,
+                 cx: &mut Context<PlaylistsView>| {
+                    let path = path.clone().unwrap_or_default();
+                    if let Some(menu) = &mut this.menu {
+                        if menu.hover != path {
+                            menu.hover = path;
+                            cx.notify();
+                        }
+                    }
+                },
+            );
             match &menu.target {
                 MenuTarget::Playlist(playlist) => {
                     let playlist = *playlist;
@@ -1319,7 +1339,12 @@ impl Render for PlaylistsView {
                     root = root.child(context_menu(
                         theme,
                         position,
-                        vec![("Rename".to_string(), rename), ("Delete".to_string(), delete)],
+                        vec![
+                            MenuItem::action("Rename", rename),
+                            MenuItem::action("Delete", delete),
+                        ],
+                        &hover_path,
+                        hover,
                         dismiss,
                     ));
                 }
@@ -1354,14 +1379,21 @@ impl Render for PlaylistsView {
                             });
                         },
                     ));
-                    let mut items: Vec<(String, MenuHandler)> = Vec::new();
+                    let mut items: Vec<MenuItem> = Vec::new();
                     if sub {
-                        items.push(("Open full folder".to_string(), open_full));
+                        items.push(MenuItem::action("Open full folder", open_full));
                     }
                     if here {
-                        items.push(("Open folder".to_string(), open_here));
+                        items.push(MenuItem::action("Open folder", open_here));
                     }
-                    root = root.child(context_menu(theme, position, items, dismiss));
+                    root = root.child(context_menu(
+                        theme,
+                        position,
+                        items,
+                        &hover_path,
+                        hover,
+                        dismiss,
+                    ));
                 }
             }
         }

@@ -130,18 +130,48 @@ impl Side {
 
 // ---- entry points ---------------------------------------------------------
 
-/// Render a texture from the current track's embedded cover.
-///
-/// Returns `None` when the file has no readable art (or the art is too small
-/// to quilt), in which case the lyrics panel keeps its ordinary empty hint.
-pub fn load_for_song(path: &Path, base: DynamicBase) -> Option<Arc<RenderImage>> {
+/// The result of loading a song's cover texture.
+pub enum LoadedTexture {
+    /// The cover hashes to the seed the panel already has a texture for, so
+    /// the existing image still applies.
+    Unchanged,
+    /// A newly rendered texture, and the seed it was rendered from.
+    Rendered { seed: u64, image: Arc<RenderImage> },
+}
+
+/// The raw bytes of a song's first embedded picture.
+fn cover_bytes(path: &Path) -> Option<Vec<u8>> {
     let tagged = Probe::open(path).ok()?.guess_file_type().ok()?.read().ok()?;
     let tag = tagged.primary_tag().or_else(|| tagged.first_tag())?;
-    let picture = tag.pictures().first()?;
-    let bytes = picture.data();
+    Some(tag.pictures().first()?.data().to_vec())
+}
 
-    let seed = u64::from_le_bytes(Sha256::digest(bytes)[..8].try_into().ok()?);
-    let decoded = image::load_from_memory(bytes).ok()?;
+fn seed_for_bytes(bytes: &[u8]) -> u64 {
+    u64::from_le_bytes(
+        Sha256::digest(bytes)[..8]
+            .try_into()
+            .expect("sha256 digest is 32 bytes"),
+    )
+}
+
+/// Load a texture from a song's embedded cover.
+///
+/// `keep_seed` is the seed of the texture already on screen: when the cover
+/// hashes to it, no rendering is needed and [`LoadedTexture::Unchanged`] is
+/// returned. Returns `None` when the file has no readable art (or the art is
+/// too small to quilt), in which case the lyrics panel keeps its ordinary empty
+/// hint.
+pub fn load_for_song(
+    path: &Path,
+    base: DynamicBase,
+    keep_seed: Option<u64>,
+) -> Option<LoadedTexture> {
+    let bytes = cover_bytes(path)?;
+    let seed = seed_for_bytes(&bytes);
+    if Some(seed) == keep_seed {
+        return Some(LoadedTexture::Unchanged);
+    }
+    let decoded = image::load_from_memory(&bytes).ok()?;
     let decoded = if decoded.width() > MAX_SOURCE_EDGE || decoded.height() > MAX_SOURCE_EDGE {
         decoded.resize(MAX_SOURCE_EDGE, MAX_SOURCE_EDGE, imageops::FilterType::Lanczos3)
     } else {
@@ -156,7 +186,7 @@ pub fn load_for_song(path: &Path, base: DynamicBase) -> Option<Arc<RenderImage>>
     }
 
     let (size, out) = render_raster(&Image { w, h, px }, seed, base)?;
-    Some(to_render_image(size, &out))
+    Some(LoadedTexture::Rendered { seed, image: to_render_image(size, &out) })
 }
 
 /// The pure path: loaded RGB pixels in, square RGB pixels out.
@@ -991,6 +1021,12 @@ mod tests {
         let expected = (RENDER_SIZE / step) * step;
         assert_eq!(size, expected, "rounded down to a multiple of CHUNK_SIZE - OVERLAP");
         assert_eq!(out.len(), size * size);
+    }
+
+    #[test]
+    fn the_same_cover_bytes_give_the_same_seed() {
+        assert_eq!(seed_for_bytes(b"cover-a"), seed_for_bytes(b"cover-a"));
+        assert_ne!(seed_for_bytes(b"cover-a"), seed_for_bytes(b"cover-b"));
     }
 
     #[test]

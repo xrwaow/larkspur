@@ -10,30 +10,36 @@
 
 pub mod config;
 pub mod cover;
+pub mod format;
 pub mod identity;
 pub mod input;
 pub mod library;
 pub mod lyrics;
+pub mod persist;
 pub mod playlist;
 pub mod queue;
-pub mod persist;
 pub mod scan;
 pub mod search;
 pub mod select;
 pub mod song;
 pub mod stats;
+pub mod user;
 pub mod view;
 
 pub use config::{Config, DynamicBase, FontKind, TextureMode, ThemeKind, WindowPlacement};
 pub use cover::{CoverCache, DecodedImage};
-pub use identity::{generate_song_id, SongId};
+pub use format::{AudioFormat, FormatSet};
+pub use identity::SongId;
 pub use input::InputAction;
 pub use library::{shuffle, Library};
 pub use lyrics::{parse_lrc, LyricLine, Lyrics};
-pub use playlist::{Playlist, PlaylistId, PlaylistKind, PlaylistOrigin, SmartKind};
+pub use playlist::{
+    AlbumOrigin, Playlist, PlaylistId, PlaylistKind, PlaylistStore, SmartKind,
+};
 pub use queue::QueueEntry;
-pub use scan::{LibraryCache, SyncReport};
+pub use scan::{LibraryCache, ScanResult, SyncReport};
 pub use select::{Order, Scope, Selection};
-pub use song::{ReleaseDate, SongMetadata};
+pub use song::{ReleaseDate, SongFingerprint, SongMetadata};
 pub use stats::{SongStats, Stats};
+pub use user::{SongIdentities, UserData, UserStore};
 pub use view::{FolderMode, TabId};

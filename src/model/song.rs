@@ -7,7 +7,8 @@ use lofty::probe::Probe;
 use lofty::tag::{Accessor, ItemKey, Tag};
 use serde::{Deserialize, Serialize};
 
-use super::identity::{generate_song_id, song_id_for_canonical, SongId};
+use super::format::AudioFormat;
+use super::identity::SongId;
 use super::lyrics::{load_sidecar, looks_like_lrc, parse_lrc, Lyrics};
 
 /// A release date packed as `YYYYMMDD` (e.g. `20230501`), with zeros for
@@ -55,6 +56,10 @@ impl ReleaseDate {
 pub struct SongMetadata {
     pub id: SongId,
     pub path: PathBuf,
+    /// The container/codec family, parsed from the extension once at scan
+    /// time. Search and display use this instead of re-parsing the path.
+    #[serde(default)]
+    pub format: Option<AudioFormat>,
     pub song_name: Option<String>,
     pub artists: Vec<String>,
     pub album_name: Option<String>,
@@ -86,24 +91,19 @@ pub struct SongMetadata {
 }
 
 impl SongMetadata {
-    /// Read tags and properties for `path`.
+    /// Read tags and properties for `path` without assigning an identity.
     ///
     /// Succeeds for untagged files too — they're still playable songs, just
     /// without a title. An `Err` means the file couldn't be opened or isn't
     /// a container `lofty` understands, not merely "has no tags".
-    pub fn load(path: &Path) -> anyhow::Result<Self> {
-        let id = generate_song_id(path)?;
-        Self::load_with_id(path, id)
+    pub fn read(path: &Path) -> anyhow::Result<Self> {
+        Self::load(path, SongId::default())
     }
 
-    /// Like [`load`](Self::load), for a path the caller knows is already
-    /// canonical — the scanner's walk resolves symlinked directories, so it
-    /// skips a `canonicalize` syscall per file.
-    pub fn load_canonical(path: &Path) -> anyhow::Result<Self> {
-        Self::load_with_id(path, song_id_for_canonical(path))
-    }
-
-    fn load_with_id(path: &Path, id: SongId) -> anyhow::Result<Self> {
+    /// Read tags and properties for `path`, stamping `id` on the result. The
+    /// scanner owns id allocation; this keeps the read path free of identity
+    /// policy.
+    pub fn load(path: &Path, id: SongId) -> anyhow::Result<Self> {
         // Re-guess from the file's actual bytes: `Probe::open` guesses from
         // the extension, and `.ogg` files may hold Opus (lofty would then
         // fail with "Vorbis: File missing magic signature").
@@ -126,6 +126,7 @@ impl SongMetadata {
             return Ok(Self {
                 id,
                 path: path.to_path_buf(),
+                format: AudioFormat::from_path(path),
                 nominal_bitrate,
                 lyrics: sidecar.unwrap_or_default(),
                 duration,
@@ -162,6 +163,7 @@ impl SongMetadata {
         Ok(Self {
             id,
             path: path.to_path_buf(),
+            format: AudioFormat::from_path(path),
             song_name,
             artists,
             album_name,
@@ -217,6 +219,29 @@ impl SongMetadata {
         }
     }
 
+    /// The tag identity used to recognise a moved file. Two songs with the
+    /// same album artist, album, track position, title, and duration are the
+    /// same recording for reconciliation purposes.
+    pub fn fingerprint(&self) -> SongFingerprint {
+        SongFingerprint {
+            album_artist: self.album_artist().to_string(),
+            album: self.album().to_string(),
+            track_position: self.track_position,
+            title: self.display_title().into_owned(),
+            duration: self.duration,
+        }
+    }
+}
+
+/// A path-independent identity for reconciliation: what a moved file still
+/// has in common with its cached entry.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SongFingerprint {
+    pub album_artist: String,
+    pub album: String,
+    pub track_position: Option<u16>,
+    pub title: String,
+    pub duration: Duration,
 }
 
 /// The date a tag declares, packed — trying the three keys that carry one.

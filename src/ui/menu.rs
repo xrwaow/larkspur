@@ -4,12 +4,18 @@
 //! [`anchored`] box positioned at the click, drawn on top of the view via
 //! [`deferred`], and dismissed with `on_mouse_down_out`. The menu occludes the
 //! mouse so a click on an item can't also land on the row behind it.
+//!
+//! Menus are a tree: an [`MenuItem`] is either an action or a submenu. A
+//! submenu opens beside its parent row when the row is hovered, recursively,
+//! so long lists (artists, custom playlists, destinations) stay folded away
+//! until asked for.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use gpui::{
-    anchored, deferred, div, prelude::*, px, AnyElement, App, ClickEvent, Corner, Entity,
-    MouseDownEvent, Point, Pixels, Window,
+    anchored, deferred, div, prelude::*, px, AnyElement, App, ClickEvent, Corner, Div, ElementId,
+    Entity, MouseDownEvent, Pixels, Point, Window,
 };
 
 use crate::model::{FolderMode, PlaylistId, QueueEntry, SongId};
@@ -19,6 +25,23 @@ use crate::ui::theme::Theme;
 
 /// A menu item's click handler.
 pub type MenuHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static>;
+
+/// One row of a context menu: either a directly clickable action, or a
+/// submenu that opens on hover.
+pub enum MenuItem {
+    Action { label: String, on_click: MenuHandler },
+    Submenu { label: String, items: Vec<MenuItem> },
+}
+
+impl MenuItem {
+    pub fn action(label: impl Into<String>, on_click: MenuHandler) -> Self {
+        Self::Action { label: label.into(), on_click }
+    }
+
+    pub fn submenu(label: impl Into<String>, items: Vec<MenuItem>) -> Self {
+        Self::Submenu { label: label.into(), items }
+    }
+}
 
 /// Where a song menu was raised from. Each variant names exactly the actions
 /// that origin can offer, so impossible combinations (queue *and* playlist,
@@ -52,11 +75,11 @@ fn add_to_queue_item(
     library: &Entity<LibraryState>,
     playback: &Entity<PlaybackState>,
     song: SongId,
-) -> (String, MenuHandler) {
+) -> MenuItem {
     let library = library.clone();
     let playback = playback.clone();
-    (
-        "Add to Queue".to_string(),
+    MenuItem::action(
+        "Add to Queue",
         Box::new(move |_event, _window, cx| {
             let entries = library.read(cx).queue_entries(&[song]);
             if !entries.is_empty() {
@@ -68,12 +91,12 @@ fn add_to_queue_item(
 
 /// A preset menu item that raises a cross-view request on the library.
 fn request_item(
-    label: String,
+    label: impl Into<String>,
     library: &Entity<LibraryState>,
     request: Request,
-) -> (String, MenuHandler) {
+) -> MenuItem {
     let library = library.clone();
-    (
+    MenuItem::action(
         label,
         Box::new(move |_event, _window, cx| {
             library.update(cx, |state, cx| state.request(request.clone(), cx));
@@ -86,26 +109,180 @@ fn remove_from_playlist_item(
     library: &Entity<LibraryState>,
     playlist: PlaylistId,
     song: SongId,
-) -> (String, MenuHandler) {
+) -> MenuItem {
     let library = library.clone();
-    (
-        "Remove from playlist".to_string(),
+    MenuItem::action(
+        "Remove from playlist",
         Box::new(move |_event, _window, cx| {
             library.update(cx, |state, cx| state.remove_song(playlist, song, cx));
         }),
     )
 }
 
+/// One "add to this playlist" action for any number of songs.
+fn add_songs_item(
+    library: &Entity<LibraryState>,
+    playlist: PlaylistId,
+    label: impl Into<String>,
+    songs: &[SongId],
+) -> MenuItem {
+    let library = library.clone();
+    let songs = songs.to_vec();
+    MenuItem::action(
+        label,
+        Box::new(move |_event, _window, cx| {
+            library.update(cx, |state, cx| state.add_songs(playlist, songs.clone(), cx));
+        }),
+    )
+}
+
+/// "New playlist from these songs" — the tail of every add-to-playlist menu.
+fn new_playlist_item(
+    library: &Entity<LibraryState>,
+    songs: &[SongId],
+    single: bool,
+) -> MenuItem {
+    let library = library.clone();
+    let songs = songs.to_vec();
+    let label = if single {
+        "New playlist…".to_string()
+    } else {
+        format!("New playlist from {} songs", songs.len())
+    };
+    MenuItem::action(
+        label,
+        Box::new(move |_event, _window, cx| {
+            library.update(cx, |state, cx| state.new_playlist_from(songs.clone(), cx));
+        }),
+    )
+}
+
+/// The "Add to playlist" part of a song menu.
+///
+/// With one custom playlist the action is direct; with several they fold into
+/// an "Add to playlist" submenu. "New playlist" rides along, at the end of
+/// that submenu when there is one, so the bulk list stays tidy.
+fn add_to_playlist_menu(
+    library: &Entity<LibraryState>,
+    songs: &[SongId],
+    single: bool,
+    cx: &App,
+) -> Vec<MenuItem> {
+    let custom: Vec<(PlaylistId, String)> = library
+        .read(cx)
+        .library()
+        .custom_playlists()
+        .iter()
+        .map(|playlist| (playlist.id, playlist.title().to_string()))
+        .collect();
+
+    match custom.len() {
+        0 => vec![new_playlist_item(library, songs, single)],
+        1 => {
+            let (id, title) = custom.into_iter().next().expect("one playlist");
+            vec![
+                add_songs_item(library, id, format!("Add to {title}"), songs),
+                new_playlist_item(library, songs, single),
+            ]
+        }
+        _ => {
+            let mut children: Vec<MenuItem> = custom
+                .into_iter()
+                .map(|(id, title)| add_songs_item(library, id, title, songs))
+                .collect();
+            children.push(new_playlist_item(library, songs, single));
+            vec![MenuItem::submenu("Add to playlist", children)]
+        }
+    }
+}
+
+/// A destination reachable from a song menu. Kept as data so a lone
+/// destination can be shown directly while several fold under "Go to".
+enum GoTarget {
+    Artist(String),
+    Artists(Vec<String>),
+    Playlist(PlaylistId),
+    Folder(PathBuf),
+}
+
+/// Render one destination. At the menu root a lone target keeps its "Go to"
+/// wording; inside the "Go to" submenu the shorter name is enough.
+fn go_target_item(
+    target: GoTarget,
+    root: bool,
+    library: &Entity<LibraryState>,
+) -> MenuItem {
+    match target {
+        GoTarget::Artist(artist) => {
+            let label = if root { format!("Go to {artist}") } else { artist.clone() };
+            request_item(label, library, Request::ArtistView(artist))
+        }
+        GoTarget::Artists(artists) => {
+            let children = artists
+                .into_iter()
+                .map(|artist| {
+                    let label = artist.clone();
+                    request_item(label, library, Request::ArtistView(artist))
+                })
+                .collect();
+            MenuItem::submenu("Artists", children)
+        }
+        GoTarget::Playlist(id) => {
+            let label = if root { "Go to playlist" } else { "Playlist" };
+            request_item(label, library, Request::OpenPlaylist(id))
+        }
+        GoTarget::Folder(path) => {
+            let label = if root { "Go to folder" } else { "Folder" };
+            request_item(label, library, Request::FolderOpen(path, FolderMode::Here))
+        }
+    }
+}
+
+/// The "Go to" part of a song menu.
+///
+/// One destination is shown directly (so a song by one artist has a single
+/// "Go to {artist}" row); several fold under a "Go to" submenu, and several
+/// credited artists fold again under "Artists".
+fn go_to_menu(
+    library: &Entity<LibraryState>,
+    artists: Vec<String>,
+    album: Option<PlaylistId>,
+    folder: Option<PathBuf>,
+) -> Vec<MenuItem> {
+    let mut targets = Vec::new();
+    match artists.len() {
+        0 => {}
+        1 => targets.push(GoTarget::Artist(artists.into_iter().next().expect("one artist"))),
+        _ => targets.push(GoTarget::Artists(artists)),
+    }
+    if let Some(album) = album {
+        targets.push(GoTarget::Playlist(album));
+    }
+    if let Some(folder) = folder {
+        targets.push(GoTarget::Folder(folder));
+    }
+
+    match targets.len() {
+        0 => Vec::new(),
+        1 => vec![go_target_item(targets.pop().expect("one target"), true, library)],
+        _ => vec![MenuItem::submenu(
+            "Go to",
+            targets
+                .into_iter()
+                .map(|target| go_target_item(target, false, library))
+                .collect(),
+        )],
+    }
+}
+
 /// The items a song's context menu shows.
 ///
-/// For a single song: "Go to {artist}" for each credited artist, "Go to
-/// playlist" for its album, and (in a custom playlist) "Remove from playlist".
-/// For a multi-row selection: "Play", one "Add to {playlist}" per custom
-/// playlist, "New playlist from selection", and (in a custom playlist) "Remove
-/// from playlist". A menu raised from an icon-grid playlist card also offers
-/// "Go to {artist}" for every artist the playlist credits, "Go to playlist"
-/// for the card itself. A single song also offers "Go to folder" — the folder
-/// view of its own directory, no subfolders.
+/// For a single song: "Add to Queue", its "Add to playlist" and "Go to"
+/// destinations, and (in a custom playlist) "Remove from playlist". For a
+/// multi-row selection: "Play", "Add to queue", "Add to playlist", "New
+/// playlist", and "Remove from playlist" when the tab is a custom one. A menu
+/// raised from an icon-grid playlist card also offers the card's own "Go to"
+/// destinations and every artist the playlist credits.
 ///
 /// The cross-view actions go through [`LibraryState`] as requests — the tab
 /// container and the browse view pick them up — so a row in the browse view can
@@ -117,8 +294,8 @@ pub fn song_menu_items(
     songs: &[SongId],
     origin: &MenuOrigin,
     cx: &App,
-) -> Vec<(String, MenuHandler)> {
-    let mut items: Vec<(String, MenuHandler)> = Vec::new();
+) -> Vec<MenuItem> {
+    let mut items: Vec<MenuItem> = Vec::new();
     let context = match *origin {
         MenuOrigin::Row { playlist } => playlist,
         MenuOrigin::Queue | MenuOrigin::Card(_) => None,
@@ -154,28 +331,20 @@ pub fn song_menu_items(
             // reliable mapping.
             let playback = playback.clone();
             let selected = vec![song];
-            items.push((
-                "Remove from queue".to_string(),
+            items.push(MenuItem::action(
+                "Remove from queue",
                 Box::new(move |_event, _window, cx| {
                     remove_queued(&playback, &selected, cx);
                 }),
             ));
         }
 
-        if let Some(album) = album {
-            items.push(request_item("Go to playlist".into(), library, Request::OpenPlaylist(album)));
-        }
-
-        if let Some(folder) = folder {
-            items.push(request_item("Go to folder".into(), library, Request::FolderOpen(folder, FolderMode::Here)));
-        }
+        items.extend(add_to_playlist_menu(library, &[song], true, cx));
+        items.extend(go_to_menu(library, artists, album, folder));
 
         if let Some(playlist) = context.filter(|_| custom_context) {
             items.push(remove_from_playlist_item(library, playlist, song));
         }
-
-        // "Go to {artist}" closes the menu, after every other option.
-        items.extend(artists.into_iter().map(|artist| request_item(format!("Go to {artist}"), library, Request::ArtistView(artist))));
 
         return items;
     }
@@ -187,7 +356,7 @@ pub fn song_menu_items(
         let library = library.clone();
         let playback = playback.clone();
         let songs = songs.to_vec();
-        items.push((
+        items.push(MenuItem::action(
             format!("Play {count} songs"),
             Box::new(move |_event, _window, cx| {
                 // Plays the selection and opens it as a temporary playlist tab.
@@ -202,12 +371,10 @@ pub fn song_menu_items(
         let library = library.clone();
         let playback = playback.clone();
         let songs = songs.to_vec();
-        items.push((
+        items.push(MenuItem::action(
             format!("Add {count} songs to queue"),
             Box::new(move |_event, _window, cx| {
-                let entries: Vec<QueueEntry> = library
-                    .read(cx)
-                    .queue_entries(&songs);
+                let entries: Vec<QueueEntry> = library.read(cx).queue_entries(&songs);
                 playback.update(cx, |state, cx| state.add_to_queue(entries, cx));
             }),
         ));
@@ -216,7 +383,7 @@ pub fn song_menu_items(
     if queue {
         let playback = playback.clone();
         let songs = songs.to_vec();
-        items.push((
+        items.push(MenuItem::action(
             format!("Remove {count} songs from queue"),
             Box::new(move |_event, _window, cx| {
                 remove_queued(&playback, &songs, cx);
@@ -224,19 +391,17 @@ pub fn song_menu_items(
         ));
     }
 
-    // A menu raised from a playlist card: "Go to playlist" and "Go to
-    // folder" for the card — the folder its first song lives in; its artists
-    // are collected for the "Go to {artist}" items that close every menu.
-    let mut card_artists: Option<Vec<String>> = None;
+    // A menu raised from a playlist card: the card itself and the folder its
+    // first song lives in are extra "Go to" destinations, alongside every
+    // artist the playlist credits.
+    let mut artists: Vec<String> = Vec::new();
+    let mut folder = None;
+    let mut album = None;
     if let Some(card) = playlist_card {
-        let folder = songs
+        folder = songs
             .first()
             .and_then(|id| library.read(cx).library().get(*id))
             .and_then(|song| song.path.parent().map(Path::to_path_buf));
-        if let Some(folder) = folder {
-            items.push(request_item("Go to folder".into(), library, Request::FolderOpen(folder, FolderMode::Here)));
-        }
-        let mut artists: Vec<String> = Vec::new();
         for id in songs {
             let Some(song) = library.read(cx).library().get(*id) else { continue };
             for artist in &song.artists {
@@ -245,53 +410,21 @@ pub fn song_menu_items(
                 }
             }
         }
-        items.push(request_item("Go to playlist".into(), library, Request::OpenPlaylist(card)));
-        card_artists = Some(artists);
+        album = Some(card);
     }
+    items.extend(go_to_menu(library, artists, album, folder));
 
-    let custom: Vec<(PlaylistId, String)> = library
-        .read(cx)
-        .library()
-        .custom_playlists()
-        .iter()
-        .map(|playlist| (playlist.id, playlist.title().to_string()))
-        .collect();
-    for (id, title) in custom {
-        let library = library.clone();
-        let songs = songs.to_vec();
-        items.push((
-            format!("Add {count} songs to {title}"),
-            Box::new(move |_event, _window, cx| {
-                library.update(cx, |state, cx| state.add_songs(id, songs.clone(), cx));
-            }),
-        ));
-    }
-
-    {
-        let library = library.clone();
-        let songs = songs.to_vec();
-        items.push((
-            format!("New playlist from {count} songs"),
-            Box::new(move |_event, _window, cx| {
-                library.update(cx, |state, cx| state.new_playlist_from(songs.clone(), cx));
-            }),
-        ));
-    }
+    items.extend(add_to_playlist_menu(library, songs, false, cx));
 
     if let Some(playlist) = context.filter(|_| custom_context) {
         let library = library.clone();
         let songs = songs.to_vec();
-        items.push((
+        items.push(MenuItem::action(
             format!("Remove {count} songs from playlist"),
             Box::new(move |_event, _window, cx| {
                 library.update(cx, |state, cx| state.remove_songs(playlist, songs.clone(), cx));
             }),
         ));
-    }
-
-    // "Go to {artist}" closes the menu, whichever branch built it.
-    if let Some(artists) = card_artists {
-        items.extend(artists.into_iter().map(|artist| request_item(format!("Go to {artist}"), library, Request::ArtistView(artist))));
     }
 
     items
@@ -303,33 +436,111 @@ fn remove_queued(playback: &Entity<PlaybackState>, songs: &[SongId], cx: &mut gp
     playback.update(cx, |state, cx| state.remove_from_queue(songs.to_vec(), cx));
 }
 
-/// Build a context menu at `position` (window coordinates).
-///
-/// `on_dismiss` fires on a mouse-down outside the menu — the view should clear
-/// whatever state is showing it. The menu occludes the mouse, so a click on an
-/// item never also reaches the row behind it.
-pub fn context_menu(
+/// A stable id fragment for a nested menu path.
+fn path_key(path: &[usize]) -> String {
+    path.iter().map(|index| index.to_string()).collect::<Vec<_>>().join("-")
+}
+
+type HoverHandler = Rc<dyn Fn(&Option<Vec<usize>>, &mut Window, &mut App)>;
+type DismissHandler = Rc<dyn Fn(&MouseDownEvent, &mut Window, &mut App)>;
+
+/// Build one menu panel: a column of rows, with any open submenu attached to
+/// the right of its parent row. Recurses for nested submenus.
+fn menu_panel(
     theme: Theme,
-    position: Point<Pixels>,
-    items: Vec<(String, MenuHandler)>,
-    on_dismiss: impl Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
-) -> AnyElement {
-    let buttons = items.into_iter().enumerate().map(|(index, (label, on_click))| {
-        div()
-            .id(("context-menu-item", index))
-            .w_full()
-            .px_3()
-            .py_1()
-            .cursor_pointer()
-            .text_size(px(theme.cell_px()))
-            .text_color(theme.text)
-            .hover(|d| d.bg(theme.row_hover))
-            .on_click(on_click)
-            .child(label)
-            .into_any_element()
+    items: Vec<MenuItem>,
+    path: &[usize],
+    open: &[usize],
+    on_hover: &HoverHandler,
+    on_dismiss: &DismissHandler,
+) -> Div {
+    let prefix = path.to_vec();
+    let entries = items.into_iter().enumerate().map(|(index, item)| {
+        let mut item_path = prefix.clone();
+        item_path.push(index);
+        let id = ElementId::Name(
+            format!("context-menu-{}", path_key(&item_path)).into(),
+        );
+
+        match item {
+            MenuItem::Action { label, on_click } => {
+                let hover = on_hover.clone();
+                // Hovering a direct action closes any submenu opened from
+                // this panel, but leaves the panel itself open.
+                let parent_path = if prefix.is_empty() { None } else { Some(prefix.clone()) };
+                div()
+                    .id(id)
+                    .px_3()
+                    .py_1()
+                    .cursor_pointer()
+                    .text_size(px(theme.cell_px()))
+                    .text_color(theme.text)
+                    .hover(|d| d.bg(theme.row_hover))
+                    .on_hover(move |hovered, window, cx| {
+                        // Moving onto an action abandons any open submenu.
+                        if *hovered {
+                            hover(&parent_path, window, cx);
+                        }
+                    })
+                    .on_click(on_click)
+                    .child(label)
+                    .into_any_element()
+            }
+            MenuItem::Submenu { label, items } => {
+                let hover = on_hover.clone();
+                let sub_path = item_path.clone();
+                // A submenu stays open while any deeper submenu is open: the
+                // open path is the full chain, not just the leaf.
+                let is_open = open.starts_with(&item_path);
+                let row = div()
+                    .id(id)
+                    .relative()
+                    .px_3()
+                    .py_1()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_2()
+                    .cursor_pointer()
+                    .text_size(px(theme.cell_px()))
+                    .text_color(theme.text)
+                    .hover(|d| d.bg(theme.row_hover))
+                    .on_hover(move |hovered, window, cx| {
+                        if *hovered {
+                            hover(&Some(sub_path.clone()), window, cx);
+                        }
+                    })
+                    .child(label)
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_color(theme.text_faint)
+                            .child("›"),
+                    );
+
+                if is_open {
+                    row.child(
+                        menu_panel(theme, items, &item_path, open, on_hover, on_dismiss)
+                            .absolute()
+                            .left_full()
+                            // Cover the parent's right border instead of
+                            // drawing a second one beside it.
+                            .ml(px(-1.0))
+                            .top_0(),
+                    )
+                } else {
+                    row
+                }
+                .into_any_element()
+            }
+        }
     });
 
-    let menu = div()
+    // Keep the menu alive while the pointer is inside an open submenu: only
+    // the deepest open panel dismisses on an outside click.
+    let deeper = open.starts_with(&prefix) && open.len() > prefix.len();
+    let dismiss = on_dismiss.clone();
+    div()
         .flex()
         .flex_col()
         .min_w(px(theme.font_size * 9.0))
@@ -341,8 +552,35 @@ pub fn context_menu(
         // Block the mouse from the rows behind the menu: their hitboxes overlap
         // it, and without this a click on an item also plays the song under it.
         .occlude()
-        .on_mouse_down_out(on_dismiss)
-        .children(buttons);
+        .on_mouse_down_out(move |event, window, cx| {
+            if !deeper {
+                dismiss(event, window, cx);
+            }
+        })
+        .children(entries)
+}
+
+/// Build a context menu at `position` (window coordinates).
+///
+/// `open` is the path of the submenu currently expanded (empty for none);
+/// `on_hover` is called with the path the pointer moved onto, or `None` when
+/// it moves onto a directly clickable item. The view owning the menu stores
+/// that path and re-renders. `on_dismiss` fires on a mouse-down outside the
+/// menu — the view should clear whatever state is showing it. The menu
+/// occludes the mouse, so a click on an item never also reaches the row
+/// behind it.
+pub fn context_menu(
+    theme: Theme,
+    position: Point<Pixels>,
+    items: Vec<MenuItem>,
+    open: &[usize],
+    on_hover: impl Fn(&Option<Vec<usize>>, &mut Window, &mut App) + 'static,
+    on_dismiss: impl Fn(&MouseDownEvent, &mut Window, &mut gpui::App) + 'static,
+) -> AnyElement {
+    let on_hover: HoverHandler = Rc::new(on_hover);
+    let on_dismiss: DismissHandler = Rc::new(on_dismiss);
+    let open = open.to_vec();
+    let menu = menu_panel(theme, items, &[], &open, &on_hover, &on_dismiss);
 
     deferred(anchored().position(position).anchor(Corner::TopLeft).child(menu))
         .with_priority(100)

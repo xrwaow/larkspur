@@ -3,14 +3,15 @@
 //! These are deliberately **not** fields on
 //! [`SongMetadata`](super::song::SongMetadata): the metadata is rebuilt from
 //! the files on every scan and its cache is disposable, so user state stored
-//! there would be wiped by a rescan. Instead the stats persist to
-//! their own `stats.json`, a sibling of the playlists file, with the same
-//! lifetime: user-owned, surviving rescans and cache invalidations.
+//! there would be wiped by a rescan. Instead the stats persist through
+//! [`UserStore`](super::user::UserStore)'s `user.json`, beside the playlists
+//! and album ids, with the same lifetime: user-owned, surviving rescans and
+//! cache invalidations.
 //!
-//! LIMITATION: a [`SongId`] is a hash of the file's path (see
-//! [`identity`](super::identity)), so moving a file resets its stats — the
-//! same limitation playlists already have. Copying the file elsewhere also
-//! reads as a brand-new song.
+//! A [`SongId`] is an allocated identity, not a path hash, so stats survive a
+//! file move: the scanner reconciles a moved file by its metadata fingerprint
+//! and keeps the same id. Copying the file elsewhere still reads as a
+//! brand-new song.
 
 use std::collections::HashMap;
 use std::time::SystemTime;
@@ -21,7 +22,7 @@ use super::identity::SongId;
 
 /// One song's user-facing statistics.
 ///
-/// Every field defaults independently so a `stats.json` from an older shape
+/// Every field defaults independently so a `user.json` from an older shape
 /// (or a hand-edited one) still parses.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SongStats {
@@ -56,8 +57,8 @@ impl Stats {
         self.0.is_empty()
     }
 
-    pub fn contains(&self, id: SongId) -> bool {
-        self.0.contains_key(&id)
+    pub fn len(&self) -> usize {
+        self.0.len()
     }
 
     /// Count one play of `id` at `now`, stamping `last_played` too.
@@ -161,7 +162,5 @@ mod tests {
         stats.record_play(SongId(1), epoch());
         stats.record_play(SongId(2), epoch());
         assert_eq!(stats.prune(|id| lib.get(id).is_some()), 1);
-        assert!(stats.contains(SongId(1)));
-        assert!(!stats.contains(SongId(2)));
     }
 }

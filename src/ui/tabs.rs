@@ -22,7 +22,7 @@ use std::path::PathBuf;
 
 use gpui::{
     div, prelude::*, px, AnyElement, AnyView, App, ClickEvent, Context, Entity, FocusHandle,
-    KeyDownEvent, MouseDownEvent, Render, SharedString, Subscription, Window,
+    KeyDownEvent, MouseDownEvent, Render, SharedString, Subscription, WeakEntity, Window,
 };
 
 use crate::model::{FolderMode, InputAction, PlaylistId, SongId, TabId};
@@ -34,7 +34,7 @@ use crate::ui::cover_store::CoverStore;
 use crate::ui::format::format_bitrate;
 use crate::ui::input::action_for_key;
 use crate::ui::library_state::{LibraryState, Request};
-use crate::ui::menu::{context_menu, song_menu_items, MenuHandler, SongMenuRequest};
+use crate::ui::menu::{context_menu, song_menu_items, MenuItem, SongMenuRequest};
 use crate::ui::marquee::{self, Marquee};
 use crate::ui::playlist::PlaylistView;
 use crate::ui::search::SearchView;
@@ -73,6 +73,8 @@ pub struct TabsView {
     /// The open song context menu, if any. Rendered here, on top of every
     /// container, since rows anywhere can raise it.
     menu: Option<SongMenuRequest>,
+    /// The path of the submenu currently expanded in the song menu.
+    menu_hover: Vec<usize>,
     /// The window title last set, so the titlebar is only touched on change.
     last_title: String,
     /// The `(current song, ended)` pair the title was last derived from. A
@@ -162,6 +164,7 @@ impl TabsView {
             search_open: false,
             settings_open: false,
             menu: None,
+            menu_hover: Vec::new(),
             last_title: String::new(),
             title_key: None,
             marquees: HashMap::new(),
@@ -530,7 +533,10 @@ impl Render for TabsView {
                     Request::FolderOpen(dir, mode) => {
                         self.open_folder(dir, mode, window, cx);
                     }
-                    Request::SongMenu(request) => self.menu = Some(request),
+                    Request::SongMenu(request) => {
+                        self.menu = Some(request);
+                        self.menu_hover.clear();
+                    }
                 }
             }
         }
@@ -629,34 +635,34 @@ impl Render for TabsView {
         // shouldn't leave the menu hanging over what it just did.
         let menu_element = self.menu.clone().map(|menu| {
             let weak = cx.entity().downgrade();
-            let items: Vec<(String, MenuHandler)> =
+            let items = dismiss_on_click(
                 song_menu_items(
                     &self.library,
                     &self.playback,
                     &menu.songs,
                     &menu.origin,
                     cx,
-                )
-                    .into_iter()
-                    .map(|(label, handler)| {
-                        let weak = weak.clone();
-                        let wrapped: MenuHandler = Box::new(move |event, window, cx| {
-                            handler(event, window, cx);
-                            weak.update(cx, |this, cx| {
-                                this.menu = None;
-                                cx.notify();
-                            })
-                            .ok();
-                        });
-                        (label, wrapped)
-                    })
-                    .collect();
+                ),
+                &weak,
+            );
+            let hover = cx.listener(
+                |this: &mut TabsView, path: &Option<Vec<usize>>, _window, cx: &mut Context<TabsView>| {
+                    let path = path.clone().unwrap_or_default();
+                    if this.menu_hover != path {
+                        this.menu_hover = path;
+                        cx.notify();
+                    }
+                },
+            );
             context_menu(
                 theme,
                 menu.position,
                 items,
+                &self.menu_hover,
+                hover,
                 cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
                     this.menu = None;
+                    this.menu_hover.clear();
                     cx.notify();
                 }),
             )
@@ -822,4 +828,36 @@ fn tab_button(
             )
         })
         .into_any_element()
+}
+
+/// Wrap every action in a song menu so choosing it also closes the menu — the
+/// action (open a tab, remove from a playlist) shouldn't leave the menu hanging
+/// over what it just did. Submenus are wrapped recursively.
+fn dismiss_on_click(
+    items: Vec<MenuItem>,
+    view: &WeakEntity<TabsView>,
+) -> Vec<MenuItem> {
+    items
+        .into_iter()
+        .map(|item| match item {
+            MenuItem::Action { label, on_click } => {
+                let view = view.clone();
+                MenuItem::action(
+                    label,
+                    Box::new(move |event, window, cx| {
+                        on_click(event, window, cx);
+                        view.update(cx, |this, cx| {
+                            this.menu = None;
+                            this.menu_hover.clear();
+                            cx.notify();
+                        })
+                        .ok();
+                    }),
+                )
+            }
+            MenuItem::Submenu { label, items } => {
+                MenuItem::submenu(label, dismiss_on_click(items, view))
+            }
+        })
+        .collect()
 }

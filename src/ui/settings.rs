@@ -26,7 +26,7 @@ use crate::ui::browse::BrowseView;
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::lyrics::LyricsView;
-use crate::ui::menu::{context_menu, MenuHandler};
+use crate::ui::menu::{context_menu, MenuHandler, MenuItem};
 use crate::ui::playback::{svg_icon, PlaybackView};
 use crate::ui::playlists::PlaylistsView;
 use crate::ui::tabs::TabsView;
@@ -388,7 +388,7 @@ impl Render for SettingsView {
 
         if let Some(menu) = &self.font_menu {
             let current = self.config.read(cx).font_for(menu.container, FontKind::default());
-            root = root.child(font_menu(theme, menu, current, cx));
+            root = root.child(font_menu(theme, menu, current, window, cx));
         }
 
         root
@@ -593,10 +593,11 @@ fn font_menu(
     theme: Theme,
     menu: &FontMenu,
     current: FontKind,
+    _window: &Window,
     cx: &mut Context<SettingsView>,
 ) -> AnyElement {
     let container = menu.container;
-    let items: Vec<(String, MenuHandler)> = FontKind::ALL
+    let items: Vec<MenuItem> = FontKind::ALL
         .iter()
         .map(|kind| {
             let kind = *kind;
@@ -609,14 +610,21 @@ fn font_menu(
                 this.font_menu = None;
                 this.config.update(cx, |config, cx| config.set_font(container, Some(kind), cx));
             }));
-            (label, handler)
+            MenuItem::action(label, handler)
         })
         .collect();
     let dismiss = cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
         this.font_menu = None;
         cx.notify();
     });
-    context_menu(theme, menu.position, items, dismiss)
+    context_menu(
+        theme,
+        menu.position,
+        items,
+        &[],
+        |_: &Option<Vec<usize>>, _: &mut Window, _: &mut App| {},
+        dismiss,
+    )
 }
 
 /// One row of the font table: name on the left, then a bare stepper, a fixed

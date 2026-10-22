@@ -150,13 +150,13 @@ pub fn sections_from_groups(library: &Library, groups: Vec<SongGroup>) -> Vec<Al
 /// Snapshot one playlist — the playlist container's entry point.
 pub fn section_for_playlist(library: &Library, playlist: PlaylistId) -> Option<AlbumSection> {
     let playlist = library.playlist(playlist)?;
-    section(library, SongGroup { playlist: playlist.id, songs: playlist.song_ids.clone() })
+    let songs = playlist.song_ids.iter().filter_map(|id| library.get_arc(*id)).collect();
+    section(library, SongGroup { playlist: playlist.id, songs })
 }
 
 fn section(library: &Library, group: SongGroup) -> Option<AlbumSection> {
     let playlist = library.playlist(group.playlist)?;
-    let songs: Vec<Arc<SongMetadata>> =
-        group.songs.iter().filter_map(|id| library.get_arc(*id)).collect();
+    let songs = group.songs;
 
     // An album's row keeps the song's own track number (its position in the
     // album, falling back to the row order); a custom or smart playlist

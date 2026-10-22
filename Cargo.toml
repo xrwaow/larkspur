@@ -35,14 +35,11 @@ lru = "0.12"
 # pulling a second copy.
 image = "0.25"
 
-# Stable, fast hashing for song identity (NOT SipHash — see note in datatypes.rs)
-twox-hash = "1.6"
-
 # Seeds the procedural lyrics-panel texture from the cover bytes
 sha2 = "0.10"
 
 # Playlist / library persistence (JSON cache of scan roots + metadata)
-serde = { version = "1", features = ["derive"] }
+serde = { version = "1", features = ["derive", "rc"] }
 serde_json = "1"
 
 # Error handling

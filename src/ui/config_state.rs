@@ -94,7 +94,7 @@ impl ConfigState {
             // white, per the setting).
             ThemeKind::Dynamic => match self.dynamic_accent {
                 Some(accent) => Theme::dynamic(accent, self.config.dynamic_base, font, size),
-                None => Theme::for_kind(self.config.dynamic_base.into(), font, size),
+                None => Theme::for_kind(self.config.dynamic_base.fallback_theme(), font, size),
             },
             kind => Theme::for_kind(kind, font, size),
         }

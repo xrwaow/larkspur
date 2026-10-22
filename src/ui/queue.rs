@@ -25,9 +25,7 @@ use gpui::{
     MouseMoveEvent, MouseUpEvent, Render, Window,
 };
 
-use std::sync::Arc;
-
-use crate::model::{PlaylistId, QueueEntry, SongMetadata};
+use crate::model::{PlaylistId, QueueEntry};
 use crate::ui::album_list::{self, AlbumList, AlbumListSubs, AlbumListView, Play};
 use crate::ui::albums::{AlbumSection, RowActions, RowLayout, SectionSource, TrackRow};
 use crate::ui::animation::Animator;
@@ -52,7 +50,6 @@ const ROW_GAPS_PX: f32 = 36.0;
 
 pub struct QueueView {
     playback: Entity<PlaybackState>,
-    library: Entity<LibraryState>,
     themed: Themed,
     /// The shared table shell — rows, selection, marquees, virtualized list.
     list: AlbumListView,
@@ -120,7 +117,6 @@ impl QueueView {
         let themed = BrowseView::themed(&config, cx);
         Self {
             playback,
-            library,
             themed,
             list,
             queue_entries: Vec::new(),
@@ -137,30 +133,14 @@ impl QueueView {
     /// The queue as one drawable section: every path a track row, numbered by
     /// queue position. The source is [`SectionSource::Queue`], so the row
     /// actions play from the queue index rather than a playlist.
-    fn queue_section(&self, queue: &[QueueEntry], cx: &App) -> AlbumSection {
-        let library = self.library.read(cx).library();
+    fn queue_section(&self, queue: &[QueueEntry], _cx: &App) -> AlbumSection {
         let tracks = queue
             .iter()
             .enumerate()
-            .map(|(index, entry)| {
-                let id = entry.song;
-                let meta = library.get_arc(id).unwrap_or_else(|| {
-                    // A command-line file isn't in the library yet: synthesize
-                    // minimal metadata so the row still shows a filename.
-                    let path = entry.path.clone();
-                    Arc::new(SongMetadata {
-                        id,
-                        song_name: Some(
-                            path.file_stem()
-                                .unwrap_or(path.as_os_str())
-                                .to_string_lossy()
-                                .into_owned(),
-                        ),
-                        path,
-                        ..Default::default()
-                    })
-                });
-                TrackRow { song: id, number: index + 1, meta }
+            .map(|(index, entry)| TrackRow {
+                song: entry.song,
+                number: index + 1,
+                meta: entry.meta.clone(),
             })
             .collect();
         AlbumSection {
@@ -438,15 +418,11 @@ impl Render for QueueView {
         // `top` is in window coordinates; the panel spans the tabs container,
         // whose top is the window's, so they coincide.
         if let Some(info) = drag_info {
-            let library = self.library.read(cx).library();
             let (title, artist) = match self.queue_entries.get(info.grabbed) {
-                Some(entry) => match library.get(entry.song) {
-                    Some(song) => (song.display_title().into_owned(), song.artists.join(", ")),
-                    None => (
-                        entry.path.file_stem().unwrap_or(entry.path.as_os_str()).to_string_lossy().into_owned(),
-                        "Unknown Artist".to_string(),
-                    ),
-                },
+                Some(entry) => (
+                    entry.meta.display_title().into_owned(),
+                    entry.meta.artists.join(", "),
+                ),
                 None => (String::new(), String::new()),
             };
             let columns = self.list.rows().columns();

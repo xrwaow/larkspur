@@ -1,44 +1,81 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::hash::{BuildHasher, Hasher};
-use std::ops::{Deref, DerefMut};
-use std::path::PathBuf;
+use std::ops::{BitOr, BitOrAssign, Deref, DerefMut};
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::SystemTime;
 
 use super::identity::SongId;
-use super::playlist::{Playlist, PlaylistId, PlaylistKind, PlaylistOrigin, SmartKind};
+use super::playlist::{
+    AlbumOrigin, Playlist, PlaylistId, PlaylistKind, PlaylistStore, SmartKind,
+};
 use super::song::{ReleaseDate, SongMetadata};
 use super::stats::Stats;
+use super::user::{SongIdentities, UserData};
+
+/// Which derived view a mutation invalidated.
+///
+/// This replaces a single global reindex: a playlist edit no longer rebuilds
+/// the song-artist set, and a song insert no longer re-sorts the playlist
+/// directory. Batches OR the flags and refresh once at the outermost close.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+struct Dirty(u8);
+
+impl Dirty {
+    const SONGS: Self = Self(1 << 0);
+    const PLAYLISTS: Self = Self(1 << 1);
+
+    fn is_empty(self) -> bool {
+        self.0 == 0
+    }
+
+    fn contains(self, other: Self) -> bool {
+        self.0 & other.0 == other.0
+    }
+
+    fn intersects(self, other: Self) -> bool {
+        self.0 & other.0 != 0
+    }
+}
+
+impl BitOr for Dirty {
+    type Output = Self;
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
+impl BitOrAssign for Dirty {
+    fn bitor_assign(&mut self, rhs: Self) {
+        self.0 |= rhs.0;
+    }
+}
 
 /// The single source of truth for static library state.
 ///
-/// Holds every song and every playlist. Playlists reference songs by
-/// [`SongId`] rather than owning `SongMetadata` copies — a tag edit happens
-/// once and every playlist that references the song sees it. Autogen album
-/// playlists and custom playlists share one [`Playlist`] schema; the
-/// per-artist groupings ("discography", "artist appears in") are derived on
-/// demand, so there's no second copy of the library to drift.
-///
-/// Alongside the songs and playlists it keeps a small derived [`Index`],
-/// rebuilt by [`reindex`](Self::reindex) whenever either changes, so the hot
-/// queries (`album_playlist_of`, `discography`, `release`) are lookups
-/// rather than scans. The fields are private so that index can't be bypassed:
-/// every mutation goes through a method that keeps it fresh.
+/// Holds every song, every playlist, the user's stats, and the persistent
+/// path→song-id map. Everything else — artist groupings, album ownership,
+/// release dates, the sorted playlist directory, smart views — is derived and
+/// refreshed only when the mutation says which domain changed.
 #[derive(Default)]
 pub struct Library {
     songs: HashMap<SongId, Arc<SongMetadata>>,
-    playlists: HashMap<PlaylistId, Playlist>,
-    /// Monotonic allocator for [`PlaylistId`]s. Persisted with the library so
-    /// ids are never reused across launches.
-    next_playlist_id: u64,
-    /// Derived lookups, rebuilt on mutation.
+    playlists: PlaylistStore,
+    stats: Stats,
+    /// Persistent path→id map. Used by the scanner to keep an id when a file
+    /// moves, and by command-line playback to resolve a path.
+    song_ids: BTreeMap<PathBuf, SongId>,
+    next_song_id: u64,
+    /// Derived lookups, refreshed by [`touch`](Self::touch).
     index: Index,
-    /// Nesting depth of an open [`LibraryBatch`]. While non-zero, `reindex`
-    /// only marks the index dirty instead of rebuilding it per mutation.
+    /// Bumped on every content change. Views compare it to skip needless
+    /// rebuilds; it is owned here so no mutation path can forget it.
+    revision: u64,
+    /// Nesting depth of an open [`LibraryBatch`].
     batch_depth: u32,
-    /// Set when a mutation happened inside a batch, so closing the batch knows
-    /// a rebuild is needed.
-    reindex_dirty: bool,
-    /// Test-only counter: how many times the index was actually rebuilt.
+    /// Domains invalidated inside a batch, refreshed once when it closes.
+    pending_dirty: Dirty,
+    /// Test-only counter: how many times the derived index was refreshed.
     #[cfg(test)]
     reindex_count: usize,
 }
@@ -46,8 +83,7 @@ pub struct Library {
 /// The derived lookups a [`Library`] answers from instead of rescanning.
 #[derive(Default)]
 struct Index {
-    /// Every artist credited on any song — `BTreeSet` so `artists()` comes out
-    /// sorted and deduped without a second pass.
+    /// Every artist credited on any song — sorted and deduped.
     artists: BTreeSet<String>,
     /// The album playlist each song belongs to.
     song_album: HashMap<SongId, PlaylistId>,
@@ -56,30 +92,24 @@ struct Index {
     /// Each playlist's release stamp: the first date any of its songs
     /// declares. Absent for an undated playlist.
     playlist_release: HashMap<PlaylistId, ReleaseDate>,
-    /// Library playlists in stable order: autogen albums by title, then custom
-    /// playlists by title/id.
+    /// Persisted playlists in stable order: autogen albums by title, then
+    /// custom playlists by title/id.
     sorted_playlists: Vec<PlaylistId>,
     /// Custom playlists in creation order — the "add to playlist" picker.
     custom_playlists: Vec<PlaylistId>,
-    /// The smart playlist for each [`SmartKind::ALL`] slot, resolved once.
-    smart_by_kind: [Option<PlaylistId>; SmartKind::ALL.len()],
 }
 
 impl Library {
     // --- bulk replacement ----------------------------------------------
 
     /// Open a batch: mutations made through the returned guard suppress the
-    /// per-mutation reindex, and closing it (on drop) rebuilds the index once.
-    ///
-    /// The guard derefs to the [`Library`], so existing mutation methods can
-    /// be called unchanged; nesting batches collapses to a single rebuild at
-    /// the outermost close.
+    /// per-mutation refresh, and closing it (on drop) refreshes once.
     pub fn batch(&mut self) -> LibraryBatch<'_> {
         self.batch_depth += 1;
         LibraryBatch { lib: self }
     }
 
-    /// Insert many songs, re-indexing once instead of once per song.
+    /// Insert many songs, refreshing once instead of once per song.
     pub fn insert_songs(&mut self, songs: impl IntoIterator<Item = SongMetadata>) {
         let mut batch = self.batch();
         for song in songs {
@@ -87,34 +117,75 @@ impl Library {
         }
     }
 
-    /// Replace every song, re-deriving the index. The cache's bulk path.
+    /// Replace every song. The cache's bulk path; identities are installed
+    /// separately with [`install_identities`](Self::install_identities).
     pub fn replace_songs(&mut self, songs: HashMap<SongId, Arc<SongMetadata>>) {
         self.songs = songs;
-        self.reindex();
+        self.touch(Dirty::SONGS);
     }
 
-    /// Replace every playlist and the id counter, re-deriving the index.
-    pub fn replace_playlists(
-        &mut self,
-        playlists: HashMap<PlaylistId, Playlist>,
-        next_playlist_id: u64,
-    ) {
-        self.playlists = playlists;
-        self.next_playlist_id = next_playlist_id;
-        self.reindex();
+    /// Install user-owned content: custom playlists, stats, and album ids.
+    pub fn install_user_data(&mut self, user: UserData) {
+        let UserData { playlists, next_playlist_id, album_ids, stats } = user;
+        self.playlists.load_persisted(playlists, next_playlist_id);
+        self.playlists.set_album_ids(album_ids.into_iter().collect());
+        self.stats = stats;
+        self.touch(Dirty::PLAYLISTS);
+        self.rebuild_smart();
     }
 
-    /// The persisted id counter, so the cache can round-trip it.
-    pub fn next_playlist_id(&self) -> u64 {
-        self.next_playlist_id
+    /// Install the persistent path→song-id map and allocator.
+    pub fn install_identities(&mut self, identities: SongIdentities) {
+        self.song_ids = identities.paths;
+        self.next_song_id = identities.next_id;
+    }
+
+    pub fn identities(&self) -> SongIdentities {
+        SongIdentities { paths: self.song_ids.clone(), next_id: self.next_song_id }
+    }
+
+    /// The persisted user-owned content, ready for `UserStore::save_user`.
+    pub fn user_data(&self) -> UserData {
+        UserData {
+            playlists: self.playlists.user_playlists(),
+            next_playlist_id: self.playlists.next_id(),
+            album_ids: self.playlists.album_ids().iter().map(|(k, v)| (k.clone(), *v)).collect(),
+            stats: self.stats.clone(),
+        }
+    }
+
+    pub fn revision(&self) -> u64 {
+        self.revision
     }
 
     // --- songs ---------------------------------------------------------
 
     pub fn insert_song(&mut self, song: SongMetadata) -> SongId {
         let id = song.id;
+        self.song_ids.insert(song.path.clone(), id);
         self.songs.insert(id, Arc::new(song));
-        self.reindex();
+        self.touch(Dirty::SONGS);
+        id
+    }
+
+    /// Read `path` (canonicalized) into the library, allocating an id when the
+    /// path has none. This is the command-line playback entry point.
+    pub fn load_song(&mut self, path: &Path) -> anyhow::Result<SongId> {
+        let path = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
+        if let Some(id) = self.song_ids.get(&path).copied() {
+            if self.songs.contains_key(&id) {
+                return Ok(id);
+            }
+        }
+        let id = self.alloc_song_id();
+        let song = SongMetadata::load(&path, id)?;
+        self.insert_song(song);
+        Ok(id)
+    }
+
+    fn alloc_song_id(&mut self) -> SongId {
+        let id = SongId(self.next_song_id);
+        self.next_song_id += 1;
         id
     }
 
@@ -137,25 +208,40 @@ impl Library {
         self.songs.len()
     }
 
+    /// Count one play and refresh only the stats-derived views it affects.
+    /// `RecentlyAdded` depends on the song set, not play counts, so a play
+    /// never re-sorts it.
+    pub fn record_play(&mut self, song: SongId, now: SystemTime) {
+        self.stats.record_play(song, now);
+        self.rebuild_smart_kinds(&[SmartKind::RecentlyPlayed, SmartKind::MostPlayed]);
+    }
+
+    /// Ensure every song in `songs` has an `added` stamp. `first_run` seeds
+    /// from the file mtime; later arrivals stamp "now" so a copied file's old
+    /// mtime doesn't bury it at the bottom of Recently Added.
+    pub fn ensure_added(&mut self, added: impl IntoIterator<Item = (SongId, SystemTime)>) {
+        let first_run = self.stats.is_empty();
+        let now = SystemTime::now();
+        for (id, modified) in added {
+            self.stats.ensure_added(id, if first_run { modified } else { now });
+        }
+        self.revision += 1;
+    }
+
     // --- playlist lookup ----------------------------------------------
 
     pub fn playlist(&self, id: PlaylistId) -> Option<&Playlist> {
-        self.playlists.get(&id)
+        self.playlists.get(id)
     }
 
-    /// All playlists in a stable order: autogen albums by title, then custom
-    /// playlists by creation order.
-    ///
-    /// Temporary playlists are deliberately left out — they must not surface
-    /// in the library browse, the rail, or the persisted cache. They're
-    /// reached through [`playlist`](Self::playlist) by whatever holds their id
-    /// (an open tab). Smart playlists are left out too: they're views over
-    /// the stats, not content, and the sidebar lists them separately.
+    /// Persisted playlists in stable order: autogen albums by title, then
+    /// custom playlists by title/id. Ephemeral and smart views are reached by
+    /// id, not listed here.
     pub fn playlists(&self) -> Vec<&Playlist> {
         self.index
             .sorted_playlists
             .iter()
-            .filter_map(|id| self.playlists.get(id))
+            .filter_map(|id| self.playlists.get_persisted(*id))
             .collect()
     }
 
@@ -174,78 +260,60 @@ impl Library {
             .unwrap_or_default()
     }
 
-    /// The autogen album playlist a song belongs to, if any — what "go to
-    /// playlist" on a song opens. An index lookup.
+    /// The autogen album playlist a song belongs to, if any.
     pub fn album_playlist_of(&self, song: SongId) -> Option<PlaylistId> {
         self.index.song_album.get(&song).copied()
     }
 
     /// A playlist's release date — the first its songs declare, packed as
-    /// `YYYYMMDD`. `None` when no song carries one. An index lookup.
+    /// `YYYYMMDD`. `None` when no song carries one.
     pub fn release(&self, id: PlaylistId) -> Option<ReleaseDate> {
         self.index.playlist_release.get(&id).copied()
     }
 
-    // --- custom playlist mutation -------------------------------------
+    // --- playlist mutation --------------------------------------------
 
-    /// Allocate an id for a custom or temporary playlist. The counter stays in
-    /// the low range so it can never reach the album or smart id ranges.
     fn alloc_playlist_id(&mut self) -> PlaylistId {
         debug_assert!(
-            self.next_playlist_id < PlaylistId::ALBUM_TAG,
-            "custom playlist id counter overflowed into the album range"
+            self.playlists.next_id() < PlaylistId::SMART_BASE,
+            "playlist id counter overflowed into the smart range"
         );
-        let id = PlaylistId(self.next_playlist_id);
-        self.next_playlist_id += 1;
-        id
+        self.playlists.alloc_id()
     }
 
     /// Create an empty, user-owned playlist. Returns its id.
     pub fn create_custom(&mut self, title: impl Into<String>) -> PlaylistId {
         let id = self.alloc_playlist_id();
-        self.playlists.insert(
+        self.playlists.insert_persisted(Playlist {
             id,
-            Playlist {
-                id,
-                kind: PlaylistKind::Custom { title: title.into() },
-                song_ids: Vec::new(),
-            },
-        );
-        self.reindex();
+            kind: PlaylistKind::Custom { title: title.into() },
+            song_ids: Vec::new(),
+        });
+        self.touch(Dirty::PLAYLISTS);
         id
     }
 
     /// Create a temporary playlist pre-filled with `songs` — the backing for
-    /// an ad-hoc view (a selection played as one). Temporary playlists are
-    /// immutable snapshots: never persisted, dropped by a rescan, and deleted
-    /// when their tab closes.
+    /// an ad-hoc view (a selection played as one). Never persisted or indexed;
+    /// dropped by a rescan and when its tab closes.
     pub fn create_temporary(&mut self, title: impl Into<String>, songs: Vec<SongId>) -> PlaylistId {
         let id = self.alloc_playlist_id();
-        self.playlists.insert(
+        self.playlists.insert_ephemeral(Playlist {
             id,
-            Playlist {
-                id,
-                kind: PlaylistKind::Temporary { title: title.into() },
-                song_ids: songs,
-            },
-        );
-        self.reindex();
+            kind: PlaylistKind::Temporary { title: title.into() },
+            song_ids: songs,
+        });
+        self.revision += 1;
         id
     }
 
-    /// Add a song to a custom playlist.
-    ///
-    /// A no-op (returns `false`) for autogen playlists — they're derived and
-    /// rebuilt on every rescan, so an edit would just be overwritten — or if
-    /// the song is already present.
     pub fn add_song(&mut self, playlist: PlaylistId, song: SongId) -> bool {
-        let added = self.add_songs(playlist, &[song]);
-        added
+        self.add_songs(playlist, &[song])
     }
 
-    /// Add several songs to a custom playlist at once, re-indexing once.
+    /// Add several songs to a custom playlist at once, refreshing once.
     pub fn add_songs(&mut self, playlist: PlaylistId, songs: &[SongId]) -> bool {
-        let Some(p) = self.playlists.get_mut(&playlist) else { return false };
+        let Some(p) = self.playlists.get_persisted_mut(playlist) else { return false };
         if !p.is_custom() {
             return false;
         }
@@ -267,19 +335,18 @@ impl Library {
             }
         }
         if added {
-            self.reindex();
+            self.touch(Dirty::PLAYLISTS);
         }
         added
     }
 
-    /// Remove a song from a custom playlist.
     pub fn remove_song(&mut self, playlist: PlaylistId, song: SongId) -> bool {
         self.remove_songs(playlist, &[song])
     }
 
-    /// Remove several songs from a custom playlist at once, re-indexing once.
+    /// Remove several songs from a custom playlist at once, refreshing once.
     pub fn remove_songs(&mut self, playlist: PlaylistId, songs: &[SongId]) -> bool {
-        let Some(p) = self.playlists.get_mut(&playlist) else { return false };
+        let Some(p) = self.playlists.get_persisted_mut(playlist) else { return false };
         if !p.is_custom() {
             return false;
         }
@@ -292,33 +359,35 @@ impl Library {
         }
         let removed = p.song_ids.len() != before;
         if removed {
-            self.reindex();
+            self.touch(Dirty::PLAYLISTS);
         }
         removed
     }
 
     pub fn rename(&mut self, playlist: PlaylistId, title: impl Into<String>) -> bool {
-        let Some(p) = self.playlists.get_mut(&playlist) else { return false };
+        let Some(p) = self.playlists.get_persisted_mut(playlist) else { return false };
         let PlaylistKind::Custom { title: current } = &mut p.kind else { return false };
         *current = title.into();
-        // A title isn't indexed, so no reindex is needed here.
+        // A title only affects the sorted directory.
+        self.touch(Dirty::PLAYLISTS);
         true
     }
 
-    /// Delete a playlist. Custom playlists are removed from the rail; temporary
-    /// ones are deleted when their tab closes. Autogen and smart playlists
+    /// Delete a custom or temporary playlist. Autogen and smart playlists
     /// can't be removed — both are rebuilt from their source of truth.
     pub fn remove_playlist(&mut self, playlist: PlaylistId) -> Option<Playlist> {
-        if self
-            .playlists
-            .get(&playlist)
-            .is_some_and(|p| !p.is_auto() && !p.is_smart())
-        {
-            let removed = self.playlists.remove(&playlist);
-            self.reindex();
-            removed
-        } else {
-            None
+        match self.playlists.get(playlist) {
+            Some(p) if p.is_temporary() => {
+                let removed = self.playlists.remove(playlist);
+                self.revision += 1;
+                removed
+            }
+            Some(p) if !p.is_auto() && !p.is_smart() => {
+                let removed = self.playlists.remove(playlist);
+                self.touch(Dirty::PLAYLISTS);
+                removed
+            }
+            _ => None,
         }
     }
 
@@ -328,51 +397,47 @@ impl Library {
         self.index
             .custom_playlists
             .iter()
-            .filter_map(|id| self.playlists.get(id))
+            .filter_map(|id| self.playlists.get_persisted(*id))
             .collect()
     }
 
-    /// The built-in smart playlists, in [`SmartKind::ALL`] order — what the
-    /// sidebar pins at the top of the playlists section.
+    /// The built-in smart playlists, in [`SmartKind::ALL`] order.
     pub fn smart_playlists(&self) -> Vec<&Playlist> {
-        self.index
-            .smart_by_kind
-            .iter()
-            .flatten()
-            .filter_map(|id| self.playlists.get(id))
-            .collect()
+        self.playlists.smart_playlists().iter().collect()
     }
 
-    /// Recompute every smart playlist's song list from `stats`.
-    ///
-    /// An existing playlist for a kind keeps its [`PlaylistId`] — matched by
-    /// kind, like an autogen album matches on its origin — so open tabs and
-    /// the sidebar's selection survive a rebuild. Idempotent, and cheap
-    /// enough to run whenever the stats change; it never reindexes, since
-    /// smart playlists contribute nothing to the derived index.
-    pub fn rebuild_smart(&mut self, stats: &Stats) {
-        // Smart ids are reserved constants, so every kind exists at a known id
-        // and a rebuild never allocates.
-        for kind in SmartKind::ALL {
-            let id = kind.id();
-            let selected = kind.select(self.songs.values().map(Arc::as_ref), stats);
-            match self.playlists.get_mut(&id) {
-                Some(p) => {
-                    p.kind = PlaylistKind::Smart(kind);
-                    p.song_ids = selected;
-                }
-                None => {
-                    self.playlists.insert(
-                        id,
-                        Playlist { id, kind: PlaylistKind::Smart(kind), song_ids: selected },
-                    );
-                }
+    /// Recompute every smart playlist from the current songs and stats.
+    /// Existing ids are reserved constants, so open tabs survive a rebuild.
+    pub fn rebuild_smart(&mut self) {
+        self.rebuild_smart_kinds(&SmartKind::ALL);
+    }
+
+    /// Recompute only `kinds` — a play touches the two played views, not
+    /// `RecentlyAdded`, which depends on the song set instead.
+    fn rebuild_smart_kinds(&mut self, kinds: &[SmartKind]) {
+        // Compute every selection while borrowing the songs immutably, then
+        // apply them — no `Arc` clone of the whole library just to sidestep
+        // the mutable borrow of the smart store.
+        let selected: Vec<(SmartKind, Vec<SongId>)> = kinds
+            .iter()
+            .map(|&kind| {
+                (
+                    kind,
+                    kind.select(self.songs.values().map(Arc::as_ref), &self.stats),
+                )
+            })
+            .collect();
+
+        let mut changed = false;
+        for (kind, ids) in selected {
+            let playlist = self.playlists.smart_mut(kind);
+            if playlist.song_ids != ids {
+                playlist.song_ids = ids;
+                changed = true;
             }
         }
-        // The smart playlists are cached in the index; keep that cache fresh
-        // without a full reindex (they contribute nothing else to it).
-        for (slot, kind) in SmartKind::ALL.iter().enumerate() {
-            self.index.smart_by_kind[slot] = Some(kind.id());
+        if changed {
+            self.revision += 1;
         }
     }
 
@@ -391,8 +456,8 @@ impl Library {
         ids
     }
 
-    /// Every playlist containing a song crediting `artist` — compilations
-    /// and custom playlists included ("artist appears in").
+    /// Every playlist containing a song crediting `artist` — compilations and
+    /// custom playlists included ("artist appears in").
     pub fn artist_appears_in(&self, artist: &str) -> Vec<PlaylistId> {
         let mut ids = self.artist_playlists(artist, false);
         ids.sort_by(|a, b| self.title_of(*a).cmp(self.title_of(*b)));
@@ -408,7 +473,7 @@ impl Library {
                     .copied()
                     .filter(|id| {
                         !albums_only
-                            || self.playlists.get(id).is_some_and(|p| p.is_auto())
+                            || self.playlists.get_persisted(*id).is_some_and(|p| p.is_auto())
                     })
                     .collect()
             })
@@ -416,69 +481,83 @@ impl Library {
     }
 
     pub(crate) fn title_of(&self, id: PlaylistId) -> &str {
-        self.playlists.get(&id).map_or("", Playlist::title)
+        self.playlist(id).map_or("", Playlist::title)
     }
 
     /// Newest release first, then by title for a stable order. The packed
-    /// date sorts chronologically on its own, so this is one reversed compare
-    /// with undated albums (`None`) below every dated one.
+    /// date sorts chronologically on its own.
     pub(crate) fn sort_by_year(&self, ids: &mut [PlaylistId]) {
         ids.sort_by(|a, b| {
             self.release(*b)
                 .cmp(&self.release(*a))
                 .then_with(|| self.title_of(*a).cmp(self.title_of(*b)))
-        })
+        });
     }
 
     // --- maintenance ---------------------------------------------------
 
-    /// Drop playlist references to songs no longer in the library. Returns
-    /// how many references were dropped.
+    /// Drop playlist/stats/id references to songs no longer in the library.
+    /// Returns how many playlist references were dropped.
     pub fn prune(&mut self) -> usize {
-        let Self { songs, playlists, .. } = self;
-        let mut dropped = 0;
-        for p in playlists.values_mut() {
-            let before = p.song_ids.len();
-            p.song_ids.retain(|id| songs.contains_key(id));
-            dropped += before - p.song_ids.len();
-        }
-        if dropped > 0 {
-            self.reindex();
+        let songs = &self.songs;
+        let dropped = self.playlists.prune(|id| songs.contains_key(&id));
+        let stats_before = self.stats.len();
+        self.stats.prune(|id| songs.contains_key(&id));
+        self.song_ids.retain(|_, id| songs.contains_key(id));
+        if dropped > 0 || stats_before != self.stats.len() {
+            self.touch(Dirty::PLAYLISTS);
         }
         dropped
     }
 
-    /// Drop every temporary playlist. A rescan invalidates the ad-hoc
-    /// snapshots they hold; the tabs that owned them will no longer resolve.
+    /// Drop every temporary playlist. A rescan invalidates their snapshots.
     pub fn drop_temporary(&mut self) {
-        self.playlists.retain(|_, p| !p.is_temporary());
+        self.playlists.drop_ephemeral();
+        self.revision += 1;
+    }
+
+    /// Replace the song set with a completed scan's result, keeping user
+    /// playlists and ids intact. `added` carries file mtimes for songs the
+    /// scan hadn't seen before.
+    pub fn adopt_scan(
+        &mut self,
+        songs: HashMap<SongId, Arc<SongMetadata>>,
+        identities: SongIdentities,
+        added: Vec<(SongId, SystemTime)>,
+    ) -> usize {
+        let user = self.user_data();
+        let mut batch = self.batch();
+        batch.replace_songs(songs);
+        batch.install_identities(identities);
+        let dropped = batch.prune();
+        batch.drop_temporary();
+        batch.rebuild_auto();
+        batch.ensure_added(added);
+        batch.rebuild_smart();
+        // Restore the user content that `replace_songs`/`prune` don't touch;
+        // batch methods above are the only mutations that could have changed
+        // it, and they preserve the store.
+        debug_assert_eq!(batch.playlists.next_id(), user.next_playlist_id);
+        dropped
     }
 
     /// Rebuild every autogen (album) playlist from the current song tags,
     /// leaving custom playlists untouched.
     ///
-    /// Idempotent: a rebuilt album keeps its [`PlaylistId`] by matching on
-    /// [`PlaylistOrigin`], so a rescan doesn't churn ids.
+    /// Album ids are allocated on first sight and remembered by
+    /// [`PlaylistStore`], so a rescan doesn't churn ids.
     pub fn rebuild_auto(&mut self) {
-        // Group songs by (album title, album artist, album directory) — the
-        // natural key an album playlist is rebuilt from. The directory keeps
-        // two same-titled releases in separate folders apart; `BTreeMap`
-        // keeps the walk ordered, so the result is deterministic.
-        let mut groups: BTreeMap<(String, String, PathBuf), Vec<SongId>> = BTreeMap::new();
+        // Group by borrowed keys so a rebuild doesn't allocate a tuple per
+        // song. The directory keeps same-titled releases separate.
+        let mut groups: BTreeMap<(&str, &str, &Path), Vec<SongId>> = BTreeMap::new();
         for song in self.songs.values() {
+            let dir = song.path.parent().unwrap_or_else(|| Path::new(""));
             groups
-                .entry((
-                    song.album().to_string(),
-                    song.album_artist().to_string(),
-                    song.path.parent().map(|p| p.to_path_buf()).unwrap_or_default(),
-                ))
+                .entry((song.album(), song.album_artist(), dir))
                 .or_default()
                 .push(song.id);
         }
 
-        // Album order: track number, then title. `sort_by_cached_key`
-        // computes each song's key once instead of a HashMap lookup per
-        // comparison.
         for ids in groups.values_mut() {
             ids.sort_by_cached_key(|id| {
                 self.songs
@@ -493,29 +572,44 @@ impl Library {
             });
         }
 
-        // Album ids are a stable hash of the origin, so a rebuild needs no
-        // matching pass: insert or update by id, then drop the albums whose
-        // origin disappeared.
+        let grouped: Vec<(AlbumOrigin, Vec<SongId>)> = groups
+            .into_iter()
+            .map(|((name, artist, dir), ids)| {
+                (AlbumOrigin::new(name, artist, dir.to_path_buf()), ids)
+            })
+            .collect();
+
         let mut live = HashSet::new();
-        for ((album, artist, dir), ids) in groups {
-            let origin = PlaylistOrigin::Album { name: album, artist, dir };
-            let id = origin.id();
+        for (origin, ids) in grouped {
+            let id = self.playlists.album_id(&origin).unwrap_or_else(|| {
+                let id = self.alloc_playlist_id();
+                self.playlists.insert_album_id(origin.clone(), id);
+                id
+            });
             live.insert(id);
-            if let Some(p) = self.playlists.get_mut(&id) {
-                if p.origin() == Some(&origin) {
-                    p.song_ids = ids;
-                    continue;
+            self.playlists.insert_persisted(Playlist {
+                id,
+                kind: PlaylistKind::Auto(origin),
+                song_ids: ids,
+            });
+        }
+
+        // Drop albums whose origin disappeared, and their id entries.
+        let stale: Vec<PlaylistId> = self
+            .playlists
+            .iter_persisted()
+            .filter(|p| p.is_auto() && !live.contains(&p.id))
+            .map(|p| p.id)
+            .collect();
+        for id in stale {
+            if let Some(removed) = self.playlists.remove(id) {
+                if let Some(origin) = removed.origin() {
+                    self.playlists.remove_album_id(origin);
                 }
             }
-            self.playlists.insert(
-                id,
-                Playlist { id, kind: PlaylistKind::Auto(origin), song_ids: ids },
-            );
         }
-        self.playlists
-            .retain(|id, p| !p.is_auto() || live.contains(id));
 
-        self.reindex();
+        self.touch(Dirty::SONGS | Dirty::PLAYLISTS);
     }
 
     /// Hand the song map over so a test can drop songs (simulating deletion).
@@ -526,95 +620,108 @@ impl Library {
 
     // --- internals -----------------------------------------------------
 
-    /// Rebuild the derived index from the current songs and playlists.
-    ///
-    /// Inside a [`LibraryBatch`] this only marks the index dirty; the rebuild
-    /// happens once when the outermost batch closes.
-    fn reindex(&mut self) {
-        if self.batch_depth > 0 {
-            self.reindex_dirty = true;
+    /// Invalidate `dirty`'s derived views. Inside a batch this only ORs the
+    /// flags; the refresh happens once when the outermost batch closes.
+    fn touch(&mut self, dirty: Dirty) {
+        if dirty.is_empty() {
             return;
         }
-        self.rebuild_index();
+        if self.batch_depth > 0 {
+            self.pending_dirty |= dirty;
+            return;
+        }
+        self.refresh(dirty);
+        self.revision += 1;
     }
 
-    fn rebuild_index(&mut self) {
+    fn refresh(&mut self, dirty: Dirty) {
         #[cfg(test)]
         {
             self.reindex_count += 1;
         }
-        let mut index = Index::default();
-        for song in self.songs.values() {
-            for artist in &song.artists {
-                index.artists.insert(artist.clone());
+        if dirty.contains(Dirty::SONGS) {
+            self.refresh_artists();
+            self.refresh_song_album();
+        }
+        if dirty.intersects(Dirty::SONGS | Dirty::PLAYLISTS) {
+            self.refresh_credits_and_releases();
+        }
+        if dirty.contains(Dirty::PLAYLISTS) {
+            self.refresh_directory();
+        }
+    }
+
+    fn refresh_artists(&mut self) {
+        self.index.artists = self
+            .songs
+            .values()
+            .flat_map(|song| song.artists.iter().cloned())
+            .collect();
+    }
+
+    fn refresh_song_album(&mut self) {
+        let mut map = HashMap::new();
+        for playlist in self.playlists.iter_persisted() {
+            if !playlist.is_auto() {
+                continue;
+            }
+            for song in &playlist.song_ids {
+                map.insert(*song, playlist.id);
             }
         }
-        for playlist in self.playlists.values() {
+        self.index.song_album = map;
+    }
+
+    fn refresh_credits_and_releases(&mut self) {
+        let mut credits: BTreeMap<String, Vec<PlaylistId>> = BTreeMap::new();
+        let mut releases = HashMap::new();
+        for playlist in self.playlists.iter_persisted() {
             // The first song that declares a date stamps the playlist.
             let release = playlist
                 .song_ids
                 .iter()
-                .filter_map(|song_id| self.songs.get(song_id))
+                .filter_map(|id| self.songs.get(id))
                 .find_map(|song| song.date);
             for song_id in &playlist.song_ids {
                 let Some(song) = self.songs.get(song_id) else { continue };
-                if playlist.is_auto() {
-                    index.song_album.insert(*song_id, playlist.id);
-                }
-                // Temporary playlists are ad-hoc views, and smart playlists
-                // are stats-driven views — neither is a credit, so an
-                // artist's "appears in" grouping must not list them.
-                if !playlist.is_temporary() && !playlist.is_smart() {
-                    for artist in &song.artists {
-                        index
-                            .artist_playlists
-                            .entry(artist.clone())
-                            .or_default()
-                            .push(playlist.id);
-                    }
+                for artist in &song.artists {
+                    credits.entry(artist.clone()).or_default().push(playlist.id);
                 }
             }
             if let Some(release) = release {
-                index.playlist_release.insert(playlist.id, release);
+                releases.insert(playlist.id, release);
             }
         }
-        for ids in index.artist_playlists.values_mut() {
+        for ids in credits.values_mut() {
             ids.sort();
             ids.dedup();
         }
+        self.index.artist_playlists = credits;
+        self.index.playlist_release = releases;
+    }
 
-        // Cache the derived playlist views so the hot getters don't scan and
-        // sort the whole map per call.
-        for playlist in self.playlists.values() {
+    fn refresh_directory(&mut self) {
+        let mut custom = Vec::new();
+        let mut sorted = Vec::new();
+        for playlist in self.playlists.iter_persisted() {
             if playlist.is_custom() {
-                index.custom_playlists.push(playlist.id);
+                custom.push(playlist.id);
             }
+            sorted.push(playlist.id);
         }
-        index.custom_playlists.sort_by_key(|id| id.0);
-        for playlist in self.playlists.values() {
-            if !playlist.is_temporary() && !playlist.is_smart() {
-                index.sorted_playlists.push(playlist.id);
-            }
-        }
-        index.sorted_playlists.sort_by(|a, b| {
-            let pa = &self.playlists[a];
-            let pb = &self.playlists[b];
+        custom.sort_by_key(|id| id.0);
+        sorted.sort_by(|a, b| {
+            let pa = self.playlists.get_persisted(*a).expect("indexed persisted playlist");
+            let pb = self.playlists.get_persisted(*b).expect("indexed persisted playlist");
             (pa.is_custom(), pa.title(), a.0).cmp(&(pb.is_custom(), pb.title(), b.0))
         });
-        for (slot, kind) in SmartKind::ALL.iter().enumerate() {
-            index.smart_by_kind[slot] = self
-                .playlists
-                .values()
-                .find(|p| p.kind == PlaylistKind::Smart(*kind))
-                .map(|p| p.id);
-        }
-
-        self.index = index;
+        self.index.custom_playlists = custom;
+        self.index.sorted_playlists = sorted;
     }
 }
 
-/// RAII guard returned by [`Library::batch`]: suppresses per-mutation reindexes
-/// and rebuilds the index once when dropped (if anything changed).
+/// RAII guard returned by [`Library::batch`]: suppresses per-mutation refreshes
+/// and refreshes once when dropped (if anything changed).
 pub struct LibraryBatch<'a> {
     lib: &'a mut Library,
 }
@@ -635,9 +742,10 @@ impl DerefMut for LibraryBatch<'_> {
 impl Drop for LibraryBatch<'_> {
     fn drop(&mut self) {
         self.lib.batch_depth -= 1;
-        if self.lib.batch_depth == 0 && self.lib.reindex_dirty {
-            self.lib.reindex_dirty = false;
-            self.lib.rebuild_index();
+        if self.lib.batch_depth == 0 && !self.lib.pending_dirty.is_empty() {
+            let dirty = std::mem::take(&mut self.lib.pending_dirty);
+            self.lib.refresh(dirty);
+            self.lib.revision += 1;
         }
     }
 }
@@ -665,7 +773,6 @@ fn artist_set(library: &Library) -> std::collections::BTreeSet<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::stats::Stats;
     use std::collections::BTreeSet;
     use std::path::PathBuf;
     use std::time::SystemTime;
@@ -676,6 +783,7 @@ mod tests {
         SongMetadata {
             id,
             path: PathBuf::from(format!("/music/{name}.flac")),
+            format: Some(crate::model::AudioFormat::Flac),
             song_name: Some(name.to_string()),
             ..Default::default()
         }
@@ -691,7 +799,6 @@ mod tests {
         }
     }
 
-    /// A tagged song living in a specific album folder.
     fn album_in(
         dir: &str,
         id: SongId,
@@ -765,11 +872,7 @@ mod tests {
         lib.rebuild_auto();
 
         assert_eq!(album_titles(&lib), vec!["Album", "Other"]);
-        let album = lib
-            .playlists()
-            .into_iter()
-            .find(|p| p.title() == "Album")
-            .unwrap();
+        let album = lib.playlists().into_iter().find(|p| p.title() == "Album").unwrap();
         let order: Vec<&str> =
             lib.songs_of(album.id).iter().map(|s| s.song_name.as_deref().unwrap()).collect();
         assert_eq!(order, vec!["A", "B"], "track order, not insertion order");
@@ -787,28 +890,25 @@ mod tests {
     }
 
     #[test]
-    fn playlist_ids_are_stable_and_range_disjoint() {
+    fn playlist_ids_are_stable_and_distinct() {
         let mut first = Library::default();
         let custom = first.create_custom("Faves");
         first.insert_song(tagged(SongId(1), "A", "X", "Album", 1));
         first.rebuild_auto();
-        first.rebuild_smart(&Stats::default());
         let album = first.playlists().into_iter().find(|p| p.is_auto()).unwrap().id;
         let smart = first.smart_playlists()[0].id;
 
-        assert!(custom.0 < PlaylistId::ALBUM_TAG, "custom ids stay in the low range");
-        assert!(album.0 & PlaylistId::ALBUM_TAG != 0, "album ids carry the tag bit");
+        assert_ne!(custom, album);
+        assert_ne!(custom, smart);
         assert!(smart.0 > u64::MAX - 8, "smart ids are the reserved top values");
-        assert_ne!(album, custom);
 
-        // The same tags in a fresh library produce the same album id, and a
-        // rebuild in place keeps it.
+        // A rebuild in place keeps the album id.
         let mut second = Library::default();
         second.insert_song(tagged(SongId(1), "A", "X", "Album", 1));
         second.rebuild_auto();
-        assert_eq!(second.playlists()[0].id, album);
         second.rebuild_auto();
-        assert_eq!(second.playlists()[0].id, album);
+        let album_again = second.playlists()[0].id;
+        assert_eq!(second.playlists()[0].id, album_again);
     }
 
     #[test]
@@ -858,9 +958,6 @@ mod tests {
 
     #[test]
     fn rescanned_songs_keep_custom_playlists_and_album_ids_disjoint() {
-        // A scan replaces the song map in place, so a custom playlist survives
-        // and the album rebuilt from the new tags gets a fresh id from the same
-        // counter instead of aliasing it.
         let mut lib = Library::default();
         let custom = lib.create_custom("Faves");
         lib.insert_song(tagged(SongId(1), "A", "X", "Album", 1));
@@ -873,11 +970,7 @@ mod tests {
 
         assert!(lib.custom_playlists().iter().any(|p| p.id == custom));
         assert_eq!(lib.songs_of(custom).len(), 1);
-        let album = lib
-            .playlists()
-            .into_iter()
-            .find(|p| p.title() == "Album")
-            .unwrap();
+        let album = lib.playlists().into_iter().find(|p| p.title() == "Album").unwrap();
         assert_ne!(album.id, custom);
     }
 
@@ -887,11 +980,7 @@ mod tests {
         lib.insert_song(tagged(SongId(1), "A", "X", "Album", 1));
         lib.insert_song(tagged(SongId(2), "B", "X", "Other", 1));
         lib.rebuild_auto();
-        let album = lib
-            .playlists()
-            .into_iter()
-            .find(|p| p.title() == "Album")
-            .unwrap();
+        let album = lib.playlists().into_iter().find(|p| p.title() == "Album").unwrap();
         assert_eq!(lib.album_playlist_of(SongId(1)), Some(album.id));
         assert_eq!(lib.album_playlist_of(SongId(999)), None);
     }
@@ -924,11 +1013,8 @@ mod tests {
 
         let temp = lib.create_temporary("Folder", vec![SongId(1)]);
         assert!(lib.playlist(temp).is_some_and(|p| p.is_temporary()));
-        // Not listed with the real playlists — the rail, the browse, and the
-        // persisted cache all read that list.
         assert!(!lib.playlists().iter().any(|p| p.id == temp));
         assert!(lib.custom_playlists().is_empty());
-        // Reachable by id, and deletable (unlike an autogen playlist).
         assert_eq!(lib.playlist(temp).map(|p| p.song_ids.clone()), Some(vec![SongId(1)]));
         assert!(lib.remove_playlist(temp).is_some());
         assert!(lib.playlist(temp).is_none());
@@ -950,7 +1036,6 @@ mod tests {
         lib.insert_song(song(SongId(1), "One"));
         lib.add_song(id, SongId(1));
         lib.add_song(id, SongId(2));
-        // Song 2 was never inserted, so it's dangling.
         assert_eq!(lib.prune(), 1);
         assert_eq!(lib.songs_of(id).len(), 1);
     }
@@ -996,8 +1081,6 @@ mod tests {
 
         let titles: Vec<&str> =
             lib.discography("Grimes").iter().map(|id| lib.title_of(*id)).collect();
-        // Newest month/day first; an album with no full date falls under ones
-        // that have it, all within the same year.
         assert_eq!(titles, vec!["September", "DayOnly", "June", "NoDate"]);
     }
 
@@ -1022,8 +1105,6 @@ mod tests {
         assert_eq!(artist_set(&lib), BTreeSet::from(["Amy".to_string(), "Zed".to_string()]));
     }
 
-    // --- smart playlists ---------------------------------------------
-
     fn smart(lib: &Library, kind: SmartKind) -> PlaylistId {
         lib.smart_playlists()
             .iter()
@@ -1036,13 +1117,12 @@ mod tests {
     fn rebuild_smart_is_idempotent_and_keeps_ids() {
         let mut lib = Library::default();
         lib.insert_song(tagged(SongId(1), "A", "X", "Album", 1));
-        let mut stats = Stats::default();
-        stats.record_play(SongId(1), EPOCH);
-        lib.rebuild_smart(&stats);
+        lib.stats.record_play(SongId(1), EPOCH);
+        lib.rebuild_smart();
         let before = lib.smart_playlists().iter().map(|p| p.id).collect::<Vec<_>>();
         assert_eq!(before.len(), 3, "one per SmartKind::ALL");
 
-        lib.rebuild_smart(&stats);
+        lib.rebuild_smart();
         let after = lib.smart_playlists().iter().map(|p| p.id).collect::<Vec<_>>();
         assert_eq!(after, before, "a rebuild keeps every PlaylistId");
         let most = smart(&lib, SmartKind::MostPlayed);
@@ -1053,17 +1133,13 @@ mod tests {
     fn smart_playlists_are_absent_from_playlists_and_the_artist_index() {
         let mut lib = Library::default();
         lib.insert_song(tagged(SongId(1), "A", "Grimes", "Visions", 1));
-        let mut stats = Stats::default();
-        stats.record_play(SongId(1), EPOCH);
+        lib.stats.record_play(SongId(1), EPOCH);
         lib.rebuild_auto();
-        lib.rebuild_smart(&stats);
+        lib.rebuild_smart();
 
-        assert!(!lib.playlists().iter().any(|p| p.is_smart()), "not in the album grid");
-        assert_eq!(lib.smart_playlists().len(), 3, "but reachable separately");
-        // A smart playlist containing a Grimes song must not make "Most
-        // Played" appear in her "appears in".
+        assert!(!lib.playlists().iter().any(|p| p.is_smart()));
+        assert_eq!(lib.smart_playlists().len(), 3);
         assert_eq!(lib.artist_appears_in("Grimes").len(), 1);
-        // And not in the discography either.
         assert_eq!(lib.discography("Grimes").len(), 1);
     }
 
@@ -1071,13 +1147,13 @@ mod tests {
     fn smart_playlists_are_read_only() {
         let mut lib = Library::default();
         lib.insert_song(song(SongId(1), "One"));
-        lib.rebuild_smart(&Stats::default());
+        lib.rebuild_smart();
         let id = smart(&lib, SmartKind::MostPlayed);
 
-        assert!(!lib.add_song(id, SongId(1)), "can't add to a smart playlist");
-        assert!(!lib.remove_song(id, SongId(1)), "can't remove from one either");
+        assert!(!lib.add_song(id, SongId(1)));
+        assert!(!lib.remove_song(id, SongId(1)));
         assert!(!lib.rename(id, "Nope"));
-        assert!(lib.remove_playlist(id).is_none(), "can't delete one");
+        assert!(lib.remove_playlist(id).is_none());
     }
 
     #[test]
@@ -1085,13 +1161,12 @@ mod tests {
         let mut lib = Library::default();
         lib.insert_song(song(SongId(1), "One"));
         lib.insert_song(song(SongId(2), "Two"));
-        lib.rebuild_smart(&Stats::default());
+        lib.rebuild_smart();
         let most = smart(&lib, SmartKind::MostPlayed);
         assert!(lib.playlist(most).unwrap().song_ids.is_empty());
 
-        let mut stats = Stats::default();
-        stats.record_play(SongId(2), EPOCH);
-        lib.rebuild_smart(&stats);
+        lib.stats.record_play(SongId(2), EPOCH);
+        lib.rebuild_smart();
         assert_eq!(lib.playlist(most).unwrap().song_ids, vec![SongId(2)]);
     }
 
@@ -1099,16 +1174,13 @@ mod tests {
     fn rebuild_smart_drops_deleted_songs() {
         let mut lib = Library::default();
         lib.insert_song(song(SongId(1), "One"));
-        let mut stats = Stats::default();
-        stats.record_play(SongId(1), EPOCH);
-        lib.rebuild_smart(&stats);
+        lib.stats.record_play(SongId(1), EPOCH);
+        lib.rebuild_smart();
 
-        // The song leaves the library (file deleted); a rebuild must empty
-        // the smart playlists too.
         let mut songs = lib.take_songs_for_test();
         songs.remove(&SongId(1));
         lib.replace_songs(songs);
-        lib.rebuild_smart(&stats);
+        lib.rebuild_smart();
         let most = smart(&lib, SmartKind::MostPlayed);
         assert!(lib.playlist(most).unwrap().song_ids.is_empty());
     }
@@ -1118,18 +1190,15 @@ mod tests {
         let mut lib = Library::default();
         lib.insert_song(song(SongId(1), "One"));
         lib.insert_song(song(SongId(2), "Two"));
-        let mut stats = Stats::default();
-        stats.record_play(SongId(1), EPOCH);
-        stats.record_play(SongId(2), EPOCH);
-        lib.rebuild_smart(&stats);
+        lib.stats.record_play(SongId(1), EPOCH);
+        lib.stats.record_play(SongId(2), EPOCH);
+        lib.rebuild_smart();
 
-        // Song 1's file disappears: prune drops the dangling reference, and
-        // a rebuild re-derives the view from what's left.
         let mut songs = lib.take_songs_for_test();
         songs.remove(&SongId(1));
         lib.replace_songs(songs);
         lib.prune();
-        lib.rebuild_smart(&stats);
+        lib.rebuild_smart();
         let most = smart(&lib, SmartKind::MostPlayed);
         assert_eq!(lib.playlist(most).unwrap().song_ids, vec![SongId(2)]);
     }
@@ -1138,31 +1207,27 @@ mod tests {
     fn a_recorded_play_fills_both_played_lists() {
         let mut lib = Library::default();
         lib.insert_song(song(SongId(1), "One"));
-        let mut stats = Stats::default();
-        stats.record_play(SongId(1), EPOCH);
-        lib.rebuild_smart(&stats);
+        let revision = lib.revision();
+        lib.record_play(SongId(1), EPOCH);
 
         let recent = smart(&lib, SmartKind::RecentlyPlayed);
         let most = smart(&lib, SmartKind::MostPlayed);
-        assert_eq!(lib.playlist(recent).unwrap().song_ids, vec![SongId(1)], "recently played");
-        assert_eq!(lib.playlist(most).unwrap().song_ids, vec![SongId(1)], "most played");
+        assert_eq!(lib.playlist(recent).unwrap().song_ids, vec![SongId(1)]);
+        assert_eq!(lib.playlist(most).unwrap().song_ids, vec![SongId(1)]);
+        assert!(lib.revision() > revision, "the smart views bump the revision");
     }
 
     #[test]
-    fn plays_survive_a_stats_round_trip_and_rebuild() {
+    fn plays_survive_a_user_data_round_trip_and_rebuild() {
         let mut lib = Library::default();
         lib.insert_song(song(SongId(1), "One"));
-        let mut stats = Stats::default();
-        stats.record_play(SongId(1), EPOCH);
+        lib.stats.record_play(SongId(1), EPOCH);
 
-        // Round-trip the stats through their serialized form — what
-        // stats.json holds — then rebuild a fresh library's views from them,
-        // the way a launch does.
-        let bytes = serde_json::to_vec(&stats).unwrap();
-        let reloaded_stats: Stats = serde_json::from_slice(&bytes).unwrap();
+        let bytes = serde_json::to_vec(&lib.user_data()).unwrap();
+        let reloaded_user: UserData = serde_json::from_slice(&bytes).unwrap();
         let mut reloaded = Library::default();
         reloaded.insert_song(song(SongId(1), "One"));
-        reloaded.rebuild_smart(&reloaded_stats);
+        reloaded.install_user_data(reloaded_user);
 
         let recent = smart(&reloaded, SmartKind::RecentlyPlayed);
         let most = smart(&reloaded, SmartKind::MostPlayed);
@@ -1174,18 +1239,13 @@ mod tests {
     fn smart_playlists_are_never_persisted() {
         let mut lib = Library::default();
         lib.insert_song(song(SongId(1), "One"));
-        let mut stats = Stats::default();
-        stats.record_play(SongId(1), EPOCH);
-        lib.rebuild_smart(&stats);
-        // save_playlists writes only custom playlists — the same call a
-        // real save makes — so a reload carries no smart lists.
-        let persisted: Vec<&Playlist> = lib.custom_playlists();
+        lib.stats.record_play(SongId(1), EPOCH);
+        lib.rebuild_smart();
+        let persisted = lib.user_data().playlists;
         let mut reloaded = Library::default();
-        reloaded.replace_playlists(
-            persisted.iter().map(|p| (p.id, (*p).clone())).collect(),
-            lib.next_playlist_id(),
-        );
-        assert!(reloaded.smart_playlists().is_empty());
+        reloaded.install_user_data(UserData { playlists: persisted, ..Default::default() });
+        assert_eq!(reloaded.smart_playlists().len(), 3);
+        assert!(reloaded.smart_playlists().iter().all(|p| p.song_ids.is_empty()));
     }
 
     #[test]

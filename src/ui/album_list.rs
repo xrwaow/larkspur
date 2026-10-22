@@ -46,14 +46,14 @@ pub enum Play {
 pub fn sections(library: &Library, scope: &Scope, query: &search::Query) -> Vec<AlbumSection> {
     let groups = match scope {
         Scope::Library => search::search(library, query),
-        Scope::Artist(artist) => library.select(&Selection {
-            scope: Scope::Artist(artist.clone()),
-            query: query.clone(),
+        Scope::Artist(_) => library.select(&Selection {
+            scope,
+            query,
             order: Order::NewestFirst,
         }),
-        Scope::Folder { dir, mode } => library.select(&Selection {
-            scope: Scope::Folder { dir: dir.clone(), mode: *mode },
-            query: query.clone(),
+        Scope::Folder { .. } => library.select(&Selection {
+            scope,
+            query,
             order: Order::TrackOrder,
         }),
     };

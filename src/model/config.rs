@@ -61,11 +61,13 @@ impl DynamicBase {
             DynamicBase::White => "White",
         }
     }
-}
 
-impl From<DynamicBase> for ThemeKind {
-    fn from(base: DynamicBase) -> Self {
-        match base {
+    /// The static palette to use before a cover accent exists. This is an
+    /// explicit fallback, not a conversion: a dynamic base is not a theme
+    /// kind, it only chooses which static palette stands in until the accent
+    /// arrives.
+    pub fn fallback_theme(self) -> ThemeKind {
+        match self {
             DynamicBase::Black => ThemeKind::Dark,
             DynamicBase::White => ThemeKind::Light,
         }
@@ -304,22 +306,6 @@ impl Default for Config {
 }
 
 impl Config {
-    /// File extensions the decoder stack can play. Opus and OGG both go
-    /// through the Ogg demuxer; `.ogg` may hold either Vorbis or Opus.
-    /// `.m4a`/`.m4b` are MP4 containers (AAC/ALAC), covered by symphonia's
-    /// `isomp4`/`aac` support that rodio's `symphonia-all` feature pulls in.
-    pub const SONG_EXTENSIONS: &'static [&'static str] =
-        &["flac", "mp3", "opus", "ogg", "m4a", "m4b"];
-
-    /// Whether `path` looks like a playable audio file, by extension.
-    /// Case-insensitive.
-    pub fn is_supported(path: &Path) -> bool {
-        path.extension()
-            .and_then(|e| e.to_str())
-            .map(|e| Self::SONG_EXTENSIONS.contains(&e.to_lowercase().as_str()))
-            .unwrap_or(false)
-    }
-
     /// Load the config at `path`, falling back to defaults when it's missing
     /// or unreadable. A broken config is not fatal — it just means defaults.
     pub fn load(path: &Path) -> Self {
@@ -412,20 +398,6 @@ impl Config {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn accepts_known_extensions_case_insensitively() {
-        for name in ["a.flac", "b.MP3", "c.Opus", "d.ogg", "e.m4a", "f.M4B"] {
-            assert!(Config::is_supported(Path::new(name)), "{name} should be supported");
-        }
-    }
-
-    #[test]
-    fn rejects_unknown_and_extensionless() {
-        for name in ["a.wav", "b.txt", "noextension", "c.flac.bak"] {
-            assert!(!Config::is_supported(Path::new(name)), "{name} should be rejected");
-        }
-    }
 
     #[test]
     fn font_size_falls_back_to_the_container_default() {

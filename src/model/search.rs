@@ -54,7 +54,7 @@
 
 use std::time::Duration;
 
-use super::identity::SongId;
+use super::format::{AudioFormat, FormatSet};
 use super::library::Library;
 use super::playlist::PlaylistId;
 use super::select::{Order, Scope, Selection};
@@ -148,8 +148,8 @@ pub enum Filter {
     Year { min: Option<u16>, max: Option<u16> },
     /// Inclusive duration bounds.
     Duration { min: Option<Duration>, max: Option<Duration> },
-    /// Accepted file extensions, lowercase and without the dot.
-    Extension(Vec<String>),
+    /// Accepted audio formats, stored as a bitset so the filter is `Copy`.
+    Extension(FormatSet),
 }
 
 /// One search term: free text, or text scoped to a single field.
@@ -264,11 +264,9 @@ impl Filter {
             Filter::Duration { min, max } => {
                 min.is_none_or(|m| song.duration >= m) && max.is_none_or(|m| song.duration <= m)
             }
-            Filter::Extension(exts) => song
-                .path
-                .extension()
-                .and_then(|e| e.to_str())
-                .is_some_and(|e| exts.iter().any(|x| x == &e.to_ascii_lowercase())),
+            Filter::Extension(formats) => song
+                .format
+                .is_some_and(|format| formats.contains(format)),
         }
     }
 }
@@ -376,22 +374,20 @@ fn is_subsequence(haystack: &str, needle: &str) -> bool {
 }
 
 /// Songs matching a query, grouped by the album playlist they belong to.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct SongGroup {
     /// The autogen album playlist this group is headed by — its title, artist,
     /// cover, and track order all come from here.
     pub playlist: PlaylistId,
-    /// The matched songs, in album track order.
-    pub songs: Vec<SongId>,
+    /// The matched songs, in album track order, as shared handles so the UI
+    /// needn't look each one up again.
+    pub songs: Vec<std::sync::Arc<SongMetadata>>,
 }
 
 /// Run a query over the library, grouped by album.
 pub fn search(library: &Library, query: &Query) -> Vec<SongGroup> {
-    library.select(&Selection {
-        scope: Scope::Library,
-        query: query.clone(),
-        order: Order::AlbumTitle,
-    })
+    let scope = Scope::Library;
+    library.select(&Selection { scope: &scope, query, order: Order::AlbumTitle })
 }
 
 /// Parse a query string into a [`Query`] plus any warnings worth showing.
@@ -462,15 +458,21 @@ pub fn parse(input: &str) -> (Query, Vec<String>) {
                 Err(warning) => warnings.push(warning),
             },
             "ext" | "file" | "format" => {
-                let extensions: Vec<String> = value
-                    .split(',')
-                    .map(|e| e.trim().trim_start_matches('.').to_ascii_lowercase())
-                    .filter(|e| !e.is_empty())
-                    .collect();
-                if extensions.is_empty() {
+                let mut formats = FormatSet::empty();
+                for name in value.split(',') {
+                    let name = name.trim().trim_start_matches('.');
+                    if name.is_empty() {
+                        continue;
+                    }
+                    match AudioFormat::from_extension(name) {
+                        Some(format) => formats.insert(format),
+                        None => warnings.push(format!("unknown format `{name}`")),
+                    }
+                }
+                if formats.is_empty() {
                     warnings.push("empty extension filter".into());
                 } else {
-                    query.filters.push(Filter::Extension(extensions));
+                    query.filters.push(Filter::Extension(formats));
                 }
             }
             // A keyword-shaped prefix we don't know is almost certainly a typo
@@ -635,12 +637,13 @@ fn parse_duration(s: &str) -> Result<Duration, String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::model::{Lyrics, ReleaseDate};
+    use crate::model::{Lyrics, ReleaseDate, SongId};
 
     fn song(id: SongId, title: &str, artist: &str, album: &str) -> SongMetadata {
         SongMetadata {
             id,
             path: format!("/music/{album}/{title}.flac").into(),
+            format: Some(AudioFormat::Flac),
             song_name: Some(title.into()),
             artists: vec![artist.into()],
             album_name: Some(album.into()),
@@ -878,7 +881,11 @@ mod tests {
         let album = library.playlist(group.playlist).unwrap();
         assert_eq!(album.title(), "Kill Bill");
         assert_eq!(group.songs.len(), 2);
-        assert_eq!(group.songs, album.song_ids, "album track order is preserved");
+        assert_eq!(
+            group.songs.iter().map(|song| song.id).collect::<Vec<_>>(),
+            album.song_ids,
+            "album track order is preserved"
+        );
     }
 
     #[test]
@@ -895,7 +902,12 @@ mod tests {
         let library = library();
         let (query, _) = parse("");
         let groups = search(&library, &query);
-        assert_eq!(groups, search(&library, &Query::default()));
+        let same = search(&library, &Query::default());
+        assert_eq!(groups.len(), same.len());
+        assert!(groups.iter().zip(&same).all(|(a, b)| {
+            a.playlist == b.playlist
+                && a.songs.iter().map(|song| song.id).eq(b.songs.iter().map(|song| song.id))
+        }));
         assert_eq!(groups.len(), 2, "two albums");
         assert_eq!(groups.iter().map(|g| g.songs.len()).sum::<usize>(), 3);
     }

@@ -1,10 +1,11 @@
 //! Queue entries — one playable item in the playback queue — and the pure,
 //! unit-testable [`PlayQueue`] that holds them.
 //!
-//! The queue is a `(SongId, PathBuf)` pair everywhere: the id is what the UI
-//! resolves metadata and stats by, the path is what the decoder opens. Naming
-//! the pair gives the audio layer a model-owned type to speak (the model sits
-//! below the audio and UI layers, so this can't live there).
+//! The queue is a [`QueueEntry`] list everywhere: each entry is the song's id
+//! plus a shared `Arc<SongMetadata>`, so the decoder has a path and the UI has
+//! display data without a second library lookup. Naming the pair gives the
+//! audio layer a model-owned type to speak (the model sits below the audio and
+//! UI layers, so this can't live there).
 //!
 //! [`PlayQueue`] owns the entry list, the currently-loaded index and the
 //! change counter. It knows nothing about decoding, so its remove/reorder
@@ -12,18 +13,28 @@
 //! loading around it.
 
 use std::collections::HashSet;
-use std::path::PathBuf;
+use std::path::Path;
+use std::sync::Arc;
 
 use super::identity::SongId;
+use super::song::SongMetadata;
 
 /// Above this many ids, bulk removal builds a hash set instead of scanning.
 const HASH_THRESHOLD: usize = 8;
 
-/// One entry in the playback queue: the song identity plus the file to open.
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+/// One entry in the playback queue: the song identity plus a shared handle to
+/// the metadata, so the queue stays displayable even if a rescan removes the
+/// song from the library, and no per-entry path is cloned.
+#[derive(Debug, Clone)]
 pub struct QueueEntry {
     pub song: SongId,
-    pub path: PathBuf,
+    pub meta: Arc<SongMetadata>,
+}
+
+impl QueueEntry {
+    pub fn path(&self) -> &Path {
+        &self.meta.path
+    }
 }
 
 /// What a [`PlayQueue::remove`] call did to the loaded track, so the
@@ -191,10 +202,11 @@ impl PlayQueue {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::PathBuf;
 
     fn entry(id: u64) -> QueueEntry {
-        QueueEntry { song: SongId(id), path: PathBuf::from(format!("/m/{id}.flac")) }
+        let path = format!("/m/{id}.flac");
+        let meta = SongMetadata { id: SongId(id), path: path.into(), ..Default::default() };
+        QueueEntry { song: SongId(id), meta: Arc::new(meta) }
     }
 
     fn ids(q: &PlayQueue) -> Vec<u64> {

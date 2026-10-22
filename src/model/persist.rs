@@ -9,8 +9,7 @@ use std::fs;
 use std::path::Path;
 
 use serde::de::DeserializeOwned;
-use serde::Serialize;
-use serde_json::Value;
+use serde::{Deserialize, Serialize};
 
 /// Read `path` as `T` when its JSON object carries `version`.
 ///
@@ -18,13 +17,26 @@ use serde_json::Value;
 /// read-and-check-version dance keeps a schema bump from touching every
 /// loader. A mismatch reads as `None`, exactly like a missing or broken file.
 pub fn read_versioned<T: DeserializeOwned>(path: &Path, version: u32) -> Option<T> {
-    let mut value: Value = read_json(path)?;
-    let object = value.as_object_mut()?;
-    if object.get("version")?.as_u64()? != u64::from(version) {
-        return None;
+    #[derive(Deserialize)]
+    struct VersionedRead<T> {
+        version: u32,
+        #[serde(flatten)]
+        body: T,
     }
-    object.remove("version");
-    serde_json::from_value(value).ok()
+
+    let decoded: VersionedRead<T> = read_json(path)?;
+    (decoded.version == version).then_some(decoded.body)
+}
+
+/// The envelope `write_versioned` serializes directly, so a write is one pass
+/// over the data — no intermediate `serde_json::Value` copy of the whole body.
+/// `T` must serialize as a map (a struct does), which is what the old
+/// Value-based path also required.
+#[derive(Serialize)]
+struct Versioned<'a, T: Serialize> {
+    version: u32,
+    #[serde(flatten)]
+    body: &'a T,
 }
 
 /// Write `value` as an object with a `version` field beside its fields.
@@ -34,12 +46,7 @@ pub fn write_versioned<T: Serialize>(
     version: u32,
     pretty: bool,
 ) -> anyhow::Result<()> {
-    let mut value = serde_json::to_value(value)?;
-    let object = value
-        .as_object_mut()
-        .ok_or_else(|| anyhow::anyhow!("versioned JSON body must be an object"))?;
-    object.insert("version".into(), Value::from(version));
-    write_json_atomic(path, &value, pretty)
+    write_json_atomic(path, &Versioned { version, body: value }, pretty)
 }
 
 /// Read and parse `path`, or `None` if it's missing, unreadable, or invalid.

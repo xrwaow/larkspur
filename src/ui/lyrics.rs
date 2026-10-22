@@ -44,6 +44,7 @@ use crate::ui::playback_state::PlaybackState;
 use crate::ui::playback::svg_icon;
 use crate::ui::queue::QueueView;
 use crate::ui::cover_store::CoverStore;
+use crate::ui::texture::LoadedTexture;
 use crate::ui::tabs::{strip_height_px, TabsView};
 use crate::ui::library_state::LibraryState;
 use crate::ui::theme::Theme;
@@ -80,7 +81,11 @@ const TEXTURE_BEHIND_TEXT_OPACITY: f32 = 0.35;
 /// happens off-thread; the panel draws the last completed one while the next
 /// is being prepared.
 struct CachedTexture {
+    /// The song this texture has been resolved for.
     song: SongId,
+    /// The cover hash this texture was rendered from. Two songs with the same
+    /// cover bytes share a seed, and therefore the same texture.
+    seed: u64,
     base: DynamicBase,
     image: Arc<RenderImage>,
 }
@@ -185,8 +190,9 @@ impl LyricsView {
     /// Keep the procedural texture for this cover/base up to date.
     ///
     /// Rendering reads and decodes the embedded art, so it runs on the
-    /// background executor; the panel shows its ordinary empty hint until the
-    /// first result lands. A no-op once the texture is cached or known absent.
+    /// background executor. Before rendering, the cover's seed is compared
+    /// with the texture on screen: a song that shares the previous song's art
+    /// keeps that texture instead of rendering an identical one.
     fn ensure_texture(
         &mut self,
         song: SongId,
@@ -206,10 +212,17 @@ impl LyricsView {
         }
         self.texture_attempt = Some(key);
 
+        // Only a texture on the same theme base can be reused.
+        let keep = self
+            .texture
+            .as_ref()
+            .filter(|cached| cached.base == base)
+            .map(|cached| cached.seed);
+
         cx.spawn(async move |this, cx| {
-            let rendered = cx
+            let loaded = cx
                 .background_executor()
-                .spawn(async move { crate::ui::texture::load_for_song(&path, base) })
+                .spawn(async move { crate::ui::texture::load_for_song(&path, base, keep) })
                 .await;
 
             this.update(cx, |this, cx| {
@@ -217,12 +230,24 @@ impl LyricsView {
                     return; // A newer request superseded this one.
                 }
                 this.texture_attempt = None;
-                match rendered {
-                    Some(image) => {
-                        this.texture = Some(CachedTexture { song, base, image });
+                match loaded {
+                    Some(LoadedTexture::Unchanged) => {
+                        // Same cover: the texture already on screen applies.
+                        if let Some(cached) = this.texture.as_mut() {
+                            cached.song = song;
+                        }
                         this.texture_failed = None;
                     }
-                    None => this.texture_failed = Some(key),
+                    Some(LoadedTexture::Rendered { seed, image }) => {
+                        this.texture = Some(CachedTexture { song, seed, base, image });
+                        this.texture_failed = None;
+                    }
+                    None => {
+                        // Don't leave the previous song's texture standing in
+                        // for art that couldn't be read.
+                        this.texture = None;
+                        this.texture_failed = Some(key);
+                    }
                 }
                 cx.notify();
             })
@@ -349,7 +374,7 @@ impl Render for LyricsView {
                 texture = self
                     .texture
                     .as_ref()
-                    .filter(|cached| cached.song == song.id && cached.base == base)
+                    .filter(|cached| cached.base == base)
                     .map(|cached| cached.image.clone());
             }
         }

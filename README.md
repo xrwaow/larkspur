@@ -29,7 +29,7 @@ copies of it.
 | Tag / metadata reading     | `lofty`                         | Reads title/artist/album/track/lyrics tags and embedded cover art across FLAC/MP3/Opus/OGG containers. |
 | UI framework                | `gpui`                          | GPU-accelerated, retained-mode. `Entity<T>` + `Render` views map naturally onto "shared state + independent subscriber modules." Standalone crate, Linux (Wayland + X11) supported. |
 | Cover cache eviction        | `lru`                           | Byte-budgeted in-memory LRU for decoded cover pixel buffers. |
-| Song identity hashing        | `twox-hash`                     | Stable, documented hash algorithm — deliberately **not** `std`'s `DefaultHasher` (SipHash), which is not guaranteed stable across Rust versions and would silently break a persisted library/cover cache on toolchain upgrades. |
+| Song identity              | *(none)*                        | `SongId` is an opaque counter allocated by the scanner and persisted in `identities.json`, not a path hash. Moving a file is reconciled by its metadata fingerprint, so stats and playlist membership survive the move. |
 | Errors                       | `anyhow`                        | One error type everywhere — app and library code alike. |
 
 ## Source map
@@ -39,8 +39,8 @@ Paths are relative to this crate's root. This is the fastest way in:
 | Path | What lives there |
 |------|------------------|
 | `src/lib.rs` | Crate roots — `analysis`, `audio`, `bitrate`, `decode`, `model`, `opus`, `ui`. |
-| `src/model/` | The whole data schema, split by concern: `identity` (`SongId` + hashing), `song` (`SongMetadata`/`ReleaseDate` + lofty loading; serde-derived so the scan cache round-trips it whole), `lyrics` (`Lyrics`/`LyricLine` + `parse_lrc` + `.lrc` sidecars), `cover` (`DecodedImage`/`CoverCache`), `library` (`Library` + playlist autogen + derived artist groupings, with a maintained index), `playlist` (`Playlist`/`PlaylistId`/`PlaylistKind`/`PlaylistOrigin`), `search` (the query language: `Query`/`parse`/`matches`), `select` (`Scope`/`Order`/`Selection` — the one query path every list view goes through), `scan` (`LibraryCache` + mtime-based incremental sync), `view` (`TabId`/`FolderMode`), `input` (`InputAction`), `config` (`Config`: theme, waveform style, sidebar-minimized flag, per-container typefaces and font sizes, synced paths). Framework-agnostic — no GPUI, no rodio — so it unit-tests without a device or a window. |
-| `src/audio.rs` | `PlaybackController` — owns the rodio `Player` and device sink, the `Vec<(SongId, PathBuf)>` queue, seek/next/prev, drain-detection auto-advance (`tick_advance`), and the current track's duration. `track_parts` is the single place the decode source and duration are chosen — it does **not** read tags; the library already holds the metadata, keyed by the entry's `SongId`. Every source is wrapped in a `TapSource`, which copies the samples it hands out into a shared `SampleTap` ring — that's what makes the visualizer real-time. Deliberately does **not** own the waveform. |
+| `src/model/` | The whole data schema, split by concern: `identity` (the allocated `SongId`), `format` (`AudioFormat`/`FormatSet`, parsed once at scan time), `song` (`SongMetadata`/`ReleaseDate` + lofty loading; serde-derived so the scan cache round-trips it whole), `lyrics` (`Lyrics`/`LyricLine` + `parse_lrc` + `.lrc` sidecars), `cover` (`DecodedImage`/`CoverCache`), `library` (`Library` + playlist autogen + domain-scoped derived caches), `playlist` (`Playlist`/`PlaylistId`/`PlaylistKind`/`AlbumOrigin` + the lifetime-split `PlaylistStore`), `user` (`UserStore`: `user.json` playlists/stats/album ids and `identities.json`), `search` (the query language: `Query`/`parse`/`matches`), `select` (`Scope`/`Order`/borrowed `Selection` — the one query path every list view goes through), `scan` (`LibraryCache` + mtime-based incremental sync), `view` (`TabId`/`FolderMode`), `input` (`InputAction`), `config` (`Config`: theme, waveform style, sidebar-minimized flag, per-container typefaces and font sizes, synced paths). Framework-agnostic — no GPUI, no rodio — so it unit-tests without a device or a window. |
+| `src/audio.rs` | `PlaybackController` — owns the rodio `Player` and device sink, the `Vec<QueueEntry>` queue (each entry is a `SongId` plus its shared `Arc<SongMetadata>`), seek/next/prev, drain-detection auto-advance (`tick_advance`), and the current track's duration. `track_parts` is the single place the decode source and duration are chosen — it does **not** read tags; the queue entry already owns the metadata. Every source is wrapped in a `TapSource`, which copies the samples it hands out into a shared `SampleTap` ring — that's what makes the visualizer real-time. Deliberately does **not** own the waveform. |
 | `src/decode.rs` | `open_track(path, gapless)` — the one place a Symphonia container is opened and a playable track selected. Also `PacketDecoder`, the one place a packet is turned into interleaved f32 samples: Opus goes to libopus, everything else to symphonia, and both the playback source and the analysis share it. |
 | `src/opus.rs` | `OpusSource` — symphonia's Ogg demuxer feeding libopus, because symphonia 0.5 demuxes Opus but has no decoder. Handles gapless pre-skip/end trims and accurate seek (decode-and-drop to the exact timestamp). |
 | `src/analysis.rs` | `TrackAnalyzer` — a **sequential, chunked** demux+decode pass: `advance(max_secs)` decodes one bounded slice of media time, folding samples into a fixed number of waveform buckets spread over the track's media time (a `Waveform`, with a running max for auto-scaling) and bucketing packet bytes into the live-bitrate profile. The UI advances it a chunk at a time and publishes the partial waveform, so the transport's bars fill in as the song plays. `analyze_track(path, buckets, bucket)` runs it to completion for the dev `probe`. Also `SpectrumAnalyzer` — the reusable Hann-windowed FFT + log-spaced band fold the real-time visualizer runs over the tapped audio (a hand-rolled radix-2 FFT). |
@@ -367,23 +367,28 @@ it to build the palette.
 ```rust
 struct Library {
     songs: HashMap<SongId, Arc<SongMetadata>>, // Arc: cheap to clone on a scan
-    playlists: HashMap<PlaylistId, Playlist>,  // Playlist.song_ids: Vec<SongId>
-    next_playlist_id: u64,
-    index: Index,   // derived, rebuilt on mutation
+    playlists: PlaylistStore,                  // persisted / ephemeral / smart lifetimes
+    stats: Stats,                              // plays + added stamps (user-owned)
+    song_ids: BTreeMap<PathBuf, SongId>,       // persisted identity map
+    next_song_id: u64,
+    index: Index,                              // derived, refreshed per dirty domain
+    revision: u64,                             // bumped by every real change
 }
 ```
 
 Songs, playlists, and the play queue all reference songs by `SongId`
 rather than owning duplicate `SongMetadata` structs — avoids the classic
-"edited the tag in one place, three other copies are now stale" bug.
+"edited the tag in one place, three other copies are now stale" bug. The
+queue and selection results carry `Arc<SongMetadata>` handles instead of ids +
+a second lookup, so enqueueing and album rendering do one pass, not two.
 
-The fields are **private** and the derived `Index` (which album owns each song,
-which playlists each artist appears on, each playlist's release date) is
-rebuilt by every mutating method — so the hot queries (`album_playlist_of`,
-`discography`, `release`, the search grouping) are lookups rather than
-scans, and can't be bypassed into going stale. Bulk paths go through
-`replace_songs`/`replace_playlists`, so the cache never reaches into
-the library's guts.
+The fields are **private**. A mutation marks the domains it invalidated
+(`Dirty::SONGS` / `Dirty::PLAYLISTS`); only the derived views that depend on
+those domains are refreshed, once per batch. That keeps hot queries
+(`album_playlist_of`, `discography`, `release`, the search grouping) as
+lookups rather than scans, and makes it impossible to forget a rebuild:
+every mutation flows through `touch`, which also bumps the library-owned
+`revision`.
 
 ### Playlists — one container, one collection
 
@@ -392,10 +397,12 @@ There is no separate `Playlists` type: `Library` **is** the collection (the
 playlists share one `Playlist` struct; the variant-specific data lives in
 `PlaylistKind`, so there's no parallel `meta`/`origin` pair to keep in sync:
 
-- **`PlaylistKind::Auto(PlaylistOrigin)`** — one per album tag (keyed by album
-  title + album artist, so a compilation stays one playlist), rebuilt by
+- **`PlaylistKind::Auto(AlbumOrigin)`** — one per album tag (keyed by album
+  title + album artist + directory, so a compilation stays one playlist and
+  two releases in different folders stay separate), rebuilt by
   `Library::rebuild_auto` on every scan and read-only. The origin is the
-  natural key a rescan matches on, so a rebuilt album keeps its id.
+  natural key a rescan matches on, and its allocated id is persisted in
+  `user.json`, so a rebuilt album keeps its id.
 - **`PlaylistKind::Custom { title }`** — user-owned: `add_song`/`remove_song`/
   `rename`/`remove_playlist`. Ids come from a persisted monotonic counter, so
   two playlists may share a title.
@@ -420,9 +427,11 @@ re-parsed. A song's stamp is the newer of the audio file's mtime and its
 including the release date and lyrics — is cached to
 `~/.cache/larkspur/library.json` (versioned, written via a temp file +
 rename); audio is never cached — it's decoded at play time — and cover pixels
-live in the cover cache instead. The user-owned playlists live in a separate
-`playlists.json`, so a playlist edit writes a few kilobytes instead of the
-whole song library.
+live in the cover cache instead. User-owned state lives beside it in
+`user.json` (custom playlists, stats, album ids) and `identities.json` (the
+path→id map), so a playlist edit or a counted play writes a few kilobytes
+instead of the whole song library, and a scan running in the background can
+never drop a concurrent user write.
 
 ### Search — one engine, three views
 

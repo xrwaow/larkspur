@@ -13,7 +13,7 @@ use rodio::Source;
 
 use larkspur::analysis::analyze_track;
 use larkspur::audio::build_source;
-use larkspur::model::{Library, LibraryCache, SongMetadata, Stats};
+use larkspur::model::{Library, LibraryCache, SongMetadata};
 
 fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -40,7 +40,7 @@ fn seek(path: &String) -> anyhow::Result<()> {
     let path = Path::new(path);
 
     // Exercise the tag-reading path too, like the app's track_parts.
-    let metadata = SongMetadata::load(path)?;
+    let metadata = SongMetadata::read(path)?;
     println!(
         "metadata: {:?} / {:?}, duration {:?}",
         &metadata.song_name,
@@ -169,9 +169,9 @@ fn library(roots: &[String]) -> anyhow::Result<()> {
         std::env::temp_dir().join(format!("larkspur-library-dump-{}.json", std::process::id()));
     let mut cache = LibraryCache::open(cache_path.clone());
     let mut library = Library::default();
-    let (songs, report) = cache.sync(&roots, true, &mut Stats::default());
-    library.replace_songs(songs);
-    library.rebuild_auto();
+    let result = cache.sync(&roots, true, &library.identities());
+    let report = result.report.clone();
+    library.adopt_scan(result.songs, result.identities, result.added);
 
     println!("roots: {}", roots.len());
     println!(
