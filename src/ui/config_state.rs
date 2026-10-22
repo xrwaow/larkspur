@@ -17,7 +17,7 @@ use std::time::Duration;
 use gpui::{Context, Entity, Rgba, Subscription};
 
 use crate::model::config::{
-    Config, DynamicBase, FontKind, TextureMode, WaveformStyle, WindowPlacement,
+    Config, DynamicBase, FontKind, TextureMode, TransportLayout, WaveformStyle, WindowPlacement,
 };
 use crate::model::ThemeKind;
 use crate::ui::container::Container;
@@ -129,6 +129,11 @@ impl ConfigState {
         self.config.lyrics_texture
     }
 
+    /// How the transport bar arranges its controls and seek bar.
+    pub fn transport_layout(&self) -> TransportLayout {
+        self.config.transport_layout
+    }
+
     /// Whether the left library rail is collapsed to its header button.
     pub fn sidebar_minimized(&self) -> bool {
         self.config.sidebar_minimized
@@ -168,6 +173,15 @@ impl ConfigState {
     pub fn set_lyrics_texture(&mut self, mode: TextureMode, cx: &mut Context<Self>) {
         if self.config.lyrics_texture != mode {
             self.config.lyrics_texture = mode;
+            self.persist();
+            cx.notify();
+        }
+    }
+
+    /// Choose how the transport bar arranges its controls and seek bar.
+    pub fn set_transport_layout(&mut self, layout: TransportLayout, cx: &mut Context<Self>) {
+        if self.config.transport_layout != layout {
+            self.config.transport_layout = layout;
             self.persist();
             cx.notify();
         }

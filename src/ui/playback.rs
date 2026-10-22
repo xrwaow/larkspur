@@ -3,17 +3,17 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    canvas, div, point, prelude::*, px, svg, AnyElement, Bounds, ClickEvent, Context, Entity,
-    MouseButton, MouseDownEvent, PathBuilder, Pixels, Render, Rgba, Subscription, Window,
+    canvas, div, fill, point, prelude::*, px, size, svg, AnyElement, Bounds, ClickEvent, Context,
+    Entity, MouseButton, MouseDownEvent, PathBuilder, Pixels, Render, Rgba, Subscription, Window,
 };
 
 use crate::audio::RepeatMode;
-use crate::model::config::WaveformStyle;
+use crate::model::config::{TransportLayout, WaveformStyle};
 use crate::model::InputAction;
 use crate::ui::animation::{ease_out_cubic, Animator};
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
-use crate::ui::format::format_duration;
+use crate::ui::format::{format_duration, format_duration_fixed};
 use crate::ui::playback_state::PlaybackState;
 use crate::ui::theme::Theme;
 use crate::ui::widgets;
@@ -160,6 +160,59 @@ impl PlaybackView {
             cx.notify();
         });
     }
+
+    /// The transport controls, laid out in one row. Shared by both transport
+    /// arrangements so the buttons and their behaviour can't drift apart.
+    fn transport_controls(
+        &self,
+        theme: Theme,
+        repeat: RepeatMode,
+        can_prev: bool,
+        can_next: bool,
+        ended: bool,
+        playing: bool,
+        queue_open: bool,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        div()
+            .flex()
+            .items_center()
+            .justify_center()
+            .gap_3()
+            .flex_none()
+            .child(repeat_toggle(theme, repeat, self.repeat_hovered, cx))
+            .child(transport_button(
+                "prev",
+                can_prev,
+                self.prev_hovered,
+                PREV_POLYGONS,
+                theme,
+                cx.listener(|this, _event, _window, cx| {
+                    this.dispatch(InputAction::PrevTrack, cx);
+                }),
+                cx.listener(|this, hovered: &bool, _window, cx| {
+                    this.prev_hovered = *hovered;
+                    cx.notify();
+                }),
+            ))
+            .child(play_button(playing, ended, theme, cx))
+            .child(transport_button(
+                "next",
+                can_next,
+                self.next_hovered,
+                NEXT_POLYGONS,
+                theme,
+                cx.listener(|this, _event, _window, cx| {
+                    this.dispatch(InputAction::NextTrack, cx);
+                }),
+                cx.listener(|this, hovered: &bool, _window, cx| {
+                    this.next_hovered = *hovered;
+                    cx.notify();
+                }),
+            ))
+            .child(queue_toggle(theme, queue_open, self.queue_hovered, cx))
+            .into_any_element()
+    }
 }
 
 impl Container for PlaybackView {
@@ -186,6 +239,8 @@ impl Render for PlaybackView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.themed.theme();
         let style = self.config.read(cx).waveform();
+        let alt_layout =
+            self.config.read(cx).transport_layout() == TransportLayout::Alternative;
 
         // Snapshot the shared state once, then drop the borrow before
         // building elements.
@@ -216,7 +271,8 @@ impl Render for PlaybackView {
 
         let seek_bar = div()
             .id("seek-bar")
-            .w(px(BAR_WIDTH))
+            .when(alt_layout, |d| d.w_full())
+            .when(!alt_layout, |d| d.w(px(BAR_WIDTH)))
             .h(px(BAR_HEIGHT))
             .relative()
             .overflow_hidden()
@@ -258,76 +314,67 @@ impl Render for PlaybackView {
                 }),
             );
 
-        // Transport buttons on top, the waveform below flanked by the two
-        // times. The live bitrate lives in the tab strip's right edge
-        // (ui::tabs), not here.
-        div()
-            .flex()
-            .flex_col()
-            .items_center()
-            .gap_3()
-            .p_4()
-            .w_full()
-            .bg(theme.panel_bg)
-            .font_family(theme.font)
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .justify_center()
-                    .gap_3()
-                    .w_full()
-                    .child(repeat_toggle(theme, repeat, self.repeat_hovered, cx))
-                    .child(transport_button(
-                        "prev",
-                        can_prev,
-                        self.prev_hovered,
-                        PREV_POLYGONS,
-                        theme,
-                        cx.listener(|this, _event, _window, cx| {
-                            this.dispatch(InputAction::PrevTrack, cx);
-                        }),
-                        cx.listener(|this, hovered: &bool, _window, cx| {
-                            this.prev_hovered = *hovered;
-                            cx.notify();
-                        }),
-                    ))
-                    .child(play_button(playing, ended, theme, cx))
-                    .child(transport_button(
-                        "next",
-                        can_next,
-                        self.next_hovered,
-                        NEXT_POLYGONS,
-                        theme,
-                        cx.listener(|this, _event, _window, cx| {
-                            this.dispatch(InputAction::NextTrack, cx);
-                        }),
-                        cx.listener(|this, hovered: &bool, _window, cx| {
-                            this.next_hovered = *hovered;
-                            cx.notify();
-                        }),
-                    ))
-                    .child(queue_toggle(theme, queue_open, self.queue_hovered, cx)),
-            )
-            .child(
-                div()
-                    .flex()
-                    .items_center()
-                    .gap_3()
-                    .child(
-                        div()
-                            .text_size(px(theme.small_px()))
-                            .text_color(theme.text_muted)
-                            .child(format_duration(position)),
-                    )
-                    .child(seek_bar)
-                    .child(
-                        div()
-                            .text_size(px(theme.small_px()))
-                            .text_color(theme.text_muted)
-                            .child(format_duration(duration)),
-                    ),
-            )
+        let controls = self.transport_controls(
+            theme, repeat, can_prev, can_next, ended, playing, queue_open, cx,
+        );
+        let position_label = div()
+            .flex_none()
+            .text_size(px(theme.small_px()))
+            .text_color(theme.text_muted)
+            .child(format_duration_fixed(position));
+        let duration_label = div()
+            .flex_none()
+            .text_size(px(theme.small_px()))
+            .text_color(theme.text_muted)
+            .child(format_duration(duration));
+
+        // The live bitrate lives in the tab strip's right edge (ui::tabs),
+        // not here. The stacked arrangement puts the controls above the
+        // waveform; the alternative puts the controls left and the waveform
+        // right, in one short row.
+        if alt_layout {
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .px_4()
+                .py_2()
+                .w_full()
+                .bg(theme.panel_bg)
+                .font_family(theme.font)
+                .child(controls)
+                .child(
+                    div()
+                        .flex()
+                        .flex_1()
+                        .min_w_0()
+                        .items_center()
+                        .gap_3()
+                        .child(position_label)
+                        .child(div().flex_1().min_w_0().child(seek_bar))
+                        .child(duration_label),
+                )
+        } else {
+            div()
+                .flex()
+                .flex_col()
+                .items_center()
+                .gap_3()
+                .p_4()
+                .w_full()
+                .bg(theme.panel_bg)
+                .font_family(theme.font)
+                .child(controls)
+                .child(
+                    div()
+                        .flex()
+                        .items_center()
+                        .gap_3()
+                        .child(position_label)
+                        .child(seek_bar)
+                        .child(duration_label),
+                )
+        }
     }
 }
 
@@ -536,32 +583,37 @@ fn render_waveform(
     theme: Theme,
 ) -> AnyElement {
     match style {
-        WaveformStyle::FlatLine => div()
-            .w_full()
-            .h_full()
-            .relative()
-            .child(
-                // Line centered vertically in the bar (BAR_HEIGHT = 40).
-                div()
-                    .absolute()
-                    .top(px((BAR_HEIGHT - 2.0) / 2.0))
-                    .w_full()
-                    .h(px(2.0))
-                    .bg(theme.waveform),
-            )
-            .child(
-                // Progress dot centered on the line, fully inside the bar
-                // (overflow_hidden would clip a negatively-offset dot, and
-                // the dot must not run past the right edge at progress 1.0).
-                div()
-                    .absolute()
-                    .left(px(progress * (BAR_WIDTH - 10.0)))
-                    .top(px((BAR_HEIGHT - 10.0) / 2.0))
-                    .size(px(10.0))
-                    .rounded_full()
-                    .bg(theme.accent),
-            )
-            .into_any_element(),
+        WaveformStyle::FlatLine => canvas(
+            |bounds, _window, _cx| bounds,
+            move |bounds, _prepaint, window, _cx| {
+                let x0 = f32::from(bounds.origin.x);
+                let y0 = f32::from(bounds.origin.y);
+                let w = f32::from(bounds.size.width);
+                let h = f32::from(bounds.size.height);
+
+                // The line is centered vertically and spans the real width,
+                // so it follows the bar as the window resizes.
+                let line = Bounds::new(
+                    point(px(x0), px(y0 + (h - 2.0) / 2.0)),
+                    size(px(w), px(2.0)),
+                );
+                window.paint_quad(fill(line, theme.waveform));
+
+                // The progress dot is positioned from the painted width, not
+                // the old fixed BAR_WIDTH, and kept fully inside both ends.
+                let dot = 10.0;
+                let x = x0 + (progress * (w - dot)).clamp(0.0, (w - dot).max(0.0));
+                let dot_bounds = Bounds::new(
+                    point(px(x), px(y0 + (h - dot) / 2.0)),
+                    size(px(dot), px(dot)),
+                );
+                window.paint_quad(
+                    fill(dot_bounds, theme.accent).corner_radii(px(dot / 2.0)),
+                );
+            },
+        )
+        .size_full()
+        .into_any_element(),
         WaveformStyle::Bars => waveform_bars(bars, progress, theme),
     }
 }
@@ -575,8 +627,7 @@ fn waveform_bars(bars: Arc<Vec<f32>>, progress: f32, theme: Theme) -> AnyElement
     canvas(
         |_bounds, _window, _cx| (),
         move |bounds, _prepaint, window, _cx| {
-            let count = bars.len();
-            widgets::paint_bars(window, bounds, &bars, 0.04, |i| {
+            widgets::paint_bars(window, bounds, &bars, 0.04, |i, count| {
                 if (i as f32 / count.max(1) as f32) < progress {
                     theme.accent
                 } else {

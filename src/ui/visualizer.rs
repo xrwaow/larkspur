@@ -193,7 +193,7 @@ impl Render for VisualizerView {
                     move |bounds, _prepaint, window, _cx| {
                         // The bar paint is the shared transport/visualizer
                         // pass — only the rise/fall dynamics are this view's.
-                        widgets::paint_bars(window, bounds, &bars, 0.03, |_| theme.accent);
+                        widgets::paint_bars(window, bounds, &bars, 0.03, |_, _| theme.accent);
                     },
                 )
                 .size_full(),

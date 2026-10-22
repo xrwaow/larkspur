@@ -270,11 +270,21 @@ pub fn search_box(
 /// Gap between painted bars, in px.
 pub const BAR_GAP: f32 = 1.0;
 
+/// The narrowest a bar slot may get before neighbouring values are merged.
+/// One px of that is [`BAR_GAP`], leaving a bar visible at 2 px wide.
+const MIN_BAR_SLOT: f32 = 3.0;
+
 /// Paint a strip of bottom-aligned bars in one pass — the transport's
 /// waveform and the visualizer's spectrum share this geometry. `values` are
 /// 0.0–1.0 heights spread evenly across `bounds`, with [`BAR_GAP`] between
 /// them; `floor` keeps a tiny baseline visible instead of a flat empty strip;
-/// `color` picks per bar (the waveform's played/unplayed split).
+/// `color` picks per bar from its index and the painted bar count (the
+/// waveform's played/unplayed split).
+///
+/// When `bounds` is too narrow to show every value at a usable width, adjacent
+/// values are merged (taking the tallest in each group) so the strip keeps a
+/// readable bar width as the window shrinks instead of drawing overlapping
+/// one-pixel slivers.
 ///
 /// One element with one paint callback, instead of one `div` per bar — the
 /// element-tree cost is constant no matter how many buckets we use, so the
@@ -284,24 +294,32 @@ pub fn paint_bars(
     bounds: Bounds<Pixels>,
     values: &[f32],
     floor: f32,
-    color: impl Fn(usize) -> Rgba,
+    color: impl Fn(usize, usize) -> Rgba,
 ) {
-    let count = values.len();
-    if count == 0 {
+    let source_count = values.len();
+    if source_count == 0 {
         return;
     }
     let width = f32::from(bounds.size.width);
     let height = f32::from(bounds.size.height);
+    let max_bars = (width / MIN_BAR_SLOT).floor().max(1.0) as usize;
+    let count = source_count.min(max_bars);
     let slot = width / count as f32;
     let bar_width = (slot - BAR_GAP).max(1.0);
     let origin_x = f32::from(bounds.origin.x);
     let origin_y = f32::from(bounds.origin.y);
 
-    for (i, &value) in values.iter().enumerate() {
+    for i in 0..count {
+        // Partition the source values evenly, so no data is dropped at either
+        // end and the group's peak still shows through the merged bar.
+        let start = i * source_count / count;
+        let end = ((i + 1) * source_count / count).max(start + 1);
+        let value = values[start..end].iter().copied().fold(0.0, f32::max);
+
         let bar_height = (value.max(floor) * height).max(1.0);
         let x = origin_x + i as f32 * slot + (slot - bar_width) / 2.0;
         let y = origin_y + (height - bar_height);
         let bar = Bounds::new(point(px(x), px(y)), size(px(bar_width), px(bar_height)));
-        window.paint_quad(fill(bar, color(i)));
+        window.paint_quad(fill(bar, color(i, count)));
     }
 }

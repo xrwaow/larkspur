@@ -96,6 +96,29 @@ impl WaveformStyle {
     }
 }
 
+/// How the transport bar arranges its controls and seek bar.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub enum TransportLayout {
+    /// Controls above, seek bar below — the taller, original arrangement.
+    #[default]
+    Stacked,
+    /// Controls left, seek bar right in one short row — the minimal variant.
+    Alternative,
+}
+
+impl TransportLayout {
+    /// Every selectable layout, in the order the settings panel lists them.
+    pub const ALL: [TransportLayout; 2] =
+        [TransportLayout::Stacked, TransportLayout::Alternative];
+
+    pub fn label(self) -> &'static str {
+        match self {
+            TransportLayout::Stacked => "Stacked",
+            TransportLayout::Alternative => "Minimal",
+        }
+    }
+}
+
 /// When the lyrics panel draws its procedural cover-art texture.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 pub enum TextureMode {
@@ -228,6 +251,8 @@ pub struct Config {
     pub visualizer: bool,
     /// When the lyrics panel draws its procedural cover-art texture.
     pub lyrics_texture: TextureMode,
+    /// How the transport bar arranges its controls and seek bar.
+    pub transport_layout: TransportLayout,
     /// Whether the left library rail is collapsed to its header button.
     pub sidebar_minimized: bool,
     /// Where the window was when the app last ran, so it reopens the same
@@ -258,6 +283,8 @@ struct ConfigWire {
     #[serde(default)]
     lyrics_texture: TextureMode,
     #[serde(default)]
+    transport_layout: TransportLayout,
+    #[serde(default)]
     sidebar_minimized: bool,
     #[serde(default)]
     window: Option<WindowPlacement>,
@@ -283,6 +310,7 @@ impl<'de> Deserialize<'de> for Config {
             waveform: wire.waveform,
             visualizer: wire.visualizer,
             lyrics_texture: wire.lyrics_texture,
+            transport_layout: wire.transport_layout,
             sidebar_minimized: wire.sidebar_minimized,
             window: wire.window,
         })
@@ -299,6 +327,7 @@ impl Default for Config {
             waveform: WaveformStyle::default(),
             visualizer: default_visualizer(),
             lyrics_texture: TextureMode::default(),
+            transport_layout: TransportLayout::default(),
             sidebar_minimized: false,
             window: None,
         }
@@ -550,6 +579,21 @@ mod tests {
         let json = r#"{"theme":"Dark","font_sizes":{},"roots":[]}"#;
         let old: Config = serde_json::from_str(json).unwrap();
         assert_eq!(old.lyrics_texture, TextureMode::NoLyrics);
+    }
+
+    #[test]
+    fn transport_layout_defaults_to_stacked_and_round_trips() {
+        assert_eq!(Config::default().transport_layout, TransportLayout::Stacked);
+
+        let mut config = Config::default();
+        config.transport_layout = TransportLayout::Alternative;
+        let bytes = serde_json::to_vec(&config).unwrap();
+        let back: Config = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(back.transport_layout, TransportLayout::Alternative);
+
+        let json = r#"{"theme":"Dark","font_sizes":{},"roots":[]}"#;
+        let old: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(old.transport_layout, TransportLayout::Stacked);
     }
 
     #[test]

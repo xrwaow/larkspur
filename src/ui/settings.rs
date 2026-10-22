@@ -20,7 +20,8 @@ use gpui::{
 };
 
 use crate::model::config::{
-    DynamicBase, FontKind, TextureMode, ThemeKind, WaveformStyle, MAX_FONT_SIZE, MIN_FONT_SIZE,
+    DynamicBase, FontKind, TextureMode, ThemeKind, TransportLayout, WaveformStyle, MAX_FONT_SIZE,
+    MIN_FONT_SIZE,
 };
 use crate::ui::browse::BrowseView;
 use crate::ui::config_state::{ConfigState, Themed};
@@ -48,16 +49,18 @@ enum Segmented {
     Theme,
     DynamicBase,
     Waveform,
+    Transport,
     Visualizer,
     Texture,
 }
 
 impl Segmented {
     /// All groups, in render order-ish. Used to create their focus handles.
-    const ALL: [Segmented; 5] = [
+    const ALL: [Segmented; 6] = [
         Segmented::Theme,
         Segmented::DynamicBase,
         Segmented::Waveform,
+        Segmented::Transport,
         Segmented::Visualizer,
         Segmented::Texture,
     ];
@@ -67,6 +70,7 @@ impl Segmented {
             Segmented::Theme => "seg-theme",
             Segmented::DynamicBase => "seg-dynamic-base",
             Segmented::Waveform => "seg-waveform",
+            Segmented::Transport => "seg-transport",
             Segmented::Visualizer => "seg-visualizer",
             Segmented::Texture => "seg-lyrics-texture",
         }
@@ -77,6 +81,7 @@ impl Segmented {
             Segmented::Theme => &["Dark", "Light", "Dynamic"],
             Segmented::DynamicBase => &["Black", "White"],
             Segmented::Waveform => &["Bars", "Line"],
+            Segmented::Transport => &["Stacked", "Minimal"],
             Segmented::Visualizer => &["On", "Off"],
             Segmented::Texture => &["Off", "No lyrics", "Always"],
         }
@@ -145,6 +150,10 @@ impl SettingsView {
                 .iter()
                 .position(|style| *style == config.waveform())
                 .unwrap_or(0),
+            Segmented::Transport => TransportLayout::ALL
+                .iter()
+                .position(|layout| *layout == config.transport_layout())
+                .unwrap_or(0),
             Segmented::Visualizer => usize::from(!config.visualizer()),
             Segmented::Texture => TextureMode::ALL
                 .iter()
@@ -170,6 +179,10 @@ impl SettingsView {
             Segmented::Waveform => {
                 let style = WaveformStyle::ALL[index];
                 self.config.update(cx, |config, cx| config.set_waveform(style, cx));
+            }
+            Segmented::Transport => {
+                let layout = TransportLayout::ALL[index];
+                self.config.update(cx, |config, cx| config.set_transport_layout(layout, cx));
             }
             Segmented::Visualizer => {
                 let on = index == 0;
@@ -262,6 +275,7 @@ impl Render for SettingsView {
         let theme_active = self.segment_active(Segmented::Theme, cx);
         let base_active = self.segment_active(Segmented::DynamicBase, cx);
         let waveform_active = self.segment_active(Segmented::Waveform, cx);
+        let transport_active = self.segment_active(Segmented::Transport, cx);
         let visualizer_active = usize::from(!visualizer_on);
         let texture_active = self.segment_active(Segmented::Texture, cx);
         let roots: Vec<PathBuf> = config.roots().to_vec();
@@ -294,6 +308,15 @@ impl Render for SettingsView {
 
         // --- waveform style ---
         items.push(self.segment_row(theme, Segmented::Waveform, "Waveform", waveform_active, cx));
+
+        // --- transport arrangement ---
+        items.push(self.segment_row(
+            theme,
+            Segmented::Transport,
+            "Transport",
+            transport_active,
+            cx,
+        ));
 
         // --- visualizer band ---
         items.push(self.segment_row(

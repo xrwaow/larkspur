@@ -18,3 +18,22 @@ pub fn format_secs(secs: u64) -> String {
 pub fn format_duration(duration: Duration) -> String {
     format_secs(duration.as_secs())
 }
+
+/// `format_duration` padded to a minimum five-character width. The transport's
+/// left-hand position readout uses this so growing from `9:59` to `10:00`
+/// doesn't resize the seek bar next to it.
+pub fn format_duration_fixed(duration: Duration) -> String {
+    format!("{:>5}", format_duration(duration))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn the_transport_readout_stays_the_same_width_across_ten_minutes() {
+        assert_eq!(format_duration_fixed(Duration::from_secs(59)), " 0:59");
+        assert_eq!(format_duration_fixed(Duration::from_secs(9 * 60 + 59)), " 9:59");
+        assert_eq!(format_duration_fixed(Duration::from_secs(10 * 60)), "10:00");
+    }
+}
