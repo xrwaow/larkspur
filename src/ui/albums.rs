@@ -7,6 +7,9 @@
 //! search passes what a query matched, a playlist passes its own songs — so the
 //! snapshot, the header, and the track row all live here.
 //!
+//! Icon view draws the same sections as covers; its popup song panel (see
+//! [`icon_info_panel`]) is the one place the covers carry text.
+//!
 //! Column widths are derived from the theme's font size (see [`Theme`]), so
 //! raising a container's font size scales the columns with the text rather than
 //! misaligning them.
@@ -16,9 +19,8 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    canvas, div, fill, img, point, prelude::*, px, size, AnyElement, App, Bounds, ClickEvent,
-    Context, ElementId, Entity, MouseButton, MouseDownEvent, ObjectFit, Pixels, RenderImage, Rgba,
-    SharedString, Window,
+    div, img, prelude::*, px, AnyElement, App, ClickEvent, Context, ElementId, Entity,
+    MouseButton, MouseDownEvent, ObjectFit, RenderImage, Rgba, SharedString, Window,
 };
 
 use crate::model::search::SongGroup;
@@ -30,7 +32,7 @@ use crate::ui::library_state::LibraryState;
 use crate::ui::marquee;
 use crate::ui::row_list::{Cell, Highlight};
 use crate::ui::theme::Theme;
-use crate::ui::widgets::blend;
+use crate::ui::widgets::{blend, edge_fade, Side};
 
 /// Cover thumbnail size in an album header.
 pub const THUMB_PX: f32 = 64.0;
@@ -271,9 +273,6 @@ fn album_meta(tracks: usize, total_secs: u64) -> String {
 pub enum ListItem {
     /// An album header.
     Header(usize),
-    /// A one-track section, collapsed into a single row — the search panel's
-    /// rendering of a single.
-    Compact(usize),
     /// Track `index` of section `section`.
     Track { section: usize, index: usize },
 }
@@ -282,25 +281,21 @@ impl ListItem {
     /// The section this row belongs to.
     pub fn section(self) -> usize {
         match self {
-            ListItem::Header(s) | ListItem::Compact(s) => s,
+            ListItem::Header(s) => s,
             ListItem::Track { section, .. } => section,
         }
     }
 }
 
-/// How rows are flattened from album sections: with album headers, as a flat
-/// list of tracks (the queue), or with one-track sections collapsed into a
-/// single compact row (search).
+/// How rows are flattened from album sections: with album headers, or as a flat
+/// list of tracks (the queue).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum RowLayout {
-    /// Headers plus track rows — the browse and playlist tables.
+    /// Headers plus track rows — the browse, search, and playlist tables.
     #[default]
     Albums,
     /// Track rows only, no headers — the queue panel.
     Flat,
-    /// Like [`Albums`](Self::Albums), but a one-track section collapses into a
-    /// single row carrying its cover — the search panel.
-    CompactSingles,
 }
 
 /// Flatten sections into drawable rows according to `layout`.
@@ -314,9 +309,6 @@ pub fn flatten(sections: &[AlbumSection], layout: RowLayout) -> Vec<ListItem> {
                 }
             }
             _ if data.tracks.is_empty() => items.push(ListItem::Header(section)),
-            RowLayout::CompactSingles if data.tracks.len() == 1 => {
-                items.push(ListItem::Compact(section));
-            }
             _ => {
                 items.push(ListItem::Header(section));
                 for index in 0..data.tracks.len() {
@@ -344,9 +336,6 @@ pub fn row_song(items: &[ListItem], sections: &[AlbumSection], ix: usize) -> Opt
         ListItem::Track { section, index } => {
             sections.get(*section)?.tracks.get(*index).map(|track| track.song)
         }
-        ListItem::Compact(section) => {
-            sections.get(*section)?.tracks.first().map(|track| track.song)
-        }
         ListItem::Header(_) => None,
     }
 }
@@ -365,7 +354,6 @@ pub fn row_target(
 ) -> Option<(SectionSource, usize)> {
     match items.get(ix)? {
         ListItem::Track { section, index } => Some((sections.get(*section)?.source, *index)),
-        ListItem::Compact(section) => Some((sections.get(*section)?.source, 0)),
         ListItem::Header(_) => None,
     }
 }
@@ -502,6 +490,9 @@ pub trait RowActions<V: Render>: 'static {
     /// A row (or, in icon view, an album cover) was right-clicked. `songs` is
     /// what the menu acts on — the clicked row's song, or the album's songs —
     /// and `playlist` is the playlist the row or card belongs to.
+    ///
+    /// Icon cards use [`card_context`](Self::card_context) instead: a
+    /// right-click on the cover opens its info panel, not a menu.
     fn context(
         &self,
         view: &mut V,
@@ -514,8 +505,39 @@ pub trait RowActions<V: Render>: 'static {
         cx: &mut Context<V>,
     );
 
+    /// A right-click on an icon card. Most action sets never see one; the icon
+    /// grid toggles its info panel here for a multi-song card, while a single
+    /// raises its song menu instead.
+    fn card_context(
+        &self,
+        _view: &mut V,
+        _card: usize,
+        _event: &MouseDownEvent,
+        _window: &mut Window,
+        _cx: &mut Context<V>,
+    ) {
+    }
+
     /// A row's hover state changed.
     fn hover(&self, view: &mut V, item_ix: usize, hovered: bool, cx: &mut Context<V>);
+
+    /// An info-panel row's title cell was hovered; `travel` is how far its text
+    /// overflows the cell, in px. Icon view keeps one marquee per panel row,
+    /// so a long song title or menu label slides on its own hover.
+    fn info_cell_hover(
+        &self,
+        _view: &mut V,
+        _row: usize,
+        _hovered: bool,
+        _travel: f32,
+        _cx: &mut Context<V>,
+    ) {
+    }
+
+    /// An info-panel row's hover state changed (anywhere on the row) — the
+    /// background its title's fade has to dissolve into.
+    fn info_row_hover(&self, _view: &mut V, _row: usize, _hovered: bool, _cx: &mut Context<V>) {
+    }
 
     /// A row's title or artist cell hover state changed, so its marquee slides
     /// on its own.
@@ -551,11 +573,9 @@ pub struct RowContext<'a> {
     pub library: &'a Entity<LibraryState>,
     /// The currently-playing song, if it is one.
     pub current: Option<SongId>,
-    /// Whether audio is actually playing, so the playing row's equalizer only
-    /// animates while it should.
-    pub playing: bool,
-    /// The shared clock's elapsed seconds, driving the equalizer's motion.
-    pub eq_phase: f32,
+    /// The playing row's equalizer — a retained view that animates itself
+    /// (see [`crate::ui::eq`]), so the list doesn't repaint for it.
+    pub eq: Option<Entity<crate::ui::eq::EqBars>>,
     /// The playing song's live bitrate label, preformatted once per frame —
     /// shown on its row instead of the declared one.
     pub live_bitrate_label: Option<SharedString>,
@@ -576,9 +596,6 @@ struct RowPaint {
     theme: Theme,
     /// This row is the current track.
     playing: bool,
-    /// Audio is actually playing (the equalizer animates only then).
-    audio_playing: bool,
-    eq_phase: f32,
     selection: Option<f32>,
     hover: Option<f32>,
     /// The title cell's marquee offset, in px.
@@ -627,7 +644,6 @@ pub fn render_item<V: Render + 'static>(
     // A header has no title/artist cells or row actions to wire; draw it and go.
     let Some((track, index)) = (match item {
         ListItem::Header(_) => None,
-        ListItem::Compact(_) => Some((&section.tracks[0], 0)),
         ListItem::Track { index, .. } => Some((&section.tracks[index], index)),
     }) else {
         let cover = header_cover(context, section, cx);
@@ -642,11 +658,12 @@ pub fn render_item<V: Render + 'static>(
         Some(shift) => (shift, false),
         None => (0.0, context.drag.is_some()),
     };
+    // The playing row's self-animating equalizer, rendered in place of the
+    // track number (see `crate::ui::eq`).
+    let eq = playing.then(|| context.eq.clone()).flatten().map(|eq| eq.into_any_element());
     let paint = RowPaint {
         theme: context.theme,
         playing,
-        audio_playing: context.playing,
-        eq_phase: context.eq_phase,
         selection: context.highlight.selection(ix),
         hover: context.highlight.hover(ix),
         title_offset: context.highlight.marquee_offset(ix, Cell::Title),
@@ -663,8 +680,7 @@ pub fn render_item<V: Render + 'static>(
         slim: context.slim,
     };
 
-    // The five listeners a track row wires up — the same for a compact row
-    // (`index` is its section's only track) and a multi-track one.
+    // The five listeners a track row wires up — the same for every row.
     let actions = actions.expect("a row is interactive");
     let (a1, actions2) = (actions.clone(), actions.clone());
     let (actions3, actions4) = (actions.clone(), actions.clone());
@@ -690,35 +706,18 @@ pub fn render_item<V: Render + 'static>(
         })),
     };
 
-    let year_label = section.date.map(|date| date.year().to_string());
-    if matches!(item, ListItem::Compact(_)) {
-        // A compact row carries its section's cover on the left.
-        request_cover(context.covers, context.library, section.cover_song, cx);
-        let cover = context.covers.read(cx).cover_of(section.cover_song);
-        track_row(
-            &paint,
-            ix,
-            track,
-            index,
-            columns,
-            cover,
-            Some(year_label.unwrap_or_default()),
-            handlers,
-        )
-    } else {
-        // A custom or smart playlist's row carries its own song's cover; a
-        // track of an album doesn't (the header holds the cover).
-        let row_cover = (section.row_covers && !context.slim).then(|| {
-            request_cover(context.covers, context.library, Some(song), cx);
-            context.covers.read(cx).cover_of(Some(song))
-        }).flatten();
-        track_row(&paint, ix, track, index, columns, row_cover, None, handlers)
-    }
+    // A custom or smart playlist's row carries its own song's cover; a track
+    // of an album doesn't (the header holds the cover).
+    let row_cover = (section.row_covers && !context.slim).then(|| {
+        request_cover(context.covers, context.library, Some(song), cx);
+        context.covers.read(cx).cover_of(Some(song))
+    }).flatten();
+    track_row(&paint, eq, ix, track, index, columns, row_cover, handlers)
 }
 
 /// Ask the store for a section's cover, if it isn't already known. Called while
 /// rendering a header, so only the covers actually on screen get requested.
-fn request_cover<V: Render + 'static>(
+pub(crate) fn request_cover<V: Render + 'static>(
     covers: &Entity<CoverStore>,
     library: &Entity<LibraryState>,
     song: Option<SongId>,
@@ -888,30 +887,23 @@ pub fn album_header(theme: Theme, section: &AlbumSection, cover: AnyElement) -> 
         .into_any_element()
 }
 
-/// One track row. A compact row (a one-track section) is compressed with its
-/// section's cover on the left instead of a number column plus a header; a
-/// regular row shows the number (or the playing row's equalizer), an optional
+/// One track row: the number (or the playing row's equalizer), an optional
 /// per-song cover, then title, artist, and the numeric columns. The playing row
 /// is drawn in the accent colour.
 fn track_row(
     paint: &RowPaint,
+    eq: Option<AnyElement>,
     item_ix: usize,
     track: &TrackRow,
     index: usize,
     columns: &Columns,
     cover: Option<CoverImage>,
-    compact_year: Option<String>,
     handlers: RowHandlers,
 ) -> AnyElement {
-    let compact = compact_year.is_some();
-    let id: ElementId = if compact {
-        ("album-single", item_ix).into()
-    } else {
-        ("album-track", item_ix).into()
-    };
+    let id: ElementId = ("album-track", item_ix).into();
     let theme = paint.theme;
     let playing = paint.playing;
-    let background = row_background(theme, playing, paint.selection, paint.hover, if compact { 0 } else { index });
+    let background = row_background(theme, playing, paint.selection, paint.hover, index);
     // The song-entry convention: regular rows are square; the selected and
     // currently-playing ones carry the slight rounding.
     let rounded = playing || paint.selection.is_some();
@@ -923,7 +915,7 @@ fn track_row(
         .items_center()
         .gap_3()
         .px_4()
-        .py(if compact { px(6.0) } else { px(4.0) })
+        .py(px(4.0))
         .cursor_pointer()
         .bg(background)
         .when(rounded, |d| d.rounded_md())
@@ -933,15 +925,12 @@ fn track_row(
         .on_click(handlers.on_click)
         .on_mouse_down(MouseButton::Right, handlers.on_right_click)
         .on_mouse_down(MouseButton::Left, handlers.on_press)
-        .when(compact, |d| d.child(thumbnail(theme, cover.clone(), theme.cover_col())))
-        .when(!compact, |d| {
-            d.child(if playing {
-                eq_icon(theme, paint.eq_phase, paint.audio_playing)
-            } else {
-                number_cell(theme, track.number)
-            })
-            .children(cover.map(|cover| thumbnail(theme, Some(cover), theme.cover_col())))
+        .child(if playing {
+            eq.unwrap_or_else(|| number_cell(theme, track.number))
+        } else {
+            number_cell(theme, track.number)
         })
+        .children(cover.map(|cover| thumbnail(theme, Some(cover), theme.cover_col())))
         .child(text_cell(
             theme,
             ("row-title", track.song.get()),
@@ -966,13 +955,10 @@ fn track_row(
         ))
         // Fill the gap so the numeric columns stay right-aligned.
         .child(div().flex_1().min_w_0())
-        .when_some(compact_year, |d, year| {
-            d.child(right_cell(theme, theme.year_col(), year))
-        })
         // Always reserve the action column on regular rows, so rows keep
         // identical children and the numeric columns stay put. Slim rows (the
         // queue) end at the gap — no numeric columns follow.
-        .when(!compact && !paint.slim, |d| d.child(div().w(px(theme.action_col())).flex_none()))
+        .when(!paint.slim, |d| d.child(div().w(px(theme.action_col())).flex_none()))
         .when(!paint.slim, |d| {
             d.child(right_cell(theme, theme.bitrate_col(), paint.bitrate.clone()))
         })
@@ -1030,72 +1016,6 @@ fn number_cell(theme: Theme, number: usize) -> AnyElement {
         .text_color(theme.text_faint)
         .child(format!("{number:02}."))
         .into_any_element()
-}
-
-/// How many bars the equalizer draws.
-const EQ_BARS: usize = 3;
-
-/// Width of one equalizer bar, and the gap between them, in px.
-const EQ_BAR_PX: f32 = 2.0;
-const EQ_GAP_PX: f32 = 2.0;
-
-/// The playing row's equalizer: a few small bars in the accent colour, dancing
-/// while the track plays and resting when it's paused. It takes the number
-/// column's place, so the row still lines up. Shared with the queue panel's
-/// rows, which use the same row anatomy.
-pub fn eq_icon(theme: Theme, phase: f32, playing: bool) -> AnyElement {
-    let height = theme.font_size * 0.95;
-    let levels = eq_levels(phase, playing);
-    let width = EQ_BARS as f32 * EQ_BAR_PX + (EQ_BARS - 1) as f32 * EQ_GAP_PX;
-    div()
-        .w(px(theme.number_col()))
-        .flex_none()
-        .h(px(height))
-        .flex()
-        // Start on the same vertical line as the numbers it replaces.
-        .justify_start()
-        .child(
-            canvas(
-                |_bounds, _window, _cx| (),
-                move |bounds, _prepaint, window, _cx| {
-                    paint_eq(window, bounds, &levels, theme.accent);
-                },
-            )
-            .w(px(width))
-            .h_full(),
-        )
-        .into_any_element()
-}
-
-/// The bar heights (0..1) at `phase` seconds. Each bar runs at its own speed
-/// and offset so the three never move in lockstep; a paused track rests at a
-/// short, even profile.
-fn eq_levels(phase: f32, playing: bool) -> [f32; EQ_BARS] {
-    if !playing {
-        return [0.30, 0.55, 0.40];
-    }
-    let mut levels = [0.0; EQ_BARS];
-    for (i, level) in levels.iter_mut().enumerate() {
-        let speed = 5.0 + i as f32 * 1.7;
-        let offset = i as f32 * 1.9;
-        let wave = (phase * speed + offset).sin().abs();
-        *level = 0.22 + 0.78 * wave;
-    }
-    levels
-}
-
-/// Paint the equalizer's bars, bottom-aligned in `bounds`.
-fn paint_eq(window: &mut Window, bounds: Bounds<Pixels>, levels: &[f32; EQ_BARS], color: Rgba) {
-    let height = f32::from(bounds.size.height);
-    let origin_x = f32::from(bounds.origin.x);
-    let origin_y = f32::from(bounds.origin.y);
-    for (i, level) in levels.iter().enumerate() {
-        let bar_height = (level * height).max(2.0);
-        let x = origin_x + i as f32 * (EQ_BAR_PX + EQ_GAP_PX);
-        let y = origin_y + (height - bar_height);
-        let bar = Bounds::new(point(px(x), px(y)), size(px(EQ_BAR_PX), px(bar_height)));
-        window.paint_quad(fill(bar, color));
-    }
 }
 
 /// The row background: playing wins, then the selection crossfade, then the
@@ -1190,8 +1110,9 @@ fn thumbnail_sized(
 }
 
 /// The uniform height of an icon card: cover plus padding. Icon view draws no
-/// text — the playing song's information lives in the bottom bar — so every
-/// card is the same size and the column packing is exact.
+/// text under the cover — details arrive in the popup song panel (see
+/// [`icon_info_panel`]) — so every card is the same size and the column packing
+/// is exact.
 pub fn icon_card_height() -> f32 {
     ICON_PAD_PX * 2.0 + ICON_COVER_PX
 }
@@ -1228,9 +1149,15 @@ pub fn pack_rows(count: usize, viewport_w: f32) -> IconLayout {
 /// overdraw that makes fast scrolling not pop cards in from nothing.
 const ICON_OVERDRAW_PX: f32 = 400.0;
 
-/// The icon grid: every album as a cover — no text under it; the playing
-/// song's information lives in the bottom bar. Cards are uniform, packed into
-/// rows that fill left to right and wrap to the next row when one is full
+/// Breathing room between the hover panel and the viewport's edges, in px.
+pub const ICON_INFO_MARGIN_PX: f32 = 8.0;
+
+/// The hover info panel's cover thumbnail size, in px.
+const ICON_INFO_COVER_PX: f32 = 44.0;
+
+/// The icon grid: every album as a cover, with its details arriving in a
+/// popup panel on right-click (see [`icon_info_panel`]). Cards are uniform, packed
+/// into rows that fill left to right and wrap to the next row when one is full
 /// (see [`pack_rows`]).
 ///
 /// The grid is windowed to the viewport: only the rows whose (pre-computed)
@@ -1243,6 +1170,9 @@ pub fn render_icon_grid<V: Render + 'static>(
     layout: &IconLayout,
     scroll_y: f32,
     viewport_h: f32,
+    // The card whose info panel is on screen: it takes the panel's own
+    // surface, so the cover, its bridge, and the panel read as one shape.
+    active: Option<usize>,
     actions: &Rc<dyn RowActions<V>>,
     cx: &mut Context<V>,
 ) -> AnyElement {
@@ -1281,7 +1211,7 @@ pub fn render_icon_grid<V: Render + 'static>(
                     let section = &sections[card];
                     request_cover(context.covers, context.library, section.cover_song, cx);
                     let cover = context.covers.read(cx).cover_of(section.cover_song);
-                    icon_card(context, section, cover, actions, cx)
+                    icon_card(context, card, section, cover, active == Some(card), actions, cx)
                 })),
         );
     }
@@ -1297,19 +1227,31 @@ pub fn render_icon_grid<V: Render + 'static>(
         .into_any_element()
 }
 
-/// One icon card: just the cover — uniform with every other card. Clicking it
-/// plays the album (what clicking a header row would do); right-clicking
-/// opens the song menu for the album's songs.
+/// One icon card: just the cover — uniform with every other card. A left click
+/// plays the album (what clicking a header row would do); a right-click raises
+/// the side info panel, from which the album's songs can be played or opened
+/// in the song menu. A one-song card has no list to show, so its right-click
+/// raises that song's menu directly (see [`icon_info_panel`]).
 fn icon_card<V: Render + 'static>(
     context: &RowContext,
+    card: usize,
     section: &AlbumSection,
     cover: Option<CoverImage>,
+    active: bool,
     actions: &Rc<dyn RowActions<V>>,
     cx: &mut Context<V>,
 ) -> AnyElement {
     let theme = context.theme;
     let source = section.source;
-    let songs: Vec<SongId> = section.tracks.iter().map(|track| track.song).collect();
+
+    // Hovering only keeps an already-open panel alive (see `icon_info_panel`).
+    // The card index is the panel's identity.
+    let on_hover = {
+        let actions = actions.clone();
+        cx.listener(move |view, hovered: &bool, _window, cx| {
+            actions.hover(view, card, *hovered, cx)
+        })
+    };
 
     // The cover plays the album from its first track.
     let on_click = section.tracks.first().map(|_track| {
@@ -1318,14 +1260,11 @@ fn icon_card<V: Render + 'static>(
             actions.activate(view, 0, source, 0, event, window, cx)
         })
     });
-    // Right-click opens the song menu for the album's songs.
+    // Right-click opens the album's info panel (where the song menu lives).
     let on_right_click = {
         let actions = actions.clone();
-        let songs = songs.clone();
-        let source = section.source;
-        let playlist_context = context.context;
         cx.listener(move |view, event: &MouseDownEvent, window, cx| {
-            actions.context(view, 0, songs.clone(), source, playlist_context, event, window, cx)
+            actions.card_context(view, card, event, window, cx)
         })
     };
 
@@ -1343,11 +1282,14 @@ fn icon_card<V: Render + 'static>(
         .p(px(ICON_PAD_PX))
         .rounded_md()
         .cursor_pointer()
-        .hover(|d| d.bg(theme.row_hover))
+        // While its panel is up the card wears the panel's surface rather than
+        // the hover wash: the bridge is painted over the card's padding, and
+        // only one colour makes that join disappear.
+        .when(active, |d| d.bg(theme.row_active))
+        .when(!active, |d| d.hover(|d| d.bg(theme.row_hover)))
+        .on_hover(on_hover)
         .when_some(on_click, |d, on_click| d.on_click(on_click))
-        .when(!songs.is_empty(), |d| {
-            d.on_mouse_down(MouseButton::Right, on_right_click)
-        })
+        .on_mouse_down(MouseButton::Right, on_right_click)
         // Icon view: singles (one-track sections) get rounded covers;
         // album and playlist covers stay square.
         .child(if section.tracks.len() == 1 {
@@ -1356,6 +1298,378 @@ fn icon_card<V: Render + 'static>(
             thumbnail(theme, cover, ICON_COVER_PX)
         })
         .into_any_element()
+}
+
+/// The hover info panel's width, scaled with the container's font.
+pub fn icon_info_width(theme: Theme) -> f32 {
+    (theme.font_size * 18.0).clamp(210.0, 320.0)
+}
+
+/// The hover info panel's row height, in px.
+fn icon_info_line(theme: Theme) -> f32 {
+    theme.small_px() * 1.5
+}
+
+/// The hover panel's geometry — computed from the track count before it lays
+/// out so the caller can cap it to the viewport, place it, and size its scroll
+/// area (see [`icon_info_metrics`]).
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct IconInfoMetrics {
+    pub panel_w: f32,
+    pub panel_h: f32,
+    /// Height of the clipped, scrollable song list.
+    pub list_h: f32,
+    /// How far the song list can scroll before its last row is flush.
+    pub max_scroll: f32,
+}
+
+/// Measure the hover panel for `tracks` songs in a `viewport_h`-tall grid.
+/// The list is capped so the panel never grows taller than the viewport (or a
+/// comfortable fixed maximum); past that it scrolls.
+///
+/// The fixed chrome is: 12 px padding top and bottom, the 1 px border on each
+/// of those two edges (2 px), the 44 px cover header, two 8 px gaps, and the
+/// 1 px divider. The heading is one truncated line.
+///
+/// The border is in here so a panel's rounded bottom edge sits exactly where
+/// its own height says it does.
+pub fn icon_info_metrics(theme: Theme, tracks: usize, viewport_h: f32) -> IconInfoMetrics {
+    let line = icon_info_line(theme);
+    let fixed = 24.0 + 2.0 + ICON_INFO_COVER_PX + 16.0 + 1.0;
+    let content_h = tracks.max(1) as f32 * line;
+    let max_panel_h = (viewport_h - 2.0 * ICON_INFO_MARGIN_PX)
+        .min(theme.font_size * 30.0)
+        .max(fixed + line);
+    let list_h = content_h.min((max_panel_h - fixed).max(line));
+    IconInfoMetrics {
+        panel_w: icon_info_width(theme),
+        panel_h: fixed + list_h,
+        list_h,
+        max_scroll: (content_h - list_h).max(0.0),
+    }
+}
+
+/// The heading a card's side text is drawn under: a single's menu is headed by
+/// the song itself (`{title} - {artist}`); a longer section's panel by its
+/// album and artist.
+pub fn icon_info_heading(section: &AlbumSection) -> String {
+    if let [track] = section.tracks.as_slice() {
+        let title = track.meta.display_title();
+        return if track.meta.artists.is_empty() {
+            title.into_owned()
+        } else {
+            format!("{title} - {}", track.meta.artists.join(", "))
+        };
+    }
+    if section.artist.is_empty() {
+        section.album.clone()
+    } else if section.album.is_empty() {
+        section.artist.clone()
+    } else {
+        format!("{} - {}", section.album, section.artist)
+    }
+}
+
+/// The heading cell's width inside a hover panel of `panel_w` px: the panel's
+/// horizontal padding, the cover, and the gap after it.
+pub fn icon_info_heading_width(panel_w: f32) -> f32 {
+    (panel_w - 24.0 - ICON_INFO_COVER_PX - 12.0).max(24.0)
+}
+
+/// The number of characters the hover panel's heading shows in a `panel_w`-wide
+/// panel, measured in the theme's heading font.
+pub fn icon_info_heading_chars(window: &Window, theme: Theme, panel_w: f32) -> usize {
+    let advance = marquee::char_advance(window, theme, theme.cell_px() + 1.0).max(0.01);
+    ((icon_info_heading_width(panel_w) / advance).floor() as usize).max(1)
+}
+
+/// The hover panel's corner radius, in px.
+const ICON_INFO_RADIUS_PX: f32 = 8.0;
+
+/// The icon grid's info card: a free-floating panel headed by `{album} -
+/// {artist}` over a rule and the card's song list, popping up where the cover
+/// was right-clicked. Clicking a song plays it, right-clicking one menus it,
+/// and right-clicking the heading menus them all. Only a multi-song card gets
+/// a panel at all: a single's cover has no list worth opening, so its
+/// right-click opens that song's menu at the pointer instead (see
+/// `album_list`'s `card_context`). Long titles fade at the right edge and
+/// slide on hover — the track rows' marquee — and the list is clipped and
+/// scrolls (with a bottom fade, no scrollbar) when there are more rows than
+/// fit. The heading is a marquee cell too.
+#[allow(clippy::too_many_arguments)]
+pub fn icon_info_panel<V: Render + 'static>(
+    theme: Theme,
+    section: &AlbumSection,
+    heading: &str,
+    cover: Option<CoverImage>,
+    playlist_context: Option<PlaylistId>,
+    actions: &Rc<dyn RowActions<V>>,
+    metrics: IconInfoMetrics,
+    scroll_y: f32,
+    title_offset: f32,
+    // The marquees of the rows drawn, indexed like the rows.
+    row_motion: &[InfoRowMotion],
+    on_title_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
+    window: &mut Window,
+    cx: &mut Context<V>,
+) -> AnyElement {
+    let line = icon_info_line(theme);
+    let source = section.source;
+    let title_w = icon_info_heading_width(metrics.panel_w);
+    let title_chars = icon_info_heading_chars(window, theme, metrics.panel_w);
+
+    let mut rows: Vec<AnyElement> = Vec::with_capacity(section.tracks.len().max(1));
+    for (index, track) in section.tracks.iter().enumerate() {
+        rows.push(info_song_row(
+            theme,
+            section,
+            track,
+            index,
+            index,
+            row_motion,
+            actions,
+            playlist_context,
+            metrics.panel_w,
+            window,
+            cx,
+        ));
+    }
+    if rows.is_empty() {
+        rows.push(
+            div()
+                .px_2()
+                .h(px(line))
+                .text_size(px(theme.small_px()))
+                .text_color(theme.text_faint)
+                .child("No tracks")
+                .into_any_element(),
+        );
+    }
+
+    // The list itself is clipped and translated by the eased scroll offset.
+    // The fade at its bottom makes the cut read as "more below" rather than
+    // as a hard crop, and there is deliberately no scrollbar.
+    let list = div()
+        .relative()
+        .w_full()
+        .flex_none()
+        .h(px(metrics.list_h))
+        .overflow_hidden()
+        .child(
+            div()
+                .relative()
+                .top(px(-scroll_y))
+                .w_full()
+                .flex()
+                .flex_col()
+                .children(rows),
+        )
+        // The fade is only there while there is actually more below; at the
+        // bottom of the list the final row reads cleanly.
+        .when(scroll_y < metrics.max_scroll - 0.5, |d| {
+            d.child(edge_fade(theme.row_active, line * 1.3, Side::Bottom))
+        });
+
+    // Right-clicking the panel's heading is the card's old right-click: the
+    // menu for every song. (A single never gets here — it has no panel, its
+    // right-click opens the song's menu at the pointer.)
+    let on_heading_context = {
+        let actions = actions.clone();
+        let songs: Vec<SongId> = section.tracks.iter().map(|track| track.song).collect();
+        cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+            actions.context(view, 0, songs.clone(), source, playlist_context, event, window, cx);
+            // Keep the panel's own right-click (dismiss) from also firing.
+            cx.stop_propagation();
+        })
+    };
+
+    let r = px(ICON_INFO_RADIUS_PX);
+    div()
+        .w(px(metrics.panel_w))
+        .flex()
+        .flex_col()
+        .gap_2()
+        .p_3()
+        .rounded_tl(r)
+        .rounded_tr(r)
+        .rounded_bl(r)
+        .rounded_br(r)
+        .bg(theme.row_active)
+        .border_1()
+        .border_color(theme.border)
+        .child(
+            div()
+                .flex()
+                .items_center()
+                .gap_3()
+                .on_mouse_down(MouseButton::Right, on_heading_context)
+                .child(thumbnail_rounded(theme, cover, ICON_INFO_COVER_PX))
+                .child(marquee::marquee_text(
+                    theme,
+                    (
+                        "icon-info-title",
+                        section.tracks.first().map_or(0, |track| track.song.0),
+                    ),
+                    heading,
+                    title_w,
+                    title_chars,
+                    theme.cell_px() + 1.0,
+                    title_offset,
+                    theme.text,
+                    theme.row_active,
+                    on_title_hover,
+                )),
+        )
+        .child(div().h(px(1.0)).w_full().flex_none().bg(theme.border))
+        .child(list)
+        .into_any_element()
+}
+
+/// One panel row's marquee, as the renderer reads it.
+#[derive(Clone, Copy, Default)]
+pub struct InfoRowMotion {
+    /// The title cell's slide, in px.
+    pub offset: f32,
+    /// Whether the pointer is anywhere over the row — the background the fade
+    /// has to dissolve into.
+    pub hovered: bool,
+}
+
+/// A text cell's width and character budget from the space left for it.
+fn info_cell(available: f32, advance: f32) -> (f32, usize) {
+    let width = available.max(24.0);
+    (width, ((width / advance).floor() as usize).max(1))
+}
+
+/// One song row: number, title, duration. Click plays it, right-click opens
+/// its menu; the title is a marquee cell, so a long one fades and slides.
+#[allow(clippy::too_many_arguments)]
+fn info_song_row<V: Render + 'static>(
+    theme: Theme,
+    section: &AlbumSection,
+    track: &TrackRow,
+    index: usize,
+    row: usize,
+    motion: &[InfoRowMotion],
+    actions: &Rc<dyn RowActions<V>>,
+    playlist_context: Option<PlaylistId>,
+    panel_w: f32,
+    window: &mut Window,
+    cx: &mut Context<V>,
+) -> AnyElement {
+    let line = icon_info_line(theme);
+    let source = section.source;
+    let text_px = theme.small_px();
+    let number_w = text_px * 1.6;
+    let duration = format_duration(track.meta.duration);
+    let advance = marquee::char_advance(window, theme, text_px).max(0.01);
+    let duration_w = duration.chars().count() as f32 * advance;
+    // Panel padding, the row's own padding, the two gaps, and the two fixed
+    // columns come off the width before the title gets it.
+    let (title_w, title_chars) =
+        info_cell(panel_w - 24.0 - 16.0 - 16.0 - number_w - duration_w, advance);
+    let title = track.meta.display_title();
+    let state = motion.get(row).copied().unwrap_or_default();
+    let background = marquee::wash(theme.row_active, theme.row_hover, state.hovered);
+    let travel = marquee::travel_for(&title, title_w, title_chars);
+    let on_hover = info_row_hover(actions, row, travel, cx);
+    let on_row_hover = info_row_region_hover(actions, row, cx);
+    let on_click = {
+        let actions = actions.clone();
+        cx.listener(move |view, event: &ClickEvent, window, cx| {
+            actions.activate(view, index, source, index, event, window, cx)
+        })
+    };
+    let on_right_click = {
+        let actions = actions.clone();
+        let songs = vec![track.song];
+        cx.listener(move |view, event: &MouseDownEvent, window, cx| {
+            actions.context(
+                view,
+                index,
+                songs.clone(),
+                source,
+                playlist_context,
+                event,
+                window,
+                cx,
+            );
+            // Keep the panel's own right-click (dismiss) from also firing.
+            cx.stop_propagation();
+        })
+    };
+    div()
+        .id(ElementId::NamedInteger("icon-info-track".into(), index as u64))
+        .w_full()
+        .flex_none()
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .h(px(line))
+        .rounded_sm()
+        .cursor_pointer()
+        .hover(|d| d.bg(theme.row_hover))
+        .on_hover(on_row_hover)
+        .on_click(on_click)
+        .on_mouse_down(MouseButton::Right, on_right_click)
+        .child(
+            div()
+                .w(px(number_w))
+                .flex_none()
+                .text_right()
+                .whitespace_nowrap()
+                .text_size(px(text_px))
+                .text_color(theme.text_faint)
+                .child(format!("{:02}", track.number)),
+        )
+        .child(marquee::marquee_text(
+            theme,
+            ("icon-info-title", index),
+            &title,
+            title_w,
+            title_chars,
+            text_px,
+            state.offset,
+            theme.text,
+            background,
+            on_hover,
+        ))
+        .child(
+            div()
+                .flex_none()
+                .whitespace_nowrap()
+                .text_size(px(text_px))
+                .text_color(theme.text_faint)
+                .child(duration),
+        )
+        .into_any_element()
+}
+
+/// A row's title-cell hover: only this row's cell slides, and the view only
+/// re-renders when its state actually changed.
+fn info_row_hover<'a, V: Render + 'static>(
+    actions: &Rc<dyn RowActions<V>>,
+    row: usize,
+    travel: f32,
+    cx: &'a mut Context<V>,
+) -> impl Fn(&bool, &mut Window, &mut App) + 'static + use<'a, V> {
+    let actions = actions.clone();
+    cx.listener(move |view, hovered: &bool, _window, cx| {
+        actions.info_cell_hover(view, row, *hovered, travel, cx)
+    })
+}
+
+/// A row's hover (anywhere on it): the background its marquee's fade follows.
+fn info_row_region_hover<'a, V: Render + 'static>(
+    actions: &Rc<dyn RowActions<V>>,
+    row: usize,
+    cx: &'a mut Context<V>,
+) -> impl Fn(&bool, &mut Window, &mut App) + 'static + use<'a, V> {
+    let actions = actions.clone();
+    cx.listener(move |view, hovered: &bool, _window, cx| {
+        actions.info_row_hover(view, row, *hovered, cx)
+    })
 }
 
 #[cfg(test)]
@@ -1466,6 +1780,27 @@ mod tests {
     }
 
     #[test]
+    fn a_singles_menu_is_headed_by_its_song() {
+        let mut section = section_with_tracks(1);
+        section.artist = "Grimes".into();
+        section.album = "Visions".into();
+        section.tracks[0].meta = Arc::new(SongMetadata {
+            id: SongId(0),
+            song_name: Some("Oblivion".into()),
+            artists: vec!["Grimes".into()],
+            album_name: Some("Visions".into()),
+            ..Default::default()
+        });
+
+        // A single names the song, not the album it happens to sit on.
+        assert_eq!(icon_info_heading(&section), "Oblivion - Grimes");
+
+        // Anything longer stays an album header.
+        section.tracks = section_with_tracks(2).tracks;
+        assert_eq!(icon_info_heading(&section), "Visions - Grimes");
+    }
+
+    #[test]
     fn flatten_preserves_album_structure() {
         let sections =
             vec![section_with_tracks(2), section_with_tracks(0), section_with_tracks(1)];
@@ -1484,23 +1819,6 @@ mod tests {
     }
 
     #[test]
-    fn flatten_search_collapses_singles() {
-        let sections =
-            vec![section_with_tracks(2), section_with_tracks(0), section_with_tracks(1)];
-        let items = flatten(&sections, RowLayout::CompactSingles);
-
-        // Search keeps the compact single: the one-track section collapses
-        // into a single row carrying its cover.
-        assert_eq!(items.len(), 5);
-        assert!(matches!(items[0], ListItem::Header(0)));
-        assert!(matches!(items[1], ListItem::Track { section: 0, index: 0 }));
-        assert!(matches!(items[2], ListItem::Track { section: 0, index: 1 }));
-        assert!(matches!(items[3], ListItem::Header(1)));
-        assert!(matches!(items[4], ListItem::Compact(2)));
-        assert_eq!(items[4].section(), 2);
-    }
-
-    #[test]
     fn step_selectable_walks_tracks_and_clamps() {
         let sections = vec![section_with_tracks(2)];
         let items = flatten(&sections, RowLayout::Albums); // Header, Track 0, Track 1
@@ -1515,7 +1833,7 @@ mod tests {
     #[test]
     fn row_of_song_finds_the_playing_row() {
         let sections = vec![section_with_tracks(2), section_with_tracks(1)];
-        let items = flatten(&sections, RowLayout::CompactSingles); // Header, T0, T1, Compact
+        let items = flatten(&sections, RowLayout::Albums); // Header, T0, T1, Header, T0
         assert_eq!(row_of_song(&items, &sections, SongId(1)), Some(2));
         assert_eq!(row_of_song(&items, &sections, SongId(0)), Some(1), "first match wins");
         assert_eq!(row_of_song(&items, &sections, SongId(9)), None);
@@ -1614,6 +1932,34 @@ mod tests {
     fn icon_cards_are_uniform() {
         // No text under the covers, so every card is exactly cover + padding.
         assert_eq!(icon_card_height(), ICON_PAD_PX * 2.0 + ICON_COVER_PX);
+    }
+
+    #[test]
+    fn info_height_grows_until_the_song_list_scrolls() {
+        let theme = Theme::default();
+        let short = icon_info_metrics(theme, 1, 900.0);
+        let medium = icon_info_metrics(theme, 6, 900.0);
+        let tall = icon_info_metrics(theme, 40, 900.0);
+        assert!(medium.panel_h > short.panel_h);
+        assert_eq!(short.max_scroll, 0.0, "one track needs no scrolling");
+        assert!(tall.panel_h > medium.panel_h);
+        assert!(tall.max_scroll > 0.0, "a long album scrolls inside the panel");
+        // The panel is capped to a comfortable fraction of the viewport.
+        assert!(tall.panel_h <= 900.0 - 2.0 * 8.0);
+    }
+
+    #[test]
+    fn info_metrics_count_the_panel_border() {
+        // The panel's chrome includes its 1 px border on the top and bottom
+        // edges. The panel's height is what its own bottom edge sits on, so
+        // leaving the border out put that edge 2 px short.
+        let theme = Theme::default();
+        let one = icon_info_metrics(theme, 1, 900.0);
+        assert_eq!(one.list_h, icon_info_line(theme), "one track is one line");
+        assert_eq!(
+            one.panel_h - one.list_h,
+            24.0 + 2.0 + ICON_INFO_COVER_PX + 16.0 + 1.0
+        );
     }
 
     #[test]

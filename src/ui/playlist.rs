@@ -80,7 +80,15 @@ impl PlaylistView {
         let is_custom = is_custom(&library, playlist, cx);
         Self {
             themed,
-            list: AlbumListView::new(library, playback, covers, animator, wake, Play::Playlist),
+            list: AlbumListView::new(
+                library,
+                playback,
+                covers,
+                config,
+                animator,
+                wake,
+                Play::Playlist,
+            ),
             playlist,
             is_custom,
             add_query: TextField::default(),
@@ -218,19 +226,21 @@ impl Render for PlaylistView {
             let columns = self.list.rows().columns();
             let highlight = self.list.rows().highlight();
             let actions: Option<Rc<dyn RowActions<Self>>> = None;
+            let eq = self.list.eq_bars(cx);
+            let current = self.list.playback().read(cx).current_song();
+            let live_bitrate_label = self
+                .list
+                .playback()
+                .read(cx)
+                .live_bitrate()
+                .map(|bps| SharedString::from(crate::ui::format::format_bitrate(bps)));
             let row = albums::RowContext {
                 theme,
                 covers: self.list.covers(),
                 library: self.list.library(),
-                current: self.list.playback().read(cx).current_song(),
-                playing: self.list.playback().read(cx).is_playing(),
-                eq_phase: 0.0,
-                live_bitrate_label: self
-                    .list
-                    .playback()
-                    .read(cx)
-                    .live_bitrate()
-                    .map(|bps| SharedString::from(crate::ui::format::format_bitrate(bps))),
+                current,
+                eq,
+                live_bitrate_label,
                 context: Some(playlist),
                 highlight: &highlight,
                 drag: None,

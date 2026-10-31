@@ -60,8 +60,6 @@ impl Advance {
     pub const IDLE: Self = Self { redraw: false, awake: false };
     /// Pixels changed, so draw and keep going.
     pub const MOVED: Self = Self { redraw: true, awake: true };
-    /// No pixels changed, but the animation still needs frames (sampling).
-    pub const BUSY: Self = Self { redraw: false, awake: true };
 }
 
 /// Drive a view's continuous animation from the shared clock (144 Hz).

@@ -62,7 +62,15 @@ impl BrowseView {
         let themed = Themed::new(&config, cx);
         Self {
             themed,
-            list: AlbumListView::new(library, playback, covers, animator, wake, Play::Playlist),
+            list: AlbumListView::new(
+                library,
+                playback,
+                covers,
+                config,
+                animator,
+                wake,
+                Play::Playlist,
+            ),
             scope: Scope::Library,
             search: TextField::default(),
             search_focus: cx.focus_handle(),
@@ -197,6 +205,12 @@ impl Render for BrowseView {
                 // `space` pauses, arrows scroll. `escape` clears it first.
                 let field_focused = this.search_focus.is_focused(window);
                 if event.keystroke.key == "escape" {
+                    // A cover's info panel is the topmost thing the pointer may
+                    // have opened; dismiss it before touching the filter box.
+                    if this.list.icon_info_open() {
+                        this.list.dispatch(InputAction::CloseOverlay, cx);
+                        return;
+                    }
                     if field_focused && !this.search.is_empty() {
                         this.search.clear();
                         this.list.rows_mut().mark_dirty();

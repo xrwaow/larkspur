@@ -90,6 +90,7 @@ impl QueueView {
             library.clone(),
             playback.clone(),
             covers.clone(),
+            config.clone(),
             animator.clone(),
             wake,
             Play::Playlist,
@@ -249,6 +250,7 @@ impl RowActions<QueueView> for QueueRows {
             songs,
             position: event.position,
             origin: MenuOrigin::Queue,
+            heading: None,
         };
         let library = view.list().library().clone();
         library.update(cx, |state, cx| state.request(Request::SongMenu(request), cx));

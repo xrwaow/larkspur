@@ -145,6 +145,7 @@ impl Render for CoverView {
                     songs: vec![song],
                     position: event.position,
                     origin: MenuOrigin::Row { playlist: None },
+                    heading: None,
                 };
                 library.update(cx, |state, cx| state.request(Request::SongMenu(request), cx));
             }

@@ -250,8 +250,8 @@ impl Theme {
         self.small_px() * 1.8
     }
 
-    /// The album-cover thumbnail in a row: the compact row's cover, or the
-    /// per-track cover a custom/smart playlist draws.
+    /// The album-cover thumbnail in a row: the per-track cover a
+    /// custom/smart playlist draws.
     pub fn cover_col(&self) -> f32 {
         self.font_size * 2.9
     }
@@ -268,11 +268,6 @@ impl Theme {
         self.font_size * 5.0
     }
 
-    /// The release-year column — `1997` with a little slack.
-    pub fn year_col(&self) -> f32 {
-        self.font_size * 2.7
-    }
-
     /// The trailing action column (the `×` on a playlist row).
     pub fn action_col(&self) -> f32 {
         self.font_size * 2.0
@@ -282,12 +277,6 @@ impl Theme {
     /// up down the panel.
     pub fn label_col(&self) -> f32 {
         self.font_size * 8.0
-    }
-
-    /// A value readout, right-aligned with a little slack — `13 px` in the
-    /// settings font table.
-    pub fn value_col(&self) -> f32 {
-        self.font_size * 3.4
     }
 
     /// One lyric slot's height, so blank padding lines up with real ones.

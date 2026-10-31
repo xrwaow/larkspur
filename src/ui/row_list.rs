@@ -224,8 +224,8 @@ pub struct RowList {
     dirty: bool,
     /// The font size the columns were measured at, so a font change re-measures.
     measured_at: f32,
-    /// How sections flatten into rows — with album headers (default), flat
-    /// (the queue), or with one-track sections collapsed (search).
+    /// How sections flatten into rows — with album headers (default), or flat
+    /// (the queue).
     layout: RowLayout,
     /// The title/artist column character counts a flat list was asked to size
     /// to (its panel's width, not the tables' fixed 48).
@@ -493,7 +493,6 @@ impl RowList {
         let section = &self.sections[item.section()];
         let track = match item {
             ListItem::Track { index, .. } => section.tracks.get(*index),
-            ListItem::Compact(_) => section.tracks.first(),
             ListItem::Header(_) => None,
         };
         let Some(track) = track else { return 0.0 };

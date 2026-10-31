@@ -8,6 +8,7 @@ pub mod container;
 pub mod cover;
 pub mod cover_store;
 pub mod drag;
+pub mod eq;
 pub mod format;
 pub mod input;
 pub mod introspect;

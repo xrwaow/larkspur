@@ -19,6 +19,7 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
+use std::rc::Rc;
 
 use gpui::{
     div, prelude::*, px, AnyElement, AnyView, App, ClickEvent, Context, Entity, FocusHandle,
@@ -27,6 +28,7 @@ use gpui::{
 
 use crate::model::{FolderMode, InputAction, PlaylistId, SongId, TabId};
 use crate::ui::animation::{animate, Advance, Animator};
+use crate::ui::albums;
 use crate::ui::browse::BrowseView;
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
@@ -34,7 +36,10 @@ use crate::ui::cover_store::CoverStore;
 use crate::ui::format::format_bitrate;
 use crate::ui::input::action_for_key;
 use crate::ui::library_state::{LibraryState, Request};
-use crate::ui::menu::{context_menu, song_menu_items, MenuItem, SongMenuRequest};
+use crate::ui::menu::{
+    context_menu, heading_cell, heading_text_px, song_menu_items, MenuHeading, MenuItem,
+    SongMenuRequest,
+};
 use crate::ui::marquee::{self, Marquee};
 use crate::ui::playlist::PlaylistView;
 use crate::ui::search::SearchView;
@@ -86,6 +91,11 @@ pub struct TabsView {
     /// region-hover also carries the tab's hover wash, so the fade matches
     /// whatever background is painted.
     marquees: HashMap<TabId, Marquee>,
+    /// The song menu heading's marquee: a single's `{title} - {artist}` is
+    /// capped to the icon-grid info panel's heading width, so a long one fades
+    /// at the edge and slides on hover like the panel's instead of widening the
+    /// menu. One cell is enough — only one menu is ever up.
+    menu_marquee: Marquee,
     /// Set when the library notified, so the request poll only runs when
     /// something may actually be pending rather than every frame.
     library_dirty: bool,
@@ -138,9 +148,10 @@ impl TabsView {
             }
         });
         let observe_animator = animate(&animator, cx, |this, dt, _cx| {
-            let moved = this.marquees.values_mut().fold(false, |moved, marquee| {
+            let mut moved = this.marquees.values_mut().fold(false, |moved, marquee| {
                 marquee.tick(dt) | moved
             });
+            moved |= this.menu_marquee.tick(dt);
             if moved {
                 Advance::MOVED
             } else {
@@ -167,6 +178,7 @@ impl TabsView {
             last_title: String::new(),
             title_key: None,
             marquees: HashMap::new(),
+            menu_marquee: Marquee::new(),
             library_dirty: false,
             focus_handle: cx.focus_handle(),
             _observe: observe,
@@ -366,6 +378,24 @@ impl TabsView {
         cx.notify();
     }
 
+    /// Dismiss the song menu.
+    fn close_song_menu(&mut self, cx: &mut Context<Self>) {
+        self.menu = None;
+        self.menu_hover.clear();
+        self.reset_menu_marquee();
+        cx.notify();
+    }
+
+    /// Put the song menu heading's slide back at rest, hover flag and all: the
+    /// next menu's heading starts at its beginning instead of inheriting a
+    /// half-slid offset or a pointer that is no longer over it.
+    fn reset_menu_marquee(&mut self) {
+        // `reset` deliberately keeps the hover flag (a label can change under a
+        // resting pointer), so clear the hover here as well.
+        self.menu_marquee.set_hovered(false, 0.0);
+        self.menu_marquee.reset();
+    }
+
     /// Every tab, in strip order.
     fn tab_ids(&self) -> Vec<TabId> {
         let mut ids = vec![TabId::Browse];
@@ -533,6 +563,9 @@ impl Render for TabsView {
                         self.open_folder(dir, mode, window, cx);
                     }
                     Request::SongMenu(request) => {
+                        // A new menu's heading starts at rest, whatever the
+                        // last one's slide was doing.
+                        self.reset_menu_marquee();
                         self.menu = Some(request);
                         self.menu_hover.clear();
                     }
@@ -634,16 +667,43 @@ impl Render for TabsView {
         // shouldn't leave the menu hanging over what it just did.
         let menu_element = self.menu.clone().map(|menu| {
             let weak = cx.entity().downgrade();
-            let items = dismiss_on_click(
-                song_menu_items(
-                    &self.library,
-                    &self.playback,
-                    &menu.songs,
-                    &menu.origin,
-                    cx,
-                ),
-                &weak,
-            );
+            let mut items = Vec::with_capacity(menu.songs.len() + 1);
+            if let Some(label) = menu.heading.clone() {
+                // The heading is a marquee cell, capped to the width the icon
+                // grid's info panel gives its own heading — a single's menu and
+                // a longer album's panel then read the same, and a title too
+                // long for the cell fades and slides on hover instead of
+                // stretching the menu.
+                let (width, max_chars) = heading_cell(
+                    albums::icon_info_heading_width(albums::icon_info_width(theme)),
+                    marquee::char_advance(window, theme, heading_text_px(theme)),
+                );
+                let travel = marquee::travel_for(&label, width, max_chars);
+                // Arm the slide against the heading actually drawn, so a
+                // changed title or cell width can't leave a stale target.
+                self.menu_marquee.sync(travel);
+                let on_hover = cx.listener(move |this: &mut TabsView, hovered: &bool, _window, cx| {
+                    if this.menu_marquee.set_hovered(*hovered, travel) {
+                        this.animator.read(cx).request();
+                        cx.notify();
+                    }
+                });
+                items.push(MenuItem::Heading(MenuHeading {
+                    label,
+                    width,
+                    max_chars,
+                    offset: self.menu_marquee.offset(),
+                    on_hover: Rc::new(on_hover),
+                }));
+            }
+            items.extend(song_menu_items(
+                &self.library,
+                &self.playback,
+                &menu.songs,
+                &menu.origin,
+                cx,
+            ));
+            let items = dismiss_on_click(items, &weak);
             let hover = cx.listener(
                 |this: &mut TabsView, path: &Option<Vec<usize>>, _window, cx: &mut Context<TabsView>| {
                     let path = path.clone().unwrap_or_default();
@@ -661,9 +721,7 @@ impl Render for TabsView {
                 &self.menu_hover,
                 hover,
                 cx.listener(|this, _event: &MouseDownEvent, _window, cx| {
-                    this.menu = None;
-                    this.menu_hover.clear();
-                    cx.notify();
+                    this.close_song_menu(cx);
                 }),
             )
         });
@@ -686,8 +744,7 @@ impl Render for TabsView {
             .track_focus(&self.focus_handle)
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, window, cx| {
                 if event.keystroke.key == "escape" && this.menu.is_some() {
-                    this.menu = None;
-                    cx.notify();
+                    this.close_song_menu(cx);
                     return;
                 }
                 if let Some(action) = action_for_key(&event.keystroke) {
@@ -840,6 +897,7 @@ fn dismiss_on_click(
     items
         .into_iter()
         .map(|item| match item {
+            MenuItem::Heading(heading) => MenuItem::Heading(heading),
             MenuItem::Action { label, on_click } => {
                 let view = view.clone();
                 MenuItem::action(
@@ -847,9 +905,7 @@ fn dismiss_on_click(
                     Box::new(move |event, window, cx| {
                         on_click(event, window, cx);
                         view.update(cx, |this, cx| {
-                            this.menu = None;
-                            this.menu_hover.clear();
-                            cx.notify();
+                            this.close_song_menu(cx);
                         })
                         .ok();
                     }),

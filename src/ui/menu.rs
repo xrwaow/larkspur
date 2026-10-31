@@ -14,21 +14,26 @@ use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
 use gpui::{
-    anchored, deferred, div, prelude::*, px, AnyElement, App, ClickEvent, Corner, Div, ElementId,
-    Entity, MouseDownEvent, Pixels, Point, Window,
+    anchored, deferred, div, prelude::*, px, AnyElement, App, ClickEvent, Corner, Div,
+    ElementId, Entity, MouseDownEvent, Pixels, Point, Window,
 };
 
 use crate::model::{FolderMode, PlaylistId, QueueEntry, SongId};
 use crate::ui::library_state::{LibraryState, Request};
+use crate::ui::marquee;
 use crate::ui::playback_state::PlaybackState;
 use crate::ui::theme::Theme;
 
 /// A menu item's click handler.
 pub type MenuHandler = Box<dyn Fn(&ClickEvent, &mut Window, &mut gpui::App) + 'static>;
 
-/// One row of a context menu: either a directly clickable action, or a
-/// submenu that opens on hover.
+/// One row of a context menu: a dim, non-interactive heading, a directly
+/// clickable action, or a submenu that opens on hover.
 pub enum MenuItem {
+    /// A label for the menu as a whole — never clickable, and never a hover
+    /// row. Used for a menu raised from an icon-grid card, which is headed by
+    /// the song (`{title} - {artist}`).
+    Heading(MenuHeading),
     Action { label: String, on_click: MenuHandler },
     Submenu { label: String, items: Vec<MenuItem> },
 }
@@ -41,6 +46,38 @@ impl MenuItem {
     pub fn submenu(label: impl Into<String>, items: Vec<MenuItem>) -> Self {
         Self::Submenu { label: label.into(), items }
     }
+}
+
+/// A menu's heading text.
+///
+/// The heading is drawn as a [`marquee`] cell: the same capped, edge-faded,
+/// hover-sliding text the icon grid's info panel heads itself with, so a long
+/// `<title> - <artist>` fades into the menu instead of widening it. The offset
+/// and the hover come from whoever keeps the menu, since only that owner can
+/// advance the slide between frames.
+pub struct MenuHeading {
+    /// The label itself.
+    pub label: String,
+    /// The cell's width in px and the characters it shows.
+    pub width: f32,
+    pub max_chars: usize,
+    /// The marquee's current slide, in px, read by the owner every frame.
+    pub offset: f32,
+    /// The cell's right-edge hover, which arms the slide.
+    pub on_hover: Rc<dyn Fn(&bool, &mut Window, &mut gpui::App)>,
+}
+
+/// A menu heading's text size, in px — a step below its items'.
+pub fn heading_text_px(theme: Theme) -> f32 {
+    theme.cell_px() - 1.0
+}
+
+/// Fit `width` px to whole characters of `advance` px each, returning the cell's
+/// width and the character cap that fills it: a heading capped this way shows
+/// exactly the characters it has room for, so its fade never sits mid-character.
+pub fn heading_cell(width: f32, advance: f32) -> (f32, usize) {
+    let max_chars = ((width / advance.max(0.01)).floor() as usize).max(1);
+    (max_chars as f32 * advance, max_chars)
 }
 
 /// Where a song menu was raised from. Each variant names exactly the actions
@@ -68,6 +105,10 @@ pub struct SongMenuRequest {
     pub position: Point<Pixels>,
     /// What raised the menu — decides which origin-specific items appear.
     pub origin: MenuOrigin,
+    /// An optional dim heading above the items. Only the icon grid's covers
+    /// set one: a menu raised from a song row acts on what the row already
+    /// names, while a cover's menu has to say which song it is.
+    pub heading: Option<String>,
 }
 
 /// A preset menu item: "Add to Queue" for one song.
@@ -298,6 +339,11 @@ pub fn song_menu_items(
     let mut items: Vec<MenuItem> = Vec::new();
     let context = match *origin {
         MenuOrigin::Row { playlist } => playlist,
+        // A single-song card *is* a section of the playlist it came from, so
+        // its menu offers what a row of that playlist would: in particular
+        // "Remove from playlist" on a custom one. (A multi-song card adds its
+        // own destinations further down instead.)
+        MenuOrigin::Card(id) if songs.len() <= 1 => Some(id),
         MenuOrigin::Queue | MenuOrigin::Card(_) => None,
     };
     let queue = matches!(origin, MenuOrigin::Queue);
@@ -464,6 +510,31 @@ fn menu_panel(
         );
 
         match item {
+            // A heading is a label, not a row: no hover, no click, and a rule
+            // under it to set it off from the actions. It is a marquee cell, so
+            // a long one fades at the edge and slides on hover rather than
+            // widening the menu.
+            MenuItem::Heading(heading) => {
+                let on_hover = heading.on_hover.clone();
+                div()
+                    .px_3()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(theme.border)
+                    .child(marquee::marquee_text(
+                        theme,
+                        "menu-heading",
+                        &heading.label,
+                        heading.width,
+                        heading.max_chars,
+                        heading_text_px(theme),
+                        heading.offset,
+                        theme.text_faint,
+                        theme.row_active,
+                        move |hovered, window, cx| on_hover(hovered, window, cx),
+                    ))
+                    .into_any_element()
+            }
             MenuItem::Action { label, on_click } => {
                 let hover = on_hover.clone();
                 // Hovering a direct action closes any submenu opened from
@@ -605,12 +676,31 @@ pub fn context_menu(
     // with the UI font but never eats more than half a narrow window.
     let viewport_width = window.viewport_size().width;
     let reserve = px((theme.font_size * 30.0).min(f32::from(viewport_width) * 0.5));
-    let open_left = position.x > viewport_width - reserve;
-    let anchor = if open_left { Corner::TopRight } else { Corner::TopLeft };
+    let anchor = if position.x > viewport_width - reserve {
+        Corner::TopRight
+    } else {
+        Corner::TopLeft
+    };
+    let open_left = matches!(anchor, Corner::TopRight | Corner::BottomRight);
 
     let menu = menu_panel(theme, items, &[], &open, open_left, &on_hover, &on_dismiss);
 
     deferred(anchored().position(position).anchor(anchor).child(menu))
         .with_priority(100)
         .into_any_element()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_heading_cell_holds_whole_characters() {
+        // 24 characters of 10 px in a 240 px cell: an exact fit.
+        assert_eq!(heading_cell(240.0, 10.0), (240.0, 24));
+        // Five px spare are better spent nowhere than on half a character.
+        assert_eq!(heading_cell(245.0, 10.0), (240.0, 24));
+        // Even a cell narrower than one character keeps one.
+        assert_eq!(heading_cell(4.0, 10.0), (10.0, 1));
+    }
 }
