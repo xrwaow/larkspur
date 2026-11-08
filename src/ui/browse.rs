@@ -202,7 +202,7 @@ impl Render for BrowseView {
                 }
                 // The filter box takes keys only while it's focused — selected
                 // by clicking it or by `ctrl+f`. Blurred, everything bubbles:
-                // `space` pauses, arrows scroll. `escape` clears it first.
+                // `space` pauses, arrows scroll.
                 let field_focused = this.search_focus.is_focused(window);
                 if event.keystroke.key == "escape" {
                     // A cover's info panel is the topmost thing the pointer may
@@ -211,9 +211,13 @@ impl Render for BrowseView {
                         this.list.dispatch(InputAction::CloseOverlay, cx);
                         return;
                     }
-                    if field_focused && !this.search.is_empty() {
-                        this.search.clear();
-                        this.list.rows_mut().mark_dirty();
+                    // `escape` gives the box up without touching what was
+                    // typed: the filter stays applied, so the filtered list can
+                    // be scrolled and navigated from the keyboard. The box's
+                    // × button (and `ctrl+f` to come back) is how it's
+                    // cleared.
+                    if field_focused {
+                        window.focus(&this.focus_handle);
                         cx.notify();
                     }
                     return;
