@@ -19,7 +19,7 @@
 use std::path::PathBuf;
 
 use gpui::{
-    div, prelude::*, px, Context, Entity, FocusHandle, KeyDownEvent, Render, Subscription, Window,
+    div, prelude::*, px, Context, Entity, FocusHandle, KeyDownEvent, Render, Window,
 };
 
 use crate::model::{search, FolderMode, InputAction, Scope};
@@ -30,7 +30,7 @@ use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::cover_store::CoverStore;
 use crate::ui::input::action_for_key;
-use crate::ui::layout;
+use crate::ui::layout::WindowCenter;
 use crate::ui::library_state::LibraryState;
 use crate::ui::playback_state::PlaybackState;
 use crate::ui::playback::svg_icon;
@@ -47,11 +47,9 @@ pub struct BrowseView {
     search: TextField,
     search_focus: FocusHandle,
     focus_handle: FocusHandle,
-    /// The rail state the header was last laid out for; a change needs a
-    /// re-render even though it doesn't touch the theme.
-    sidebar_minimized: bool,
+    /// Centers the header's filter box on the window, following the left rail.
+    window_center: WindowCenter,
     _observe: AlbumListSubs,
-    _observe_config: Subscription,
 }
 
 impl BrowseView {
@@ -67,17 +65,7 @@ impl BrowseView {
             album_list::observe(&library, Some(&playback), &covers, &animator, cx);
         let wake = animator.read(cx).wake_handle();
         let themed = Themed::new(&config, cx);
-        // The theme subscription deliberately ignores appearance-neutral
-        // config changes, so watch the rail state separately: the header's
-        // centered filter box has to follow the rail when it collapses.
-        let sidebar_minimized = config.read(cx).sidebar_minimized();
-        let _observe_config = cx.observe(&config, |this: &mut Self, config, cx| {
-            let minimized = config.read(cx).sidebar_minimized();
-            if this.sidebar_minimized != minimized {
-                this.sidebar_minimized = minimized;
-                cx.notify();
-            }
-        });
+        let window_center = WindowCenter::new(&config, &animator, cx);
         Self {
             themed,
             list: AlbumListView::new(
@@ -93,18 +81,9 @@ impl BrowseView {
             search: TextField::default(),
             search_focus: cx.focus_handle(),
             focus_handle: cx.focus_handle(),
-            sidebar_minimized,
+            window_center,
             _observe: observe,
-            _observe_config,
         }
-    }
-
-    /// How far the header's centered tools must move right to center on the
-    /// whole window instead of just the center panel: the panel starts after
-    /// the left rail and ends before the right one, so a narrower left rail
-    /// leaves its midpoint short of the window's by half the difference.
-    fn header_center_shift(&self) -> f32 {
-        (layout::RAIL_PX - layout::rail_px(self.sidebar_minimized)) / 2.0
     }
 
     /// Exposed so the tab container can hand this view keyboard focus.
@@ -277,10 +256,9 @@ impl Render for BrowseView {
                 Some(&format!("{} albums · {} songs", sections.len(), songs)),
                 None,
                 // The scope's filter box rides on the title line, centered
-                // against the whole window (see `header_center_shift`). The
-                // library filters the whole library; an artist tab, their
-                // discography; a folder view, the folder's albums and singles
-                // as they stand right now.
+                // against the whole window. The library filters the whole
+                // library; an artist tab, their discography; a folder view,
+                // the folder's albums and singles as they stand right now.
                 Some((
                     {
                         // Fixed-width: the albums·songs readout changes with
@@ -306,7 +284,7 @@ impl Render for BrowseView {
                             ))
                             .into_any_element()
                     },
-                    self.header_center_shift(),
+                    self.window_center.shift(),
                 )),
                 Some({
                     div()

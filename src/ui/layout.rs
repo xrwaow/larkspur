@@ -4,7 +4,14 @@
 //! (`tests/layout.rs`) build from [`app_layout`], so the text diagram can
 //! never drift from what the app actually renders.
 
-use super::container::{col, module, Dock, LayoutPlan};
+use std::cell::{Cell, RefCell};
+use std::rc::Rc;
+
+use gpui::{Context, Entity, Subscription};
+
+use super::animation::{Animator, Tween};
+use super::config_state::ConfigState;
+use super::container::{col, module, Dock, LayoutPlan, RAIL_ANIM_SECS};
 use super::cover::CoverView;
 use super::introspect::{self, ModuleSizes};
 use super::visualizer::BAND_HEIGHT;
@@ -24,6 +31,85 @@ pub fn rail_px(minimized: bool) -> f32 {
         MIN_RAIL_PX
     } else {
         RAIL_PX
+    }
+}
+
+/// How far the center panel's midpoint sits from the whole window's midpoint.
+///
+/// The center is docked between two rails, so shrinking the left one leaves
+/// its midpoint short of the window center by half the width difference — the
+/// symmetric 8 px gaps around the panel cancel out. Views that center on the
+/// window rather than on their own panel (the header's filter box, the
+/// transport controls) shift their centered content right by this much.
+fn window_center_shift(sidebar_minimized: bool) -> f32 {
+    (RAIL_PX - rail_px(sidebar_minimized)) / 2.0
+}
+
+/// A view's window-centering correction, kept live against the left rail.
+///
+/// Construct one next to the theme and call [`shift`](Self::shift) when laying
+/// out a centered element (the header's filter box, the transport controls).
+/// It owns the config and frame-clock observations, so the view only has to
+/// re-render when the correction actually moves — and it slides over the same
+/// [`RAIL_ANIM_SECS`] tween as the rail, keeping its content on the window's
+/// midpoint throughout the collapse instead of hopping across when it ends.
+pub struct WindowCenter {
+    shift: Rc<Cell<f32>>,
+    _observe_config: Subscription,
+    _observe_animator: Subscription,
+}
+
+impl WindowCenter {
+    pub fn new<C: 'static>(
+        config: &Entity<ConfigState>,
+        animator: &Entity<Animator>,
+        cx: &mut Context<C>,
+    ) -> Self {
+        let initial = window_center_shift(config.read(cx).sidebar_minimized());
+        let shift = Rc::new(Cell::new(initial));
+        let target = Rc::new(Cell::new(initial));
+        let tween = Rc::new(RefCell::new(Tween::new(initial)));
+        let wake = animator.read(cx).wake_handle();
+
+        let config_tween = tween.clone();
+        let config_target = target.clone();
+        let _observe_config = cx.observe(config, move |_this, config, cx| {
+            let next = window_center_shift(config.read(cx).sidebar_minimized());
+            if config_target.get() != next {
+                config_target.set(next);
+                config_tween.borrow_mut().to(next, RAIL_ANIM_SECS);
+                // The clock parks itself when idle, so retargeting has to ask
+                // for the first frame of the slide.
+                wake.request();
+            }
+        });
+
+        let animator_tween = tween.clone();
+        let animator_shift = shift.clone();
+        let _observe_animator = cx.observe(animator, move |_this, animator, cx| {
+            let dt = animator.read(cx).dt();
+            let mut tween = animator_tween.borrow_mut();
+            let moved = tween.tick(dt);
+            if moved {
+                animator_shift.set(tween.value());
+            }
+            let running = tween.is_animating();
+            drop(tween);
+            if moved {
+                cx.notify();
+            }
+            if running {
+                animator.read(cx).request();
+            }
+        });
+
+        Self { shift, _observe_config, _observe_animator }
+    }
+
+    /// How far centered content must move right to sit on the window's
+    /// midpoint instead of the center panel's.
+    pub fn shift(&self) -> f32 {
+        self.shift.get()
     }
 }
 
@@ -80,4 +166,18 @@ const PLAYBACK_BAR_PX: f32 = 180.0;
 /// LLM) needs to "see" the UI. See `tests/README.md`.
 pub fn describe_app() -> String {
     introspect::describe(&app_layout(true), &module_sizes())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn window_center_shift_compensates_for_the_collapsed_rail() {
+        // Both rails are 240, so the panel's midpoint is the window's.
+        assert_eq!(window_center_shift(false), 0.0);
+        // The left rail loses 196 px, so the panel's midpoint moves left by
+        // half that and must be nudged back.
+        assert_eq!(window_center_shift(true), (RAIL_PX - MIN_RAIL_PX) / 2.0);
+    }
 }

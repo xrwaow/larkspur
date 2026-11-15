@@ -14,6 +14,7 @@ use crate::ui::animation::{animate, ease_out_cubic, Advance, Animator};
 use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::format::{format_duration, format_duration_fixed};
+use crate::ui::layout::WindowCenter;
 use crate::ui::playback_state::PlaybackState;
 use crate::ui::theme::Theme;
 use crate::ui::widgets;
@@ -53,6 +54,8 @@ pub struct PlaybackView {
     repeat_hovered: bool,
     /// Hover state for the queue toggle (same reason as prev/next).
     queue_hovered: bool,
+    /// Centers the stacked transport on the window, following the left rail.
+    window_center: WindowCenter,
     _observe: Subscription,
     _observe_animator: Subscription,
 }
@@ -82,6 +85,7 @@ impl PlaybackView {
             }
         });
         let themed = Themed::new(&config, cx);
+        let window_center = WindowCenter::new(&config, &animator, cx);
         Self {
             state,
             config,
@@ -97,6 +101,7 @@ impl PlaybackView {
             next_hovered: false,
             repeat_hovered: false,
             queue_hovered: false,
+            window_center,
             _observe: observe,
             _observe_animator: observe_animator,
         }
@@ -249,6 +254,9 @@ impl Render for PlaybackView {
         let style = self.config.read(cx).waveform();
         let alt_layout =
             self.config.read(cx).transport_layout() == TransportLayout::Alternative;
+        // The stacked transport centers on the whole window, not just on the
+        // panel between the rails.
+        let center_shift = self.window_center.shift();
 
         // Snapshot the shared state once, then drop the borrow before
         // building elements.
@@ -381,15 +389,27 @@ impl Render for PlaybackView {
                 .w_full()
                 .bg(theme.panel_bg)
                 .font_family(theme.font)
-                .child(controls)
                 .child(
                     div()
                         .flex()
+                        .flex_col()
                         .items_center()
                         .gap_3()
-                        .child(position_label)
-                        .child(seek_bar)
-                        .child(duration_label),
+                        // A relative nudge shifts both rows together after
+                        // the panel-centered layout, so they line up with the
+                        // window's center.
+                        .relative()
+                        .left(px(center_shift))
+                        .child(controls)
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .gap_3()
+                                .child(position_label)
+                                .child(seek_bar)
+                                .child(duration_label),
+                        ),
                 )
         }
     }
