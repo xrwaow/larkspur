@@ -164,6 +164,10 @@ impl PlaybackView {
 
     /// The transport controls, laid out in one row. Shared by both transport
     /// arrangements so the buttons and their behaviour can't drift apart.
+    ///
+    /// `with_queue` decides whether the queue toggle rides along at the end of
+    /// the row; the minimal arrangement draws it at the far right instead, so
+    /// it passes `false` and appends the toggle itself.
     fn transport_controls(
         &self,
         theme: Theme,
@@ -173,6 +177,7 @@ impl PlaybackView {
         ended: bool,
         playing: bool,
         queue_open: bool,
+        with_queue: bool,
         cx: &mut Context<Self>,
     ) -> AnyElement {
         div()
@@ -211,7 +216,9 @@ impl PlaybackView {
                     cx.notify();
                 }),
             ))
-            .child(queue_toggle(theme, queue_open, self.queue_hovered, cx))
+            .when(with_queue, |d| {
+                d.child(queue_toggle(theme, queue_open, self.queue_hovered, cx))
+            })
             .into_any_element()
     }
 }
@@ -316,7 +323,15 @@ impl Render for PlaybackView {
             );
 
         let controls = self.transport_controls(
-            theme, repeat, can_prev, can_next, ended, playing, queue_open, cx,
+            theme,
+            repeat,
+            can_prev,
+            can_next,
+            ended,
+            playing,
+            queue_open,
+            !alt_layout,
+            cx,
         );
         let position_label = div()
             .flex_none()
@@ -331,8 +346,8 @@ impl Render for PlaybackView {
 
         // The live bitrate lives in the tab strip's right edge (ui::tabs),
         // not here. The stacked arrangement puts the controls above the
-        // waveform; the alternative puts the controls left and the waveform
-        // right, in one short row.
+        // waveform; the alternative puts the controls left, the waveform in
+        // the middle, and the queue toggle out at the right edge.
         if alt_layout {
             div()
                 .flex()
@@ -355,6 +370,7 @@ impl Render for PlaybackView {
                         .child(div().flex_1().min_w_0().child(seek_bar))
                         .child(duration_label),
                 )
+                .child(queue_toggle(theme, queue_open, self.queue_hovered, cx))
         } else {
             div()
                 .flex()

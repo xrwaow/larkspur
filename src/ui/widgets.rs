@@ -9,6 +9,7 @@ use gpui::{
     Window,
 };
 
+use crate::ui::playback::svg_icon;
 use crate::ui::text_field::TextField;
 use crate::ui::theme::Theme;
 
@@ -126,8 +127,14 @@ pub fn edge_fade(background: Rgba, length: f32, side: Side) -> AnyElement {
 }
 
 /// A panel's top row: a title on the left (optionally with a leading button
-/// and a secondary line beneath it), optional header tools filling the middle
-/// (a filter box, action buttons), and a faint hint on the right.
+/// and a secondary line beneath it), optional tools centered over the header,
+/// and a faint hint on the right.
+///
+/// The tools are an absolute overlay, so they center on the header's whole
+/// width rather than on whatever space the title leaves over. The tuple's
+/// offset nudges them right (or left, when negative) without affecting that
+/// centering — callers whose panel is off-center in the window use it to
+/// correct for asymmetric side rails.
 ///
 /// `title_px` carries the deliberate center/rail split: the center panels
 /// headline at `cell_px() + 2.0`, the rail bands stay at `cell_px()`.
@@ -139,7 +146,7 @@ pub fn panel_header(
     leading: Option<AnyElement>,
     subtitle: Option<&str>,
     hint: Option<(&str, Rgba)>,
-    tools: Option<AnyElement>,
+    tools: Option<(AnyElement, f32)>,
     trailing: Option<AnyElement>,
 ) -> AnyElement {
     div()
@@ -190,9 +197,7 @@ pub fn panel_header(
                     .child(hint.to_string()),
             )
         })
-        // Tools live in an overlay so they can center on the whole header
-        // rather than on whatever space the title leaves over.
-        .when_some(tools, |d, tools| {
+        .when_some(tools, |d, (tools, offset)| {
             d.child(
                 div()
                     .absolute()
@@ -200,17 +205,23 @@ pub fn panel_header(
                     .flex()
                     .items_center()
                     .justify_center()
-                    .child(tools),
+                    // `relative` + `left` shifts the centered child without
+                    // changing the flex solver's centering.
+                    .child(div().relative().left(px(offset)).child(tools)),
             )
         })
         .into_any_element()
 }
 
-/// A rounded search box: the magnifier, the field's editable text, a dimmed
-/// `hint` while it's empty and unfocused, and — once there's text — either a
-/// `×` clear button (`on_clear`) or a custom `trailing` element. `accented`
-/// highlights the border — the search overlay marks its pinned-open cheat
-/// sheet with it.
+/// A compact, pill-shaped search box: a faint magnifier, the field's editable
+/// text, a dimmed `hint` while it's empty and unfocused, and — once there's
+/// text — either a `×` clear button (`on_clear`) or a custom `trailing`
+/// element. `accented` highlights the border — the search overlay marks its
+/// pinned-open cheat sheet with it.
+///
+/// Unlike the plain field chrome, the box has a fixed compact height and a
+/// border that's invisible (but still laid out) while idle, so it drops onto
+/// a panel header's title line without growing it or shifting when focused.
 ///
 /// `focus` is the handle that owns the field: it's tracked on the chrome, so
 /// clicking anywhere in the box focuses the field (and typing lands in it),
@@ -232,7 +243,7 @@ pub fn search_box(
             div()
                 .flex_none()
                 .px_1()
-                .rounded_md()
+                .rounded(px(2.0))
                 .cursor_pointer()
                 .text_size(px(theme.small_px()))
                 .text_color(theme.text_faint)
@@ -246,21 +257,53 @@ pub fn search_box(
         _ => trailing,
     };
     let focused = focus.is_focused(window);
-    // Shared chrome with the plain box, so the search box matches every other
-    // field. `accented` keeps the overlay's pinned-open highlight even while
-    // the box is blurred.
-    let mut box_el = TextField::chrome(theme, accented || focused)
+    let outlined = accented || focused;
+    let show_hint = field.is_empty() && !focused;
+
+    // A compact, squared-off box that matches the rest of the UI (tab,
+    // album covers, player buttons) rather than a pill. The border always
+    // takes up its pixel and only shows while outlined — idle it's the
+    // fill's own color — so focusing paints the edge without nudging the
+    // text or the rows beside it.
+    let mut box_el = div()
+        .flex()
+        .items_center()
+        .gap_2()
+        .h(px((theme.cell_px() * 2.0).max(26.0)))
+        .px(px((theme.cell_px() * 0.75).max(10.0)))
+        .rounded(px(3.0))
+        .bg(theme.row_odd)
+        .border_1()
+        .border_color(if outlined { theme.accent } else { theme.row_odd })
         .track_focus(focus)
+        .child(svg_icon(
+            theme.small_px(),
+            theme.small_px(),
+            "assets/search.svg",
+            if outlined { theme.accent } else { theme.text_faint },
+        ))
         .child(field.render_text(theme, placeholder, focus, window));
-    if hint.is_some() && field.is_empty() && !focus.is_focused(window) {
-        box_el = box_el.child(
-            div()
-                .flex_none()
-                .text_size(px(theme.small_px()))
-                .text_color(theme.text_faint)
-                .child(hint.unwrap().to_string()),
-        );
+
+    if let Some(hint) = hint {
+        if show_hint {
+            box_el = box_el.child(
+                div()
+                    .flex_none()
+                    .ml_auto()
+                    .px(px(4.0))
+                    .rounded(px(2.0))
+                    .border_1()
+                    .border_color(Rgba {
+                        a: theme.text_faint.a * 0.35,
+                        ..theme.text_faint
+                    })
+                    .text_size(px((theme.small_px() - 1.0).max(9.0)))
+                    .text_color(theme.text_faint)
+                    .child(hint.to_string()),
+            );
+        }
     }
+
     if let Some(trailing) = trailing {
         box_el = box_el.child(trailing);
     }

@@ -18,7 +18,9 @@
 
 use std::path::PathBuf;
 
-use gpui::{div, prelude::*, px, Context, Entity, FocusHandle, KeyDownEvent, Render, Window};
+use gpui::{
+    div, prelude::*, px, Context, Entity, FocusHandle, KeyDownEvent, Render, Subscription, Window,
+};
 
 use crate::model::{search, FolderMode, InputAction, Scope};
 use crate::ui::album_list::{self, AlbumList, AlbumListSubs, AlbumListView, Play};
@@ -28,6 +30,7 @@ use crate::ui::config_state::{ConfigState, Themed};
 use crate::ui::container::Container;
 use crate::ui::cover_store::CoverStore;
 use crate::ui::input::action_for_key;
+use crate::ui::layout;
 use crate::ui::library_state::LibraryState;
 use crate::ui::playback_state::PlaybackState;
 use crate::ui::playback::svg_icon;
@@ -44,7 +47,11 @@ pub struct BrowseView {
     search: TextField,
     search_focus: FocusHandle,
     focus_handle: FocusHandle,
+    /// The rail state the header was last laid out for; a change needs a
+    /// re-render even though it doesn't touch the theme.
+    sidebar_minimized: bool,
     _observe: AlbumListSubs,
+    _observe_config: Subscription,
 }
 
 impl BrowseView {
@@ -60,13 +67,24 @@ impl BrowseView {
             album_list::observe(&library, Some(&playback), &covers, &animator, cx);
         let wake = animator.read(cx).wake_handle();
         let themed = Themed::new(&config, cx);
+        // The theme subscription deliberately ignores appearance-neutral
+        // config changes, so watch the rail state separately: the header's
+        // centered filter box has to follow the rail when it collapses.
+        let sidebar_minimized = config.read(cx).sidebar_minimized();
+        let _observe_config = cx.observe(&config, |this: &mut Self, config, cx| {
+            let minimized = config.read(cx).sidebar_minimized();
+            if this.sidebar_minimized != minimized {
+                this.sidebar_minimized = minimized;
+                cx.notify();
+            }
+        });
         Self {
             themed,
             list: AlbumListView::new(
                 library,
                 playback,
                 covers,
-                config,
+                config.clone(),
                 animator,
                 wake,
                 Play::Playlist,
@@ -75,8 +93,18 @@ impl BrowseView {
             search: TextField::default(),
             search_focus: cx.focus_handle(),
             focus_handle: cx.focus_handle(),
+            sidebar_minimized,
             _observe: observe,
+            _observe_config,
         }
+    }
+
+    /// How far the header's centered tools must move right to center on the
+    /// whole window instead of just the center panel: the panel starts after
+    /// the left rail and ends before the right one, so a narrower left rail
+    /// leaves its midpoint short of the window's by half the difference.
+    fn header_center_shift(&self) -> f32 {
+        (layout::RAIL_PX - layout::rail_px(self.sidebar_minimized)) / 2.0
     }
 
     /// Exposed so the tab container can hand this view keyboard focus.
@@ -211,12 +239,15 @@ impl Render for BrowseView {
                         this.list.dispatch(InputAction::CloseOverlay, cx);
                         return;
                     }
-                    // `escape` gives the box up without touching what was
-                    // typed: the filter stays applied, so the filtered list can
-                    // be scrolled and navigated from the keyboard. The box's
-                    // × button (and `ctrl+f` to come back) is how it's
-                    // cleared.
+                    // `escape` clears the filter and gives the box up in one
+                    // press, so the list goes back to the full scope and the
+                    // keyboard can scroll it right away. The box's × button
+                    // still clears without moving focus.
                     if field_focused {
+                        if !this.search.is_empty() {
+                            this.search.clear();
+                            this.list.rows_mut().mark_dirty();
+                        }
                         window.focus(&this.focus_handle);
                         cx.notify();
                     }
@@ -245,34 +276,38 @@ impl Render for BrowseView {
                 None,
                 Some(&format!("{} albums · {} songs", sections.len(), songs)),
                 None,
-                // The scope's header tools share the title's line: the filter
-                // box and the shuffle button. The library filters and shuffles
-                // the whole library; an artist tab, their discography; a
-                // folder view, the folder's albums and singles as they stand
-                // right now.
-                Some({
-                    // Fixed-width: the albums·songs readout changes with the
-                    // filter, and a flexed box would resize on every keystroke.
-                    div()
-                        .flex_none()
-                        .w(px(theme.cell_px() * 22.0))
-                        .child(search_box(
-                            theme,
-                            &self.search,
-                            &self.search_focus,
-                            Some(placeholder),
-                            false,
-                            Some("ctrl+f"),
-                            Some(Box::new(cx.listener(|this, _event, _window, cx| {
-                                this.search.clear();
-                                this.list.rows_mut().mark_dirty();
-                                cx.notify();
-                            }))),
-                            None,
-                            window,
-                        ))
-                        .into_any_element()
-                }),
+                // The scope's filter box rides on the title line, centered
+                // against the whole window (see `header_center_shift`). The
+                // library filters the whole library; an artist tab, their
+                // discography; a folder view, the folder's albums and singles
+                // as they stand right now.
+                Some((
+                    {
+                        // Fixed-width: the albums·songs readout changes with
+                        // the filter, and a flexed box would resize on every
+                        // keystroke.
+                        div()
+                            .flex_none()
+                            .w(px(theme.cell_px() * 22.0))
+                            .child(search_box(
+                                theme,
+                                &self.search,
+                                &self.search_focus,
+                                Some(placeholder),
+                                false,
+                                Some("ctrl+f"),
+                                Some(Box::new(cx.listener(|this, _event, _window, cx| {
+                                    this.search.clear();
+                                    this.list.rows_mut().mark_dirty();
+                                    cx.notify();
+                                }))),
+                                None,
+                                window,
+                            ))
+                            .into_any_element()
+                    },
+                    self.header_center_shift(),
+                )),
                 Some({
                     div()
                         .id("shuffle")
