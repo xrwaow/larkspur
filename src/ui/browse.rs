@@ -65,7 +65,7 @@ impl BrowseView {
             album_list::observe(&library, Some(&playback), &covers, &animator, cx);
         let wake = animator.read(cx).wake_handle();
         let themed = Themed::new(&config, cx);
-        let window_center = WindowCenter::new(&config, &animator, cx);
+        let window_center = WindowCenter::new(&config, cx);
         Self {
             themed,
             list: AlbumListView::new(

@@ -85,7 +85,7 @@ impl PlaybackView {
             }
         });
         let themed = Themed::new(&config, cx);
-        let window_center = WindowCenter::new(&config, &animator, cx);
+        let window_center = WindowCenter::new(&config, cx);
         Self {
             state,
             config,

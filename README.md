@@ -169,7 +169,7 @@ on bubbles up to the tab container.
 | `enter` | play the selected row (or, in search, run a changed query) |
 | `ctrl+tab` / `ctrl+shift+tab` | next / previous tab |
 | `ctrl+w` | close the active tab (or dismiss an overlay) |
-| `ctrl+f` | focus the library tab's filter box (or the search panel's query box while it's up) |
+| `ctrl+f` | focus the active tab's search box — its filter, or a custom playlist's add-songs box — or the search panel's query box while it's up |
 | `ctrl+shift+f` | open / close the search panel |
 | `esc` | dismiss the search or settings panel, a right-click menu, or clear and unfocus a focused filter box |
 

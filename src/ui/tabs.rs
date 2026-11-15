@@ -335,6 +335,23 @@ impl TabsView {
         }
     }
 
+    /// `ctrl+f`: select the active container's own search/filter box, whatever
+    /// tab it is — the library or artist filter, a folder's filter, or a custom
+    /// playlist's add-songs search. A tab without one leaves focus alone.
+    fn focus_active_search(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.active == TabId::Browse {
+            self.browse.update(cx, |browse, cx| browse.focus_search(window, cx));
+            return;
+        }
+        let Some(tab) = self.tabs.iter().find(|tab| tab.id == self.active) else { return };
+        let view = tab.view.clone();
+        if let Ok(browse) = view.clone().downcast::<BrowseView>() {
+            browse.update(cx, |browse, cx| browse.focus_search(window, cx));
+        } else if let Ok(playlist) = view.downcast::<PlaylistView>() {
+            playlist.update(cx, |playlist, cx| playlist.focus_search(window, cx));
+        }
+    }
+
     /// Re-point focus at the active container. Used after an inline edit in
     /// another panel (the rail's rename) hands focus away.
     pub fn refocus(&self, window: &mut Window, cx: &App) {
@@ -443,15 +460,16 @@ impl TabsView {
                 }
             }
             // `ctrl+f`: re-select the search panel's box when it's up,
-            // otherwise the library tab's filter box — switching to the tab if
-            // it isn't the active one.
+            // otherwise the active tab's own search box. It never jumps tabs.
             InputAction::FocusSearch => {
+                if self.settings_open {
+                    return;
+                }
                 if self.search_open {
                     let focus = self.search.read(cx).focus_handle_for_window();
                     window.focus(&focus);
                 } else {
-                    self.activate(TabId::Browse, window, cx);
-                    self.browse.update(cx, |browse, cx| browse.focus_search(window, cx));
+                    self.focus_active_search(window, cx);
                 }
                 cx.notify();
             }
