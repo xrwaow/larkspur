@@ -20,6 +20,10 @@ use super::visualizer::BAND_HEIGHT;
 /// `ui::tabs`), so the two can't drift apart.
 pub const RAIL_PX: f32 = 240.0;
 
+/// The window's minimum width: both rails plus a center wider than a rail, so
+/// no panel is ever squeezed out entirely.
+pub const MIN_WINDOW_WIDTH_PX: f32 = RAIL_PX * 3.0 + 40.0;
+
 /// Width of the collapsed left rail — just enough for the expand button in
 /// its header.
 pub const MIN_RAIL_PX: f32 = 44.0;
@@ -138,5 +142,11 @@ mod tests {
         // The left rail loses 196 px, so the panel's midpoint moves left by
         // half that and must be nudged back.
         assert_eq!(window_center_shift(true), (RAIL_PX - MIN_RAIL_PX) / 2.0);
+    }
+
+    #[test]
+    fn the_window_minimum_fits_both_rails_and_a_center() {
+        // 240 + 240 rails plus a 280 center.
+        assert_eq!(MIN_WINDOW_WIDTH_PX, 760.0);
     }
 }

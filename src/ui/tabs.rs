@@ -873,7 +873,6 @@ fn tab_button(
         .on_hover(on_tab_hover)
         .on_click(on_click)
         .child(marquee::marquee_text(
-            theme,
             ("tab-label", index),
             &title,
             label_width,

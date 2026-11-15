@@ -228,9 +228,19 @@ pub fn char_advance(window: &Window, theme: Theme, text_px: f32) -> f32 {
 
 /// How far `text` overflows a column of `width` px sized for `max_chars`
 /// characters, in px. Zero when it fits.
+///
+/// The slide runs one character past the overflow: a cell holds a whole number
+/// of characters, so the last visible glyph would otherwise come to rest right
+/// on the edge, under the fade. That spare character is the empty space the
+/// fade covers instead.
 pub fn travel_for(text: &str, width: f32, max_chars: usize) -> f32 {
     let advance = width / max_chars.max(1) as f32;
-    ((text.chars().count() as f32) - max_chars as f32).max(0.0) * advance
+    let overflow = (text.chars().count() as f32) - max_chars as f32;
+    if overflow <= 0.0 {
+        0.0
+    } else {
+        (overflow + 1.0) * advance
+    }
 }
 
 /// The exact rendered width of `text`, shaped in the theme's font at `text_px`.
@@ -251,8 +261,15 @@ pub fn text_width(window: &Window, theme: Theme, text: &str, text_px: f32) -> f3
 }
 
 /// Render `text` in a fixed-width cell of `width` px, sized for `max_chars`
-/// characters: clipped, faded at the edges when it overflows, and drawn at
+/// characters: clipped, faded at the edges while it slides, and drawn at
 /// `offset` px (the slide).
+///
+/// At rest the cell cuts the text on a character boundary — the row font is
+/// monospace, so a character-sized cell cuts on a glyph edge and there is no
+/// half-glyph to hide — so nothing is faded and the last character reads whole.
+/// The fades appear only mid-slide, when the text is cut on both sides partway
+/// through a glyph, and the slide itself ends one character short of the edge
+/// (see [`travel_for`]), so the tail clears the fade too.
 ///
 /// `background` is the colour behind the cell — the fade is a gradient of it, so
 /// the text appears to dissolve into the row rather than into a coloured band.
@@ -260,7 +277,6 @@ pub fn text_width(window: &Window, theme: Theme, text: &str, text_px: f32) -> f3
 /// pointer is over *it*.
 #[allow(clippy::too_many_arguments)]
 pub fn marquee_text(
-    _theme: Theme,
     id: impl Into<ElementId>,
     text: &str,
     width: f32,
@@ -272,8 +288,6 @@ pub fn marquee_text(
     on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     let advance = width / max_chars.max(1) as f32;
-    let travel = travel_for(text, width, max_chars);
-
     let mut cell = div()
         .id(id)
         .w(px(width))
@@ -292,17 +306,14 @@ pub fn marquee_text(
                 .child(text.to_string()),
         );
 
-    if travel > 0.5 {
-        // The overflow fades out over one character at the right edge.
-        cell = cell.child(edge_fade(background, advance, Side::Right));
-    }
     if offset < -0.5 {
-        // Once the text has slid, its start fades in at the left edge.
-        cell = cell.child(edge_fade(background, advance, Side::Left));
+        cell = cell
+            .child(edge_fade(background, advance, Side::Right))
+            .child(edge_fade(background, advance, Side::Left));
     }
     // The slide is triggered from the cell's right side only — where the text
-    // fades out — rather than anywhere on the cell: hovering the middle of a
-    // long row while moving the pointer across the list shouldn't set every
+    // runs off the edge — rather than anywhere on the cell: hovering the middle
+    // of a long row while moving the pointer across the list shouldn't set every
     // title sliding.
     cell = cell.child(
         div()
@@ -337,9 +348,10 @@ mod tests {
     }
 
     #[test]
-    fn travel_is_the_overflow_in_px() {
-        // 30 chars in a 20-char, 200px column: 10 chars * 10px each.
-        assert_eq!(travel_for(&"x".repeat(30), 200.0, 20), 100.0);
+    fn travel_is_the_overflow_plus_a_spare_character() {
+        // 30 chars in a 20-char, 200px column: 10 chars * 10px each, plus one
+        // character of empty space for the edge fade to cover.
+        assert_eq!(travel_for(&"x".repeat(30), 200.0, 20), 110.0);
     }
 
     #[test]

@@ -268,11 +268,6 @@ impl Theme {
         self.font_size * 5.0
     }
 
-    /// The trailing action column (the `×` on a playlist row).
-    pub fn action_col(&self) -> f32 {
-        self.font_size * 2.0
-    }
-
     /// The `{label}:` column of a setting row — fixed, so the controls line
     /// up down the panel.
     pub fn label_col(&self) -> f32 {

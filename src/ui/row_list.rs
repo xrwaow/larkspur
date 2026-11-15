@@ -227,12 +227,14 @@ pub struct RowList {
     /// How sections flatten into rows — with album headers (default), or flat
     /// (the queue).
     layout: RowLayout,
-    /// The title/artist column character counts a flat list was asked to size
-    /// to (its panel's width, not the tables' fixed 48).
-    title_chars: usize,
-    artist_chars: usize,
     /// Set when the character counts moved since the columns were measured.
     columns_stale: bool,
+    /// The width the view last measured for its list area, in px — 0 until its
+    /// first layout. The text columns fit to it (see [`Self::set_viewport`]).
+    viewport: f32,
+    /// The viewport width the columns were last fitted to, so a resize
+    /// re-measures them.
+    fitted_width: f32,
     /// Slim mode: rows omit the bitrate and duration columns — the queue
     /// panel, whose width is better spent on the text columns.
     slim: bool,
@@ -248,6 +250,8 @@ impl RowList {
                 artist: 0.0,
                 title_chars: MAX_TITLE_CHARS,
                 artist_chars: MAX_ARTIST_CHARS,
+                header: 0.0,
+                header_advance: 0.0,
             },
             list_state: ListState::new(0, ListAlignment::Top, px(OVERDRAW_PX)),
             item_count: 0,
@@ -262,9 +266,9 @@ impl RowList {
             dirty: true,
             measured_at: 0.0,
             layout: RowLayout::default(),
-            title_chars: MAX_TITLE_CHARS,
-            artist_chars: MAX_ARTIST_CHARS,
             columns_stale: false,
+            viewport: 0.0,
+            fitted_width: 0.0,
             slim: false,
         }
     }
@@ -286,16 +290,27 @@ impl RowList {
         }
     }
 
-    /// Size a flat list's columns to explicit character counts — its
-    /// container's width rather than the tables' fixed 48. Takes effect on
-    /// the next [`sync`](Self::sync).
+    /// Size the title/artist columns to explicit character counts — a panel
+    /// fitting them to its own width instead of the fixed default. Takes effect
+    /// on the next [`sync`](Self::sync).
     pub fn set_columns_chars(&mut self, title: usize, artist: usize) {
-        if !self.columns_stale && self.title_chars == title && self.artist_chars == artist {
+        if !self.columns_stale && self.columns.title_chars == title
+            && self.columns.artist_chars == artist
+        {
             return;
         }
-        self.title_chars = title;
-        self.artist_chars = artist;
+        self.columns.title_chars = title;
+        self.columns.artist_chars = artist;
         self.columns_stale = true;
+    }
+
+    /// Report the width of the area the list is rendered in, in px — the album
+    /// lists measure theirs each layout pass. The text columns fit to it on the
+    /// next [`sync`](Self::sync).
+    pub fn set_viewport(&mut self, width: f32) {
+        if (self.viewport - width).abs() >= 0.5 {
+            self.viewport = width;
+        }
     }
 
     /// Omit the bitrate and duration columns — the queue panel's rows.
@@ -330,10 +345,17 @@ impl RowList {
             // highlight is the only thing lit until the user navigates.
             self.cursor = None;
             self.rebuild_rows(theme, window);
-        } else if self.columns_stale || (self.measured_at - theme.font_size).abs() > 0.01 {
+        } else if self.columns_outdated(theme) {
             self.measure_columns(theme, window);
             self.columns_stale = false;
         }
+    }
+
+    /// Whether the columns no longer match the font or their viewport width.
+    fn columns_outdated(&self, theme: Theme) -> bool {
+        self.columns_stale
+            || (self.measured_at - theme.font_size).abs() > 0.01
+            || self.fitted_width != self.viewport
     }
 
     fn rebuild_rows(&mut self, theme: Theme, window: &Window) {
@@ -347,10 +369,14 @@ impl RowList {
     }
 
     fn measure_columns(&mut self, theme: Theme, window: &Window) {
-        self.columns = if self.layout == RowLayout::Flat {
-            Columns::sized(window, theme, self.title_chars, self.artist_chars)
+        self.fitted_width = self.viewport;
+        // A measured viewport (the album lists) fits the cells to the width a
+        // row has; otherwise the counts are the list's own — the fixed default,
+        // or what the panel fitted them to (the queue to its rail).
+        self.columns = if self.viewport > 1.0 && !self.slim {
+            Columns::fitted(window, theme, self.viewport, &self.sections)
         } else {
-            Columns::measure(window, theme)
+            Columns::sized(window, theme, self.columns.title_chars, self.columns.artist_chars)
         };
         self.measured_at = theme.font_size;
     }
@@ -495,16 +521,23 @@ impl RowList {
             ListItem::Track { index, .. } => section.tracks.get(*index),
             ListItem::Header(_) => None,
         };
-        let Some(track) = track else { return 0.0 };
-        match cell {
-            Cell::Title => {
-                let title = track.meta.display_title();
-                marquee::travel_for(&title, self.columns.title, self.title_chars)
+        match (track, cell) {
+            (Some(track), Cell::Title) => marquee::travel_for(
+                &track.meta.display_title(),
+                self.columns.title,
+                self.columns.title_chars,
+            ),
+            (Some(track), Cell::Artist) => marquee::travel_for(
+                &track.meta.artists.join(", "),
+                self.columns.artist,
+                self.columns.artist_chars,
+            ),
+            // A header's title slides like a row's, in the cell it hugs.
+            (None, Cell::Title) => {
+                let (width, chars) = self.columns.header_cell(&section.album);
+                marquee::travel_for(&section.album, width, chars)
             }
-            Cell::Artist => {
-                let artist = track.meta.artists.join(", ");
-                marquee::travel_for(&artist, self.columns.artist, self.artist_chars)
-            }
+            (None, Cell::Artist) => 0.0,
         }
     }
 

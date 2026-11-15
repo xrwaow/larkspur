@@ -19,7 +19,7 @@ use gpui::{
 
 use crate::model::search::{self, Query};
 use crate::model::InputAction;
-use crate::ui::album_list::{AlbumList, AlbumListSubs, AlbumListView, Play};
+use crate::ui::album_list::{self, AlbumList, AlbumListSubs, AlbumListView, Play};
 use crate::ui::albums;
 use crate::ui::animation::Animator;
 use crate::ui::browse::BrowseView;
@@ -167,7 +167,7 @@ impl Render for SearchView {
         let theme = self.themed.theme();
 
         let fresh = self.list.rows().is_dirty().then(|| self.build_sections(cx));
-        self.list.rows_mut().sync(theme, window, fresh);
+        album_list::sync(self, theme, window, fresh);
         self.list.anchor_to_playing(cx);
 
         let sections = self.list.rows().sections();

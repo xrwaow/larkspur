@@ -160,7 +160,7 @@ impl Render for BrowseView {
         let theme = self.themed.theme();
 
         let fresh = self.list.rows().is_dirty().then(|| self.build_sections(cx));
-        self.list.rows_mut().sync(theme, window, fresh);
+        album_list::sync(self, theme, window, fresh);
         self.list.anchor_to_playing(cx);
         // A filter queues the matched songs only; the unfiltered library
         // queues the whole album from the clicked row.

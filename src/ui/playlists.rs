@@ -1500,7 +1500,6 @@ fn rail_row(
                         .flex_1()
                         .min_w_0()
                         .child(marquee::marquee_text(
-                            theme,
                             ("rail-label", key),
                             &label,
                             bits.width,

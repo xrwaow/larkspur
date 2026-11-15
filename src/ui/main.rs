@@ -91,6 +91,9 @@ fn main() {
         cx.open_window(
             WindowOptions {
                 window_bounds: Some(WindowBounds::Windowed(bounds)),
+                // Keep both rails and a workable center on screen; no height
+                // floor, so short screens can still use the window.
+                window_min_size: Some(size(px(layout::MIN_WINDOW_WIDTH_PX), px(0.0))),
                 titlebar: Some(TitlebarOptions {
                     title: Some("Larkspur".into()),
                     ..Default::default()

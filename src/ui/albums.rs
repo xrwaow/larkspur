@@ -20,7 +20,7 @@ use std::sync::Arc;
 
 use gpui::{
     div, img, prelude::*, px, AnyElement, App, ClickEvent, Context, ElementId, Entity,
-    MouseButton, MouseDownEvent, ObjectFit, RenderImage, Rgba, SharedString, Window,
+    MouseButton, MouseDownEvent, ObjectFit, RenderImage, SharedString, Window,
 };
 
 use crate::model::search::SongGroup;
@@ -52,18 +52,36 @@ pub const ICON_CARD_PX: f32 = ICON_COVER_PX + ICON_PAD_PX * 2.0;
 /// fits is derived from this together with [`ICON_CARD_PX`].
 pub const ICON_GAP_PX: f32 = 8.0;
 
-/// The most characters a title column shows before its text fades and slides.
+/// The most characters a title column shows before its text is cut and slides.
 pub const MAX_TITLE_CHARS: usize = 48;
 
-/// The most characters an artist column shows before its text fades and slides.
+/// The most characters an artist column shows before its text is cut and
+/// slides.
 pub const MAX_ARTIST_CHARS: usize = 48;
 
-/// The fixed title/artist column widths, in px.
+/// A track row's cell gap (`.gap_3`) and horizontal padding per side
+/// (`.px_4`), in px.
+const ROW_GAP_PX: f32 = 12.0;
+const ROW_PAD_PX: f32 = 16.0;
+
+/// The title's share of the text width once a row no longer fits its columns —
+/// the title outranks the artist, as in the queue.
+const TITLE_SHARE: f32 = 0.58;
+
+/// The gap between an album header's title and its right-aligned year
+/// (`.gap(px(HEADER_GAP_PX))`).
+const HEADER_GAP_PX: f32 = 8.0;
+
+/// The characters the header's right-aligned year holds — `2026`.
+const YEAR_CHARS: f32 = 4.0;
+
+/// The fixed title/artist column widths, in px, plus the album header's own
+/// title cell.
 ///
-/// Both are sized to a maximum character count rather than to the longest
-/// string in a section, so every playlist lays its columns out identically and
-/// songs line up across tabs. Text longer than its column fades at the edge and
-/// slides on hover (see [`marquee::marquee_text`]).
+/// The text cells are sized to a maximum character count rather than to the
+/// longest string in a section, so every playlist lays its columns out
+/// identically and songs line up across tabs. Text longer than its column is cut
+/// at the cell's edge and slides on hover (see [`marquee`]).
 #[derive(Clone, Copy, Debug)]
 pub struct Columns {
     pub title: f32,
@@ -72,28 +90,107 @@ pub struct Columns {
     /// math and the equalizer's nudge both derive from them.
     pub title_chars: usize,
     pub artist_chars: usize,
+    /// The most the album header's title cell may take, in px — the row's width
+    /// less its padding, thumbnail, gaps and the year's four digits — and one
+    /// character's advance at the header's size. The cell hugs the title up to
+    /// that (see [`Self::header_cell`]); 0 until the list's width is known (the
+    /// first frame), which draws the title plain.
+    pub header: f32,
+    pub header_advance: f32,
 }
 
 impl Columns {
-    /// Measure the columns for `theme`'s font. The font is monospace, so one
-    /// character's advance times the max count gives the width without shaping
-    /// every title.
-    pub fn measure(window: &Window, theme: Theme) -> Self {
-        Self::sized(window, theme, MAX_TITLE_CHARS, MAX_ARTIST_CHARS)
-    }
-
-    /// Columns sized to explicit character counts — a narrow container (the
-    /// queue panel) scales its columns to its own width instead of the
-    /// tables' fixed 48.
+    /// Columns sized to explicit character counts — a container scaling its
+    /// columns to its own width (the queue to its rail, an album list to its
+    /// viewport) instead of the fixed 48.
     pub fn sized(window: &Window, theme: Theme, title_chars: usize, artist_chars: usize) -> Self {
-        let advance = marquee::char_advance(window, theme, theme.cell_px());
+        let advance = Self::advance(window, theme);
         Self {
             title: advance * title_chars as f32,
             artist: advance * artist_chars as f32,
             title_chars,
             artist_chars,
+            header: 0.0,
+            header_advance: advance,
         }
     }
+
+    /// One character's advance in the row font, in px — how a row's width turns
+    /// back into the character counts it holds.
+    fn advance(window: &Window, theme: Theme) -> f32 {
+        marquee::char_advance(window, theme, theme.cell_px())
+    }
+
+    /// Columns for a list `viewport` px wide: the text cells fit to the width a
+    /// row has left once its fixed cells are taken out, and the album header's
+    /// title cell to the width it gets.
+    pub fn fitted(window: &Window, theme: Theme, viewport: f32, sections: &[AlbumSection]) -> Self {
+        let covers = sections.iter().any(|section| section.row_covers);
+        let (title_chars, artist_chars) =
+            row_text_chars(theme, viewport, Self::advance(window, theme), covers);
+        let header_advance = marquee::char_advance(window, theme, header_title_px(theme));
+        Self {
+            header: header_max_title(viewport, header_advance),
+            header_advance,
+            ..Self::sized(window, theme, title_chars, artist_chars)
+        }
+    }
+
+    /// The album header's title cell for `album`: its width in px and the
+    /// characters it holds.
+    ///
+    /// The cell hugs the title, so the year reads as the next word on the line
+    /// instead of being pinned to the row's far edge. A title too long for the
+    /// row takes the whole [`Self::header`] width and slides on hover — the
+    /// slide's spare character is the only space the edge fade ever covers.
+    pub fn header_cell(&self, album: &str) -> (f32, usize) {
+        let advance = self.header_advance.max(0.01);
+        let chars = album.chars().count();
+        let width = (chars as f32 * advance).min(self.header).max(advance);
+        (width, ((width / advance) as usize).max(1))
+    }
+}
+
+/// The most width an album header's title cell may take in a list `row_w` px
+/// wide, at `advance` px per glyph: the row less the header's padding, the
+/// thumbnail, both gaps and the year's four digits, rounded down to whole
+/// characters so the cell never cuts a glyph.
+fn header_max_title(row_w: f32, advance: f32) -> f32 {
+    let advance = advance.max(0.01);
+    let fixed = ROW_PAD_PX * 2.0 + THUMB_PX + ROW_GAP_PX + HEADER_GAP_PX + advance * YEAR_CHARS;
+    let width = (row_w - fixed).max(advance);
+    ((width / advance) as usize).max(1) as f32 * advance
+}
+
+/// The header title's text size — a step up from a row cell's.
+fn header_title_px(theme: Theme) -> f32 {
+    theme.cell_px() + 2.0
+}
+
+/// The title/artist character budgets of a track row `width` px wide, at
+/// `advance` px per glyph.
+///
+/// Both hold at [`MAX_TITLE_CHARS`]/[`MAX_ARTIST_CHARS`] while the row fits,
+/// its flex spacer taking the slack. Below that they keep shrinking with the
+/// window — no floor short of one character, so the row never clips — and the
+/// title takes the larger share.
+fn row_text_chars(theme: Theme, width: f32, advance: f32, row_covers: bool) -> (usize, usize) {
+    let advance = advance.max(0.01);
+    // The non-text cells: number, bitrate, length, the row's cover when it has
+    // one, the gaps between them, and the padding.
+    let cells = 6.0 + if row_covers { 1.0 } else { 0.0 };
+    let fixed = ROW_PAD_PX * 2.0
+        + (cells - 1.0) * ROW_GAP_PX
+        + theme.number_col()
+        + theme.bitrate_col()
+        + theme.length_col()
+        + if row_covers { theme.cover_col() } else { 0.0 };
+    let text = (width - fixed).max(0.0);
+    // The title picks first; what it leaves goes to the artist rather than the
+    // spacer, and neither cell ever drops to zero width.
+    let title = ((text * TITLE_SHARE / advance) as usize).clamp(1, MAX_TITLE_CHARS);
+    let artist = ((text - title as f32 * advance).max(0.0) / advance) as usize;
+    (title, artist.clamp(1, MAX_ARTIST_CHARS))
 }
 
 /// One track row, snapshotted out of the library. It holds the shared song
@@ -647,7 +744,23 @@ pub fn render_item<V: Render + 'static>(
         ListItem::Track { index, .. } => Some((&section.tracks[index], index)),
     }) else {
         let cover = header_cover(context, section, cx);
-        return album_header(context.theme, section, cover);
+        // The title slides only while the pointer is over it, like a track cell —
+        // the header row itself has no actions (nothing to play).
+        let actions = actions.cloned();
+        let on_title_hover = cx.listener(move |view, hovered: &bool, _window, cx| {
+            if let Some(actions) = &actions {
+                actions.cell_hover(view, ix, Cell::Title, *hovered, cx);
+            }
+        });
+        return album_header(
+            context.theme,
+            section,
+            cover,
+            *columns,
+            ix,
+            context.highlight.marquee_offset(ix, Cell::Title),
+            on_title_hover,
+        );
     };
 
     let song = track.song;
@@ -827,9 +940,47 @@ fn cover_mosaic(theme: Theme, covers: &[Option<CoverImage>], size: f32) -> AnyEl
         .into_any_element()
 }
 
-/// An album's header: thumbnail, artist, title with the year right-aligned on
-/// the same line (same size and colour as the title), meta line.
-pub fn album_header(theme: Theme, section: &AlbumSection, cover: AnyElement) -> AnyElement {
+/// An album's header: thumbnail, artist, title with the year after it on the
+/// same line (same size and colour as the title), meta line.
+///
+/// The title is a marquee cell sized to itself (see [`Columns::header_cell`]),
+/// so the year sits right after it, and a long album name fades at the edge and
+/// slides on hover like a track row's — until the list's width is known it
+/// draws plain.
+#[allow(clippy::too_many_arguments)]
+pub fn album_header(
+    theme: Theme,
+    section: &AlbumSection,
+    cover: AnyElement,
+    columns: Columns,
+    ix: usize,
+    title_offset: f32,
+    on_title_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
+) -> AnyElement {
+    let title: AnyElement = if columns.header > 1.0 {
+        let (width, chars) = columns.header_cell(&section.album);
+        marquee::marquee_text(
+            ("album-header-title", ix),
+            &section.album,
+            width,
+            chars,
+            header_title_px(theme),
+            title_offset,
+            theme.text,
+            theme.panel_bg,
+            on_title_hover,
+        )
+    } else {
+        div()
+            .flex_1()
+            .min_w_0()
+            .truncate()
+            .text_size(px(header_title_px(theme)))
+            .text_color(theme.text)
+            .child(section.album.clone())
+            .into_any_element()
+    };
+
     div()
         .w_full()
         .flex()
@@ -856,20 +1007,13 @@ pub fn album_header(theme: Theme, section: &AlbumSection, cover: AnyElement) -> 
                     div()
                         .flex()
                         .items_baseline()
+                        .gap(px(HEADER_GAP_PX))
                         .min_w_0()
-                        .child(
-                            div()
-                                .flex_1()
-                                .min_w_0()
-                                .truncate()
-                                .text_size(px(theme.cell_px() + 2.0))
-                                .text_color(theme.text)
-                                .child(section.album.clone()),
-                        )
+                        .child(title)
                         .child(
                             div()
                                 .flex_none()
-                                .text_size(px(theme.cell_px() + 2.0))
+                                .text_size(px(header_title_px(theme)))
                                 .text_color(theme.text)
                                 .child(
                                 section.date.map(|date| date.year().to_string()).unwrap_or_default(),
@@ -931,34 +1075,32 @@ fn track_row(
             number_cell(theme, track.number)
         })
         .children(cover.map(|cover| thumbnail(theme, Some(cover), theme.cover_col())))
-        .child(text_cell(
-            theme,
+        .child(marquee::marquee_text(
             ("row-title", track.song.get()),
             &track.meta.display_title(),
             columns.title,
             columns.title_chars,
+            theme.cell_px(),
             paint.title_offset,
             if playing { theme.accent } else { theme.text },
             background,
             handlers.on_title_hover,
         ))
-        .child(text_cell(
-            theme,
+        .child(marquee::marquee_text(
             ("row-artist", track.song.get()),
             &track.meta.artists.join(", "),
             columns.artist,
             columns.artist_chars,
+            theme.cell_px(),
             paint.artist_offset,
             theme.text_muted,
             background,
             handlers.on_artist_hover,
         ))
-        // Fill the gap so the numeric columns stay right-aligned.
+        // Fill the gap so the numeric columns stay right-aligned. When the
+        // row can't fit its columns this shrinks to nothing and they sit
+        // close behind the artist — the space the row is short of.
         .child(div().flex_1().min_w_0())
-        // Always reserve the action column on regular rows, so rows keep
-        // identical children and the numeric columns stay put. Slim rows (the
-        // queue) end at the gap — no numeric columns follow.
-        .when(!paint.slim, |d| d.child(div().w(px(theme.action_col())).flex_none()))
         .when(!paint.slim, |d| {
             d.child(right_cell(theme, theme.bitrate_col(), paint.bitrate.clone()))
         })
@@ -970,33 +1112,6 @@ fn track_row(
             ))
         })
         .into_any_element()
-}
-
-/// A marquee text cell of fixed width.
-#[allow(clippy::too_many_arguments)]
-fn text_cell(
-    theme: Theme,
-    id: impl Into<ElementId>,
-    text: &str,
-    width: f32,
-    chars: usize,
-    offset: f32,
-    color: Rgba,
-    background: Rgba,
-    on_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
-) -> AnyElement {
-    marquee::marquee_text(
-        theme,
-        id,
-        text,
-        width,
-        chars,
-        theme.cell_px(),
-        offset,
-        color,
-        background,
-        on_hover,
-    )
 }
 
 /// The track-number cell. Left-aligned in a column just wide enough for the
@@ -1505,7 +1620,6 @@ pub fn icon_info_panel<V: Render + 'static>(
                 .on_mouse_down(MouseButton::Right, on_heading_context)
                 .child(thumbnail_rounded(theme, cover, ICON_INFO_COVER_PX))
                 .child(marquee::marquee_text(
-                    theme,
                     (
                         "icon-info-title",
                         section.tracks.first().map_or(0, |track| track.song.0),
@@ -1535,10 +1649,11 @@ pub struct InfoRowMotion {
     pub hovered: bool,
 }
 
-/// A text cell's width and character budget from the space left for it.
+/// A text cell's width and character budget from the space left for it. The
+/// width is whole characters, so the cell never cuts a glyph in half.
 fn info_cell(available: f32, advance: f32) -> (f32, usize) {
-    let width = available.max(24.0);
-    (width, ((width / advance).floor() as usize).max(1))
+    let chars = ((available.max(24.0) / advance) as usize).max(1);
+    (chars as f32 * advance, chars)
 }
 
 /// One song row: number, title, duration. Click plays it, right-click opens
@@ -1624,7 +1739,6 @@ fn info_song_row<V: Render + 'static>(
                 .child(format!("{:02}", track.number)),
         )
         .child(marquee::marquee_text(
-            theme,
             ("icon-info-title", index),
             &title,
             title_w,
@@ -1746,6 +1860,57 @@ mod tests {
 
         let section = section_for_playlist(&library, id).unwrap();
         assert_eq!(section.artist, "Grimes");
+    }
+
+    #[test]
+    fn track_columns_shrink_to_fit_the_row() {
+        let theme = Theme::dark();
+        assert_eq!(row_text_chars(theme, 4000.0, 8.0, false), (MAX_TITLE_CHARS, MAX_ARTIST_CHARS));
+        // Past the point the fixed columns fit, both keep shrinking — the
+        // title taking the larger share — and neither ever reaches zero.
+        let (title, artist) = row_text_chars(theme, 700.0, 8.0, false);
+        assert!(title < MAX_TITLE_CHARS && artist < MAX_ARTIST_CHARS && title > artist);
+        assert_eq!(row_text_chars(theme, 1.0, 8.0, false), (1, 1));
+        // A per-row cover takes width from the text columns.
+        let title_at = |covers| row_text_chars(theme, 900.0, 8.0, covers).0;
+        assert!(title_at(true) < title_at(false));
+    }
+
+    #[test]
+    fn the_header_title_hugs_its_text_and_the_year_follows() {
+        let advance = 8.0;
+        let row_w = 700.0;
+        let album = "Visions";
+        let year = advance * YEAR_CHARS;
+        let chrome = ROW_PAD_PX * 2.0 + THUMB_PX + ROW_GAP_PX + HEADER_GAP_PX;
+        let columns = Columns {
+            title: 0.0,
+            artist: 0.0,
+            title_chars: MAX_TITLE_CHARS,
+            artist_chars: MAX_ARTIST_CHARS,
+            header: header_max_title(row_w, advance),
+            header_advance: advance,
+        };
+        assert_eq!(columns.header, row_w - chrome - year);
+
+        // A short title takes just its own width — no room is spent on the edge
+        // fade at rest — and the year follows it rather than sitting out at the
+        // row's edge.
+        let (width, chars) = columns.header_cell(album);
+        assert_eq!(width, album.chars().count() as f32 * advance);
+        assert_eq!(chars, album.chars().count());
+        assert!(width < columns.header, "a short title never stretches to the year");
+
+        // A title too long for the row takes all of it — in whole characters —
+        // and the year still has its own four digits to sit in.
+        let long = "x".repeat(200);
+        let (width, _) = columns.header_cell(&long);
+        assert_eq!(width, columns.header);
+        assert!((width / advance) % 1.0 == 0.0, "a cell never cuts a glyph");
+        assert!(width + chrome + year <= row_w);
+
+        // A row too narrow for the title still leaves it one character wide.
+        assert_eq!(header_max_title(10.0, advance), advance);
     }
 
     #[test]

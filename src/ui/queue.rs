@@ -333,7 +333,7 @@ impl Render for QueueView {
         } else {
             None
         };
-        self.list.rows_mut().sync(theme, window, fresh);
+        album_list::sync(self, theme, window, fresh);
         // Up/down with nothing selected step from the playing entry — the flat
         // list's row index is the queue index.
         let loaded = self.playback.read(cx).queue().1;

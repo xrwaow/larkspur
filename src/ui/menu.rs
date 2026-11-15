@@ -522,7 +522,6 @@ fn menu_panel(
                     .border_b_1()
                     .border_color(theme.border)
                     .child(marquee::marquee_text(
-                        theme,
                         "menu-heading",
                         &heading.label,
                         heading.width,

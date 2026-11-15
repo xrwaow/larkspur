@@ -14,9 +14,8 @@
 use std::rc::Rc;
 
 use gpui::{
-    canvas, div, prelude::*, px, App, Context, ElementId, Entity, KeyDownEvent, MouseButton,
-    MouseDownEvent,
-    Render, ScrollWheelEvent, SharedString, Subscription, Window,
+    canvas, div, prelude::*, px, AnyElement, App, Context, ElementId, Entity, KeyDownEvent,
+    MouseButton, MouseDownEvent, Render, ScrollWheelEvent, SharedString, Subscription, Window,
 };
 
 use crate::model::select::{Order, Scope, Selection};
@@ -102,10 +101,10 @@ pub struct AlbumListView {
     /// instead of driving the row list's selection. Set by the render
     /// functions, which are the only ones that know which one is showing.
     icon_focus: bool,
-    /// The icon grid viewport's last measured size, in whole px. Measured by a
-    /// canvas each frame; a change schedules one re-render so the columns
-    /// re-pack against the new size (never trusting a previous-frame guess).
-    icon_viewport: std::rc::Rc<std::cell::Cell<(u32, u32)>>,
+    /// The content viewport's last measured size, in whole px, recorded by a
+    /// canvas each frame. A change schedules one re-render: the icon grid
+    /// re-packs against it, and the row list re-fits its title/artist columns.
+    viewport: Rc<std::cell::Cell<(u32, u32)>>,
     /// The library revision the rows were last built from, so a highlight-only
     /// notify (a tab switch) doesn't rebuild them.
     seen_revision: u64,
@@ -129,7 +128,7 @@ pub struct AlbumListView {
     /// The icon grid viewport's origin in window coordinates, recorded by the
     /// measurer. The panel pops up at a window-space position (the click), but
     /// is drawn in the grid's own space, so the two need reconciling.
-    icon_viewport_origin: std::rc::Rc<std::cell::Cell<(f32, f32)>>,
+    icon_viewport_origin: Rc<std::cell::Cell<(f32, f32)>>,
 }
 
 /// Every album list renders the browse container's typography (the views
@@ -186,7 +185,7 @@ impl AlbumListView {
             icon_scroll: SmoothScroll::default(),
             icon_max_scroll: std::cell::Cell::new(0.0),
             icon_focus: false,
-            icon_viewport: std::rc::Rc::new(std::cell::Cell::new((0, 0))),
+            viewport: Rc::new(std::cell::Cell::new((0, 0))),
             seen_revision: 0,
             icon_info: None,
             icon_info_scroll: SmoothScroll::default(),
@@ -194,7 +193,7 @@ impl AlbumListView {
             icon_info_max_scroll: std::cell::Cell::new(0.0),
             icon_info_marquee: marquee::Marquee::new(),
             icon_info_rows: std::collections::HashMap::new(),
-            icon_viewport_origin: std::rc::Rc::new(std::cell::Cell::new((0.0, 0.0))),
+            icon_viewport_origin: Rc::new(std::cell::Cell::new((0.0, 0.0))),
         }
     }
 
@@ -517,7 +516,7 @@ impl AlbumListView {
     /// The icon grid's viewport height, in px — 0 before the first layout, so
     /// a page action waits until the panel is actually sized.
     fn icon_viewport_height(&self) -> f32 {
-        let (_, height) = self.icon_viewport.get();
+        let (_, height) = self.viewport.get();
         if height > 1 {
             height as f32
         } else {
@@ -824,6 +823,63 @@ pub fn observe<V: AlbumList>(
     AlbumListSubs { _library, _playback, _covers, _animator }
 }
 
+/// Measure the rows for this frame: hand them the width the list area was last
+/// measured at, then let them re-measure their columns against it — the
+/// title/artist cells hold their usual size while the row fits (the spacer
+/// takes the slack) and shrink below it as the window narrows, so a row never
+/// clips.
+///
+/// Album lists call this from `render` instead of [`RowList::sync`] itself, so
+/// the fit lands in the frame after the one that measured the width: one render
+/// per resize step, and nothing shifts once the window has stopped moving.
+pub fn sync<V: AlbumList>(
+    view: &mut V,
+    theme: Theme,
+    window: &Window,
+    fresh: Option<Vec<AlbumSection>>,
+) {
+    let (width, _) = view.list().viewport.get();
+    let rows = view.list_mut().rows_mut();
+    rows.set_viewport(width as f32);
+    rows.sync(theme, window, fresh);
+}
+
+/// The measurer an album view lays over its content area: a canvas recording the
+/// viewport's size in whole px every layout pass. A change schedules one
+/// re-render, so the columns and the icon grid re-fit against the size they
+/// actually have rather than a guess.
+fn measurer<V: AlbumList>(
+    list: &AlbumListView,
+    origin: Option<Rc<std::cell::Cell<(f32, f32)>>>,
+    cx: &mut Context<V>,
+) -> AnyElement {
+    let measured = list.viewport.clone();
+    let entity = cx.entity();
+    canvas(
+        move |bounds, window, _cx| {
+            let size = (
+                f32::from(bounds.size.width).round() as u32,
+                f32::from(bounds.size.height).round() as u32,
+            );
+            // The origin rides along so the icon panel — raised at a window-space
+            // click position but drawn in the grid's space — can be placed there.
+            // It moves with the docks without a resize, so it is recorded on
+            // every layout pass, not just when the size changes.
+            if let Some(origin) = &origin {
+                origin.set((f32::from(bounds.origin.x), f32::from(bounds.origin.y)));
+            }
+            if measured.get() != size {
+                measured.set(size);
+                window.on_next_frame(move |_, cx| entity.update(cx, |_, cx| cx.notify()));
+            }
+        },
+        |_, _, _, _| {},
+    )
+    .absolute()
+    .inset_0()
+    .into_any_element()
+}
+
 /// The virtualized list area: row render through `albums::render_item`, the
 /// eased scroll area on top. `context` is the playlist the song menu offers as
 /// a destination (the open playlist) — `None` for the whole library.
@@ -881,16 +937,29 @@ pub fn render_rows_with<V: AlbumList>(
         };
         albums::render_item(&row, ix, &sections, &items, &columns, Some(&actions), cx)
     });
-    scroll_area(
-        gpui::list(list_state, render).size_full().into_any_element(),
-        cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
-            if this.list_mut().rows.wheel(wheel_pixels(event)) {
-                this.list().request_frame();
-                cx.notify();
-            }
-            cx.stop_propagation();
-        }),
-    )
+    // The measurer: a canvas over the list area, recording its width for the
+    // next frame's column fit (see [`sync`]).
+    let measurer = measurer(view.list(), None, cx);
+
+    div()
+        .relative()
+        .flex()
+        .flex_col()
+        .flex_1()
+        .min_h_0()
+        .w_full()
+        .child(measurer)
+        .child(scroll_area(
+            gpui::list(list_state, render).size_full().into_any_element(),
+            cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
+                if this.list_mut().rows.wheel(wheel_pixels(event)) {
+                    this.list().request_frame();
+                    cx.notify();
+                }
+                cx.stop_propagation();
+            }),
+        ))
+        .into_any_element()
 }
 
 /// The icon view of the same sections: album covers packed into rows that
@@ -916,7 +985,7 @@ pub fn render_icons<V: AlbumList>(
     cx: &mut Context<V>,
 ) -> gpui::AnyElement {
     view.list_mut().icon_focus = true;
-    let (viewport_w, viewport_h) = view.list().icon_viewport.get();
+    let (viewport_w, viewport_h) = view.list().viewport.get();
     let (viewport_w, viewport_h) = if viewport_w > 1 && viewport_h > 1 {
         (viewport_w as f32, viewport_h as f32)
     } else {
@@ -992,30 +1061,9 @@ pub fn render_icons<V: AlbumList>(
     };
     let icons: Rc<dyn RowActions<V>> = Rc::new(Icons);
 
-    // The measurer: a canvas stretched over the viewport. Its layout pass
-    // sees the real size every frame; when it changes, one re-render is
-    // scheduled so the pack runs against it.
-    let entity = cx.entity();
-    let measured = list.icon_viewport.clone();
-    let measured_origin = list.icon_viewport_origin.clone();
-    let measurer = canvas(
-        move |bounds, window, _cx| {
-            let key =
-                (f32::from(bounds.size.width).round() as u32, f32::from(bounds.size.height).round() as u32);
-            // The origin rides along so the panel — raised at a window-space
-            // click position but drawn in the grid's space — can be placed
-            // there. It moves with the docks without a resize, so it is
-            // recorded on every layout pass.
-            measured_origin.set((f32::from(bounds.origin.x), f32::from(bounds.origin.y)));
-            if measured.get() != key {
-                measured.set(key);
-                window.on_next_frame(move |_, cx| entity.update(cx, |_, cx| cx.notify()));
-            }
-        },
-        |_, _, _, _| {},
-    )
-    .absolute()
-    .inset_0();
+    // The measurer: a canvas over the grid, recording the viewport's size and
+    // window-space origin.
+    let measurer = measurer(list, Some(list.icon_viewport_origin.clone()), cx);
 
     // The scrollable area: the grid, translated up by the scroll offset
     // inside a clipped viewport. There is no native scroller to race with —

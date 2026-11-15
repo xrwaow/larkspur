@@ -190,7 +190,7 @@ impl Render for PlaylistView {
                 .into_iter()
                 .collect()
         });
-        self.list.rows_mut().sync(theme, window, fresh);
+        album_list::sync(self, theme, window, fresh);
         self.list.anchor_to_playing(cx);
 
         let sections = self.list.rows().sections();
