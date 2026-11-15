@@ -532,9 +532,9 @@ impl RowList {
                 self.columns.artist,
                 self.columns.artist_chars,
             ),
-            // A header's title slides like a row's, in the cell it hugs.
+            // A header's title slides like a row's, in the cell it fills.
             (None, Cell::Title) => {
-                let (width, chars) = self.columns.header_cell(&section.album);
+                let (width, chars) = self.columns.header_cell();
                 marquee::travel_for(&section.album, width, chars)
             }
             (None, Cell::Artist) => 0.0,

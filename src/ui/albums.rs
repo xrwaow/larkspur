@@ -92,9 +92,10 @@ pub struct Columns {
     pub artist_chars: usize,
     /// The most the album header's title cell may take, in px — the row's width
     /// less its padding, thumbnail, gaps and the year's four digits — and one
-    /// character's advance at the header's size. The cell hugs the title up to
-    /// that (see [`Self::header_cell`]); 0 until the list's width is known (the
-    /// first frame), which draws the title plain.
+    /// character's advance at the header's size. The cell takes all of it (see
+    /// [`Self::header_cell`]), so the year after it is right-aligned at the
+    /// row's edge; 0 until the list's width is known (the first frame), which
+    /// draws the title plain.
     pub header: f32,
     pub header_advance: f32,
 }
@@ -136,18 +137,14 @@ impl Columns {
         }
     }
 
-    /// The album header's title cell for `album`: its width in px and the
-    /// characters it holds.
+    /// The album header's title cell: its width in px and the characters it
+    /// holds.
     ///
-    /// The cell hugs the title, so the year reads as the next word on the line
-    /// instead of being pinned to the row's far edge. A title too long for the
-    /// row takes the whole [`Self::header`] width and slides on hover — the
-    /// slide's spare character is the only space the edge fade ever covers.
-    pub fn header_cell(&self, album: &str) -> (f32, usize) {
-        let advance = self.header_advance.max(0.01);
-        let chars = album.chars().count();
-        let width = (chars as f32 * advance).min(self.header).max(advance);
-        (width, ((width / advance) as usize).max(1))
+    /// The cell takes the row's whole title width whatever the title's length,
+    /// so the year that follows it stays right-aligned at the row's edge. A
+    /// title too long for the cell is cut at the edge and slides on hover.
+    pub fn header_cell(&self) -> (f32, usize) {
+        (self.header, ((self.header / self.header_advance.max(0.01)) as usize).max(1))
     }
 }
 
@@ -943,10 +940,10 @@ fn cover_mosaic(theme: Theme, covers: &[Option<CoverImage>], size: f32) -> AnyEl
 /// An album's header: thumbnail, artist, title with the year after it on the
 /// same line (same size and colour as the title), meta line.
 ///
-/// The title is a marquee cell sized to itself (see [`Columns::header_cell`]),
-/// so the year sits right after it, and a long album name fades at the edge and
-/// slides on hover like a track row's — until the list's width is known it
-/// draws plain.
+/// The title is a marquee cell filling the row beside the year (see
+/// [`Columns::header_cell`]), so the year lines up with the row's right edge and
+/// a long album name is cut at the edge and slides on hover like a track row's
+/// — until the list's width is known it draws plain.
 #[allow(clippy::too_many_arguments)]
 pub fn album_header(
     theme: Theme,
@@ -958,7 +955,7 @@ pub fn album_header(
     on_title_hover: impl Fn(&bool, &mut Window, &mut App) + 'static,
 ) -> AnyElement {
     let title: AnyElement = if columns.header > 1.0 {
-        let (width, chars) = columns.header_cell(&section.album);
+        let (width, chars) = columns.header_cell();
         marquee::marquee_text(
             ("album-header-title", ix),
             &section.album,
@@ -1004,9 +1001,14 @@ pub fn album_header(
                         .child(section.artist.clone()),
                 )
                 .child(
+                    // Title and year on one line: the title cell takes the width
+                    // the year leaves, and `justify_between` pins the year to the
+                    // row's right edge — the cell rounds down to whole characters,
+                    // so without it the year would drift up to a glyph short.
                     div()
                         .flex()
                         .items_baseline()
+                        .justify_between()
                         .gap(px(HEADER_GAP_PX))
                         .min_w_0()
                         .child(title)
@@ -1877,10 +1879,9 @@ mod tests {
     }
 
     #[test]
-    fn the_header_title_hugs_its_text_and_the_year_follows() {
+    fn the_header_title_fills_the_row_so_the_year_sits_at_its_edge() {
         let advance = 8.0;
         let row_w = 700.0;
-        let album = "Visions";
         let year = advance * YEAR_CHARS;
         let chrome = ROW_PAD_PX * 2.0 + THUMB_PX + ROW_GAP_PX + HEADER_GAP_PX;
         let columns = Columns {
@@ -1891,23 +1892,17 @@ mod tests {
             header: header_max_title(row_w, advance),
             header_advance: advance,
         };
-        assert_eq!(columns.header, row_w - chrome - year);
 
-        // A short title takes just its own width — no room is spent on the edge
-        // fade at rest — and the year follows it rather than sitting out at the
-        // row's edge.
-        let (width, chars) = columns.header_cell(album);
-        assert_eq!(width, album.chars().count() as f32 * advance);
-        assert_eq!(chars, album.chars().count());
-        assert!(width < columns.header, "a short title never stretches to the year");
-
-        // A title too long for the row takes all of it — in whole characters —
-        // and the year still has its own four digits to sit in.
-        let long = "x".repeat(200);
-        let (width, _) = columns.header_cell(&long);
+        // The title cell takes the row's whole title width, whatever the title's
+        // length, so the year after it lands on the row's right edge.
+        let (width, chars) = columns.header_cell();
         assert_eq!(width, columns.header);
-        assert!((width / advance) % 1.0 == 0.0, "a cell never cuts a glyph");
+        assert_eq!(chars as f32 * advance, width, "the cell holds whole characters");
         assert!(width + chrome + year <= row_w);
+
+        // A title longer than that is cut and slides; a short one stays put.
+        assert_eq!(marquee::travel_for("Visions", width, chars), 0.0);
+        assert!(marquee::travel_for(&"x".repeat(200), width, chars) > 0.0);
 
         // A row too narrow for the title still leaves it one character wide.
         assert_eq!(header_max_title(10.0, advance), advance);
