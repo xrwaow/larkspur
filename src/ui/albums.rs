@@ -276,9 +276,9 @@ fn section(library: &Library, group: SongGroup) -> Option<AlbumSection> {
     // An empty playlist (a freshly created custom one) still needs a header —
     // taken from the playlist's own metadata, since there's no first song to
     // borrow artist/date/cover from. Only albums carry a release date; a
-    // custom playlist spans arbitrary tracks, so one would mislead.
+    // custom or smart playlist spans arbitrary tracks, so one would mislead.
     let custom = playlist.is_custom();
-    let date = if custom { None } else { songs.iter().find_map(|song| song.date) };
+    let date = if playlist.is_auto() { songs.iter().find_map(|song| song.date) } else { None };
 
     // The meta line describes the playlist as a whole — every song in it, not
     // just the ones a search section lists.
@@ -1849,6 +1849,24 @@ mod tests {
         let section = section_for_playlist(&library, id).unwrap();
         assert_eq!(section.artist, "Various Artists");
         assert_eq!(section.date, None, "a custom playlist carries no release date");
+    }
+
+    #[test]
+    fn a_smart_playlist_carries_no_release_date() {
+        let mut library = Library::default();
+        let mut dated = song(SongId(1), "One", "Grimes", "Visions");
+        dated.date = Some(ReleaseDate::new(2003, None, None));
+        library.insert_song(dated);
+        library.rebuild_smart();
+
+        let smart = library
+            .smart_playlists()
+            .iter()
+            .find(|playlist| !playlist.song_ids.is_empty())
+            .expect("a smart playlist picked up the song")
+            .id;
+        let section = section_for_playlist(&library, smart).unwrap();
+        assert_eq!(section.date, None, "a smart playlist carries no release date");
     }
 
     #[test]

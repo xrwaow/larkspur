@@ -288,17 +288,31 @@ impl PlaybackState {
 
     pub fn seek_fraction(&mut self, fraction: f32) {
         let target = self.controller.duration.mul_f32(fraction.clamp(0.0, 1.0));
-        self.controller.seek(target);
+        self.seek_to(target);
     }
 
     /// Seek to an absolute position. Used by the lyrics panel, where clicking
     /// a line jumps to that line's timestamp.
     pub fn seek_to(&mut self, position: Duration) {
         self.controller.seek(position);
+        self.after_seek();
     }
 
     pub fn seek_relative(&mut self, secs: i64) {
         self.controller.seek_relative(secs);
+        self.after_seek();
+    }
+
+    /// Bring the rendered position up to date with a seek that just happened.
+    ///
+    /// The ticker would get there on its own, but only on its next coarse
+    /// notification (up to [`SLOW_FPS`] away) — and until then the waveform
+    /// dot would sit where the song *was*, which reads as lag on every click
+    /// and a visible snap-back after a drag.
+    fn after_seek(&mut self) {
+        self.display_position = self.controller.position();
+        self.anchor = None;
+        self.last_coarse = (self.display_position.as_secs_f32() * SLOW_FPS) as i64;
     }
 
     /// Show or hide the queue panel.
@@ -429,11 +443,11 @@ impl PlaybackState {
                 could
             }
             InputAction::SeekForward => {
-                self.controller.seek_relative(5);
+                self.seek_relative(5);
                 true
             }
             InputAction::SeekBackward => {
-                self.controller.seek_relative(-5);
+                self.seek_relative(-5);
                 true
             }
             // Volume / focus / quit are not wired to playback yet.

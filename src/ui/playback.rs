@@ -4,7 +4,8 @@ use std::sync::Arc;
 
 use gpui::{
     canvas, div, fill, point, prelude::*, px, size, svg, AnyElement, Bounds, ClickEvent, Context,
-    Entity, MouseButton, MouseDownEvent, PathBuilder, Pixels, Render, Rgba, Subscription, Window,
+    Div, Entity, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels,
+    Point, Render, Rgba, Subscription, Window,
 };
 
 use crate::audio::RepeatMode;
@@ -30,9 +31,15 @@ pub struct PlaybackView {
     config: Entity<ConfigState>,
     themed: Themed,
     // Filled in by the seek-bar's canvas each time it paints, so
-    // on_mouse_down can turn a window-relative click into a
-    // bar-relative fraction without guessing at layout position.
+    // the press/move handlers can turn a window-relative pointer
+    // position into a bar-relative fraction without guessing at
+    // layout position.
     seek_bar_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// The fraction the pointer is dragging the seek bar to, while a scrub is
+    /// live. The waveform draws from this instead of the playback position —
+    /// that only refreshes at `SLOW_FPS`, so waiting on it would lag the dot
+    /// by up to a second. `None` means "not scrubbing, draw the position".
+    scrub: Option<f32>,
     /// The waveform heights currently drawn (0.0–1.0), one per bucket. Chunks
     /// from the analyzer animate into these in sequence.
     bars: Vec<f32>,
@@ -91,6 +98,7 @@ impl PlaybackView {
             config,
             themed,
             seek_bar_bounds: Rc::new(Cell::new(Bounds::default())),
+            scrub: None,
             bars: Vec::new(),
             from: Vec::new(),
             target: Vec::new(),
@@ -165,6 +173,52 @@ impl PlaybackView {
             state.seek_fraction(fraction);
             cx.notify();
         });
+    }
+
+    /// The bar fraction under a pointer position, or `None` before the bar
+    /// has painted its bounds. Clamped, so dragging past either end pins the
+    /// dot to that end.
+    fn fraction_at(&self, position: Point<Pixels>) -> Option<f32> {
+        let bounds = self.seek_bar_bounds.get();
+        let width = f32::from(bounds.size.width);
+        if width <= 0.0 {
+            return None;
+        }
+        Some((f32::from(position.x - bounds.origin.x) / width).clamp(0.0, 1.0))
+    }
+
+    /// End a scrub: seek to where the pointer left it and hand the dot back to
+    /// the playback position. The audio is seeked once, on release — not on
+    /// every move, which is what made the drag feel heavy.
+    fn end_scrub(&mut self, cx: &mut Context<Self>) {
+        if let Some(fraction) = self.scrub.take() {
+            self.seek_fraction(fraction, cx);
+        }
+    }
+
+    /// Attach the scrub handlers to a transport panel root. They sit on the
+    /// panel rather than the bar so a drag keeps tracking (and the dot keeps
+    /// following) past the bar's ends, however far the pointer roams inside
+    /// the panel. A release outside it ends the scrub too.
+    fn scrub_handlers(&self, panel: Div, cx: &mut Context<Self>) -> Div {
+        panel
+            .on_mouse_move(cx.listener(|this, event: &MouseMoveEvent, _window, cx| {
+                // A move with the button already up means the release went
+                // somewhere we never heard about; end the scrub there.
+                if this.scrub.is_some() && !event.dragging() {
+                    this.end_scrub(cx);
+                } else if let Some(fraction) = this.scrub.and(this.fraction_at(event.position)) {
+                    this.scrub = Some(fraction);
+                    cx.notify();
+                }
+            }))
+            // Release inside the panel or outside it — either ends the scrub.
+            .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                this.end_scrub(cx)
+            }))
+            .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, cx| {
+                this.end_scrub(cx)
+            }))
     }
 
     /// The transport controls, laid out in one row. Shared by both transport
@@ -283,17 +337,21 @@ impl Render for PlaybackView {
         // Snapshot the animated bars for the paint closure.
         let bars: Arc<Vec<f32>> = Arc::new(self.bars.clone());
 
-        let fraction = if duration.as_secs_f32() > 0.0 {
-            position.as_secs_f32() / duration.as_secs_f32()
-        } else {
-            0.0
-        };
+        // A live scrub drives the dot straight from the pointer; the
+        // playback position would only refresh a few times a second.
+        let fraction = self.scrub.unwrap_or_else(|| {
+            if duration.as_secs_f32() > 0.0 {
+                position.as_secs_f32() / duration.as_secs_f32()
+            } else {
+                0.0
+            }
+        });
 
-        let bounds_cell = self.seek_bar_bounds.clone();
-        let bounds_for_paint = bounds_cell.clone();
+        let bounds_for_paint = self.seek_bar_bounds.clone();
 
         let seek_bar = div()
             .id("seek-bar")
+            .cursor_pointer()
             .when(alt_layout, |d| d.w_full())
             .when(!alt_layout, |d| d.w(px(BAR_WIDTH)))
             .h(px(BAR_HEIGHT))
@@ -301,9 +359,10 @@ impl Render for PlaybackView {
             .overflow_hidden()
             .child(
                 // canvas gives us the element's real on-screen bounds
-                // every time it paints — that's what on_mouse_down below
-                // reads to compute a click-relative fraction, instead of
-                // assuming window coords == local coords.
+                // every time it paints — that's what the press/move
+                // handlers read to turn the pointer into a bar-relative
+                // fraction, instead of assuming window coords == local
+                // coords.
                 canvas(
                     move |bounds, _window, _cx| {
                         bounds_for_paint.set(bounds);
@@ -323,17 +382,11 @@ impl Render for PlaybackView {
             )
             .on_mouse_down(
                 MouseButton::Left,
-                cx.listener(move |this, event: &MouseDownEvent, _window, cx| {
-                    // Use the *actual* painted width, not BAR_WIDTH: if the
-                    // bar ever becomes responsive the two diverge and clicks
-                    // would land in the wrong place.
-                    let bounds = bounds_cell.get();
-                    let width = f32::from(bounds.size.width);
-                    if width <= 0.0 {
-                        return;
-                    }
-                    let local_x: f32 = f32::from(event.position.x - bounds.origin.x);
-                    this.seek_fraction(local_x / width, cx);
+                cx.listener(|this, event: &MouseDownEvent, _window, cx| {
+                    // Arm the scrub: the dot jumps to the press now, and the
+                    // panel's move/release handlers below take it from here.
+                    this.scrub = this.fraction_at(event.position);
+                    cx.notify();
                 }),
             );
 
@@ -348,11 +401,14 @@ impl Render for PlaybackView {
             !alt_layout,
             cx,
         );
+        // The clock follows the drag too, so the readout never contradicts
+        // the dot.
+        let shown_position = self.scrub.map_or(position, |f| duration.mul_f32(f));
         let position_label = div()
             .flex_none()
             .text_size(px(theme.small_px()))
             .text_color(theme.text_muted)
-            .child(format_duration_fixed(position));
+            .child(format_duration_fixed(shown_position));
         let duration_label = div()
             .flex_none()
             .text_size(px(theme.small_px()))
@@ -364,7 +420,7 @@ impl Render for PlaybackView {
         // waveform; the alternative puts the controls left, the waveform in
         // the middle, and the queue toggle out at the right edge.
         if alt_layout {
-            div()
+            self.scrub_handlers(div(), cx)
                 .flex()
                 .items_center()
                 .gap_3()
@@ -387,7 +443,7 @@ impl Render for PlaybackView {
                 )
                 .child(queue_toggle(theme, queue_open, self.queue_hovered, cx))
         } else {
-            div()
+            self.scrub_handlers(div(), cx)
                 .flex()
                 .flex_col()
                 .items_center()
