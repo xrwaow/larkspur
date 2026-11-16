@@ -248,12 +248,19 @@ const TRANSPORT_ICON: f32 = 16.0;
 /// box compensates so the mark reads at the same width as the polygon glyphs.
 const REPEAT_ICON: f32 = 21.0;
 
+/// Below this viewport width the transport always uses the minimal
+/// arrangement, whatever the settings say.
+const MINIMAL_LAYOUT_MAX_WIDTH: f32 = 1140.0;
+
 impl Render for PlaybackView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.themed.theme();
         let style = self.config.read(cx).waveform();
-        let alt_layout =
-            self.config.read(cx).transport_layout() == TransportLayout::Alternative;
+        // Narrow windows can't fit the stacked arrangement, so they get the
+        // minimal one regardless of the setting. Above the breakpoint the
+        // setting decides.
+        let alt_layout = window.viewport_size().width < px(MINIMAL_LAYOUT_MAX_WIDTH)
+            || self.config.read(cx).transport_layout() == TransportLayout::Alternative;
         // The stacked transport centers on the whole window, not just on the
         // panel between the rails.
         let center_shift = self.window_center.shift();
