@@ -181,6 +181,7 @@ fn main() {
                 let playlists = cx.new(|cx| {
                     PlaylistsView::new(
                         library_state.clone(),
+                        playback_state.clone(),
                         tabs.clone(),
                         config_state.clone(),
                         cover_store.clone(),

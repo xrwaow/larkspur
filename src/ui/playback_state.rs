@@ -245,6 +245,17 @@ impl PlaybackState {
         self.controller.repeat_mode()
     }
 
+    /// The player's volume multiplier, `0.0` (silent) to `1.0` (normal).
+    pub fn volume(&self) -> f32 {
+        self.controller.volume()
+    }
+
+    /// Set the player's volume. The rail's slider also clamps; the controller
+    /// is the last word on the range.
+    pub fn set_volume(&mut self, volume: f32) {
+        self.controller.set_volume(volume);
+    }
+
     /// Cycle off → once → all — the transport's repeat button.
     pub fn cycle_repeat(&mut self, cx: &mut Context<Self>) {
         self.controller.cycle_repeat();

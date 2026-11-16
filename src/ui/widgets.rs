@@ -5,8 +5,7 @@
 
 use gpui::{
     div, fill, linear_color_stop, linear_gradient, point, prelude::*, px, size, AnyElement, App,
-    Bounds, FocusHandle, Hsla, MouseDownEvent, MouseButton, Pixels, Rgba, ScrollWheelEvent,
-    Window,
+    Bounds, FocusHandle, Hsla, MouseDownEvent, MouseButton, Pixels, Rgba, ScrollWheelEvent, Window,
 };
 
 use crate::ui::playback::svg_icon;
@@ -365,4 +364,43 @@ pub fn paint_bars(
         let bar = Bounds::new(point(px(x), px(y)), size(px(bar_width), px(bar_height)));
         window.paint_quad(fill(bar, color(i, count)));
     }
+}
+
+/// Paint a thin track with a round thumb at `fraction` (clamped to `0..=1`) —
+/// the one line-and-dot pass behind the transport's flat seek bar and the
+/// rail's volume slider. A vertical slider grows from the bottom, so dragging
+/// the collapsed rail's fader *up* makes it louder.
+pub fn paint_line_slider(
+    window: &mut Window,
+    bounds: Bounds<Pixels>,
+    fraction: f32,
+    vertical: bool,
+    theme: Theme,
+) {
+    let fraction = fraction.clamp(0.0, 1.0);
+    let (x, y) = (f32::from(bounds.origin.x), f32::from(bounds.origin.y));
+    let (w, h) = (f32::from(bounds.size.width), f32::from(bounds.size.height));
+
+    let line = if vertical {
+        Bounds::new(point(px(x + (w - 2.0) / 2.0), px(y)), size(px(2.0), px(h)))
+    } else {
+        Bounds::new(point(px(x), px(y + (h - 2.0) / 2.0)), size(px(w), px(2.0)))
+    };
+    window.paint_quad(fill(line, theme.waveform));
+
+    // A 10 px thumb, kept fully inside the track at both ends.
+    const DOT: f32 = 10.0;
+    let (dot_x, dot_y) = if vertical {
+        (
+            x + (w - DOT) / 2.0,
+            y + ((1.0 - fraction) * (h - DOT)).clamp(0.0, (h - DOT).max(0.0)),
+        )
+    } else {
+        (
+            x + (fraction * (w - DOT)).clamp(0.0, (w - DOT).max(0.0)),
+            y + (h - DOT) / 2.0,
+        )
+    };
+    let dot = Bounds::new(point(px(dot_x), px(dot_y)), size(px(DOT), px(DOT)));
+    window.paint_quad(fill(dot, theme.accent).corner_radii(px(DOT / 2.0)));
 }

@@ -22,6 +22,7 @@
 //! animation frame paid for thousands of rows of layout and the whole app ran
 //! at single-digit frames per second.
 
+use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
@@ -29,9 +30,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    canvas, div, img, list, point, prelude::*, px, AnyElement, App, ClickEvent, Context, ElementId,
-    Entity, FocusHandle, KeyDownEvent, ListAlignment, ListState, MouseButton, MouseDownEvent,
-    Pixels, Point, Render, RenderImage, Subscription, Window,
+    canvas, div, img, list, point, prelude::*, px, AnyElement, App, Bounds, ClickEvent, Context,
+    Div, ElementId, Entity, FocusHandle, KeyDownEvent, ListAlignment, ListState, MouseButton,
+    MouseDownEvent, MouseMoveEvent, MouseUpEvent, Pixels, Point, Render, RenderImage, Subscription,
+    Window,
 };
 
 use crate::model::search::{MatchMode, TextMatcher};
@@ -46,11 +48,12 @@ use crate::ui::animation::{animate, Advance, Animator};
 use crate::ui::menu::{context_menu, MenuHandler, MenuItem};
 use crate::ui::marquee::{self, Marquee};
 use crate::ui::playback::{icon, svg_icon};
+use crate::ui::playback_state::PlaybackState;
 use crate::ui::row_list::OVERDRAW_PX;
 use crate::ui::tabs::{strip_height_px, TabsView};
 use crate::ui::text_field::TextField;
 use crate::ui::theme::Theme;
-use crate::ui::widgets::{empty_hint, search_box};
+use crate::ui::widgets::{self, empty_hint, search_box};
 
 /// The most characters a rail label shows before its text fades and slides.
 const RAIL_MAX_CHARS: usize = 24;
@@ -163,6 +166,8 @@ impl GroupFilter {
 
 pub struct PlaylistsView {
     library: Entity<LibraryState>,
+    /// The player, for the rail's volume slider.
+    playback: Entity<PlaybackState>,
     /// Clicking a playlist opens it as a tab in the center — the rail is how
     /// tabs get created, so it holds the tab container.
     tabs: Entity<TabsView>,
@@ -190,6 +195,13 @@ pub struct PlaylistsView {
     /// The open right-click menu, if any.
     menu: Option<RailMenu>,
     focus_handle: FocusHandle,
+    /// The volume slider's painted bounds, recorded by its canvas each prepaint
+    /// so a pointer position can be turned into a `0.0..=1.0` fraction.
+    volume_bounds: Rc<Cell<Bounds<Pixels>>>,
+    /// Whether the volume fader is being dragged. The orientation comes from
+    /// the painted bounds, so the same flag serves the open rail's horizontal
+    /// row and the collapsed rail's vertical one.
+    volume_drag: bool,
     /// The flattened rows, rebuilt only when the library, the expansion, or the
     /// rename state changes — never per frame.
     rows: Rc<Vec<RailRow>>,
@@ -218,6 +230,7 @@ pub struct PlaylistsView {
 impl PlaylistsView {
     pub fn new(
         library: Entity<LibraryState>,
+        playback: Entity<PlaybackState>,
         tabs: Entity<TabsView>,
         config: Entity<ConfigState>,
         covers: Entity<CoverStore>,
@@ -243,6 +256,7 @@ impl PlaylistsView {
         let themed = Themed::new(&config, cx);
         Self {
             library,
+            playback,
             tabs,
             config,
             covers,
@@ -256,6 +270,8 @@ impl PlaylistsView {
             renaming: None,
             menu: None,
             focus_handle: cx.focus_handle(),
+            volume_bounds: Rc::new(Cell::new(Bounds::default())),
+            volume_drag: false,
             rows: Rc::new(Vec::new()),
             list_state: ListState::new(0, ListAlignment::Top, px(OVERDRAW_PX)),
             cover_rows: Rc::new(Vec::new()),
@@ -284,6 +300,42 @@ impl PlaylistsView {
             RailFilter::Albums => &mut self.album_filter,
             RailFilter::Artists => &mut self.artist_filter,
         }
+    }
+
+    /// The slider fraction under a pointer position, or `None` before its
+    /// canvas has painted bounds. The bounds' shape picks the axis; a vertical
+    /// fader reads bottom-up.
+    fn volume_at(&self, position: Point<Pixels>) -> Option<f32> {
+        let b = self.volume_bounds.get();
+        let (offset, extent) = if b.size.height > b.size.width {
+            (b.origin.y + b.size.height - position.y, b.size.height)
+        } else {
+            (position.x - b.origin.x, b.size.width)
+        };
+        let extent = f32::from(extent);
+        (extent > 0.0).then(|| (f32::from(offset) / extent).clamp(0.0, 1.0))
+    }
+
+    fn apply_volume(&mut self, volume: f32, cx: &mut Context<Self>) {
+        self.playback.update(cx, |state, _cx| state.set_volume(volume));
+        cx.notify();
+    }
+
+    /// Keep a volume drag alive across the whole rail, so the pointer can roam
+    /// off the thin track and still pin the ends.
+    fn volume_handlers(&self, root: Div, cx: &mut Context<Self>) -> Div {
+        root.on_mouse_move(cx.listener(|this, e: &MouseMoveEvent, _, cx| {
+            if !this.volume_drag {
+                return;
+            }
+            if !e.dragging() {
+                this.volume_drag = false;
+            } else if let Some(fraction) = this.volume_at(e.position) {
+                this.apply_volume(fraction, cx);
+            }
+        }))
+        .on_mouse_up(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, _| this.volume_drag = false))
+        .on_mouse_up_out(MouseButton::Left, cx.listener(|this, _: &MouseUpEvent, _, _| this.volume_drag = false))
     }
 
     /// The marquee bits for the rail row with `key`: its slide state and the
@@ -1081,9 +1133,69 @@ fn settings_button(
         .into_any_element()
 }
 
+/// The height of the collapsed rail's vertical fader.
+const VOLUME_FADER_PX: f32 = 84.0;
+
+/// The rail's volume control: a speaker and a fader, laid out horizontally in
+/// the open rail and vertically when it's collapsed. The track paints through
+/// the same line-and-dot pass as the transport's flat seek bar.
+fn volume_control(
+    theme: Theme,
+    vertical: bool,
+    volume: f32,
+    bounds: Rc<Cell<Bounds<Pixels>>>,
+    cx: &mut Context<PlaylistsView>,
+) -> AnyElement {
+    let icon_px = theme.small_px().max(14.0);
+    let slider = div()
+        .id("volume-slider")
+        .relative()
+        .flex_none()
+        .cursor_pointer()
+        .when(vertical, |d| d.w(px(24.0)).h(px(VOLUME_FADER_PX)))
+        .when(!vertical, |d| d.flex_1().min_w_0().h(px(24.0)))
+        .on_mouse_down(
+            MouseButton::Left,
+            cx.listener(|this, event: &MouseDownEvent, _, cx| {
+                this.volume_drag = true;
+                if let Some(fraction) = this.volume_at(event.position) {
+                    this.apply_volume(fraction, cx);
+                }
+            }),
+        )
+        .child(
+            canvas(
+                move |painted, _window, _cx| {
+                    bounds.set(painted);
+                },
+                move |painted, _prepaint, window, _cx| {
+                    widgets::paint_line_slider(window, painted, volume, vertical, theme);
+                },
+            )
+            .size_full(),
+        );
+
+    div()
+        .flex()
+        .items_center()
+        .px_2()
+        .py_1()
+        .when(vertical, |d| d.flex_col().gap_1())
+        .when(!vertical, |d| d.w_full().gap_2())
+        .child(svg_icon(
+            icon_px,
+            icon_px,
+            "assets/volume.svg",
+            if volume <= 0.0 { theme.text_faint } else { theme.text_muted },
+        ))
+        .child(slider)
+        .into_any_element()
+}
+
 impl Render for PlaylistsView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = self.themed.theme();
+        let volume = self.playback.read(cx).volume();
         let scanning = self.library.read(cx).is_scanning();
         let selected = self.library.read(cx).selected();
         // Match the tab strip beside the rail, using the tabs' own font size —
@@ -1094,9 +1206,9 @@ impl Render for PlaylistsView {
             .font_size(TabsView::container_id(), TabsView::default_font_size());
         let header_h = strip_height_px(tabs_font, theme.cell_px() + 2.0);
 
-        // Collapsed: the header strip with the expand button, plus the
-        // settings button pinned to the bottom. The list and its rows aren't
-        // built at all while it's shut.
+        // Collapsed: the header strip with the expand button, the group icons,
+        // then the volume fader and the settings button pinned to the bottom.
+        // The list and its rows aren't built at all while it's shut.
         if self.config.read(cx).sidebar_minimized() {
             if self.cover_dirty {
                 self.cover_dirty = false;
@@ -1151,7 +1263,7 @@ impl Render for PlaylistsView {
                     .into_any_element()
             });
             let cover_list = self.cover_list.clone();
-            return div()
+            let root = div()
                 .size_full()
                 .flex()
                 .flex_col()
@@ -1180,10 +1292,23 @@ impl Render for PlaylistsView {
                         .flex()
                         .justify_center()
                         .px_2()
+                        .child(volume_control(
+                            theme,
+                            true,
+                            volume,
+                            self.volume_bounds.clone(),
+                            cx,
+                        )),
+                )
+                .child(
+                    div()
+                        .flex()
+                        .justify_center()
+                        .px_2()
                         .pb_2()
                         .child(settings_button(theme, true, cx)),
-                )
-                .into_any_element();
+                );
+            return self.volume_handlers(root, cx).into_any_element();
         }
 
         if self.dirty {
@@ -1303,6 +1428,15 @@ impl Render for PlaylistsView {
                     .pb_2()
                     .border_t_1()
                     .border_color(theme.border)
+                    .flex()
+                    .flex_col()
+                    .child(volume_control(
+                        theme,
+                        false,
+                        volume,
+                        self.volume_bounds.clone(),
+                        cx,
+                    ))
                     .child(settings_button(theme, false, cx)),
             );
 
@@ -1365,10 +1499,10 @@ impl Render for PlaylistsView {
                     ));
                 }
                 MenuTarget::Folder { path, here, sub } => {
-                    // The rail holds no playback handle, so opening a folder
-                    // goes through the tab container as a request. "Open full
-                    // folder" scopes the tab to the folder and its subfolders;
-                    // "Open folder" only the folder's own songs. Nothing is
+                    // Opening a folder goes through the tab container as a
+                    // request — the rail only holds the tabs and the player.
+                    // "Open full folder" scopes the tab to the folder and its
+                    // subfolders; "Open folder" only the folder's own songs. Nothing is
                     // played — the view opens on the library's place, and the
                     // header's shuffle button starts playback from there.
                     let (path, here, sub) = (path.clone(), *here, *sub);
@@ -1415,7 +1549,7 @@ impl Render for PlaylistsView {
             }
         }
 
-        root.into_any_element()
+        self.volume_handlers(root, cx).into_any_element()
     }
 }
 

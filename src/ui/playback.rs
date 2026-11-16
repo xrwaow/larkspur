@@ -3,9 +3,9 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use gpui::{
-    canvas, div, fill, point, prelude::*, px, size, svg, AnyElement, Bounds, ClickEvent, Context,
-    Div, Entity, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels,
-    Point, Render, Rgba, Subscription, Window,
+    canvas, div, point, prelude::*, px, svg, AnyElement, Bounds, ClickEvent, Context, Div,
+    Entity, MouseButton, MouseDownEvent, MouseMoveEvent, MouseUpEvent, PathBuilder, Pixels, Point,
+    Render, Rgba, Subscription, Window,
 };
 
 use crate::audio::RepeatMode;
@@ -686,29 +686,12 @@ fn render_waveform(
         WaveformStyle::FlatLine => canvas(
             |bounds, _window, _cx| bounds,
             move |bounds, _prepaint, window, _cx| {
-                let x0 = f32::from(bounds.origin.x);
-                let y0 = f32::from(bounds.origin.y);
-                let w = f32::from(bounds.size.width);
-                let h = f32::from(bounds.size.height);
-
-                // The line is centered vertically and spans the real width,
-                // so it follows the bar as the window resizes.
-                let line = Bounds::new(
-                    point(px(x0), px(y0 + (h - 2.0) / 2.0)),
-                    size(px(w), px(2.0)),
-                );
-                window.paint_quad(fill(line, theme.waveform));
-
-                // The progress dot is positioned from the painted width, not
-                // the old fixed BAR_WIDTH, and kept fully inside both ends.
-                let dot = 10.0;
-                let x = x0 + (progress * (w - dot)).clamp(0.0, (w - dot).max(0.0));
-                let dot_bounds = Bounds::new(
-                    point(px(x), px(y0 + (h - dot) / 2.0)),
-                    size(px(dot), px(dot)),
-                );
-                window.paint_quad(
-                    fill(dot_bounds, theme.accent).corner_radii(px(dot / 2.0)),
+                widgets::paint_line_slider(
+                    window,
+                    bounds,
+                    progress,
+                    false,
+                    theme,
                 );
             },
         )

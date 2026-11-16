@@ -21,6 +21,7 @@ impl Assets {
         ("assets/expand-left.svg", include_bytes!("../../assets/expand-left.svg")),
         ("assets/expand-right.svg", include_bytes!("../../assets/expand-right.svg")),
         ("assets/settings.svg", include_bytes!("../../assets/settings.svg")),
+        ("assets/volume.svg", include_bytes!("../../assets/volume.svg")),
         ("assets/undo.svg", include_bytes!("../../assets/undo.svg")),
         ("assets/albums.svg", include_bytes!("../../assets/albums.svg")),
         ("assets/artists.svg", include_bytes!("../../assets/artists.svg")),

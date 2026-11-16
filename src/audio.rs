@@ -558,6 +558,17 @@ impl PlaybackController {
         }
     }
 
+    /// The player's volume multiplier, `0.0` (silent) to `1.0` (normal).
+    pub fn volume(&self) -> f32 {
+        self.player.volume()
+    }
+
+    /// Set the player's volume. Values are clamped: rodio multiplies every
+    /// sample by this, so anything above `1.0` would clip.
+    pub fn set_volume(&self, volume: f32) {
+        self.player.set_volume(volume.clamp(0.0, 1.0));
+    }
+
     pub fn seek(&mut self, pos: Duration) {
         // A drained queue has no source left to seek into — try_seek would just
         // fail and the click would do nothing. Reload the current track at the
